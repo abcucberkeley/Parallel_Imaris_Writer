@@ -65,7 +65,11 @@ void listFiles(char *basePath, char* pattern, uint8_t build, uint64_t cPattN, ch
                     files[cFile] = (char*)malloc(baseSize+strlen(dp->d_name)+1);
                     files[cFile][0] = '\0';
                     strcat(files[cFile],basePath);
+                    #ifdef _WIN32
+                    strcat(files[cFile],"\\");
+                    #else
                     strcat(files[cFile],"/");
+                    #endif
                     strcat(files[cFile],dp->d_name);
                     cFile++;
                 }
@@ -123,8 +127,11 @@ void convertToImaris(int argc, char **argv)
     char* patterns = NULL;
     DIR* outputDir = NULL;
     char* outputDirString = NULL;
-    char* reader = NULL;
-    while (( option_index = getopt(argc, argv, ":c:P:t:f:F:o:r:v:")) != -1){
+    char* outName = NULL;
+	char* reader = NULL;
+	char* blockSizes = NULL;
+	
+    while (( option_index = getopt(argc, argv, ":c:P:t:f:F:o:r:v:n:b:")) != -1){
         switch (option_index) {
         case 'c':
             channels = atoi(optarg);
@@ -150,6 +157,12 @@ void convertToImaris(int argc, char **argv)
         case 'v':
             vVoxelSizes = strdup(optarg);
             break;
+		case 'n':
+			outName = strdup(optarg);
+			break;
+		case 'b':
+			blockSizes = strdup(optarg);
+			break;
         default:
             printf("Option incorrect\n");
         }
@@ -186,22 +199,40 @@ void convertToImaris(int argc, char **argv)
         printf("ERROR: Given Output Directory \"%s\" does not exist and was unable to be created.\n",outputDirString);
         return;
     }
-    char* timepointsFile = (char*)malloc(strlen(outputDirString)+12);
-    char* outputFile = (char*)malloc(strlen(outputDirString)+16);
+	// Check if we can write to the output dir
+	if(access(outputDirString, W_OK)){
+		printf("ERROR: Given Output Directory \"%s\" exists but cannot be written to.\n",outputDirString);
+		return;
+	}
+	if (!outName) outName = "output";
+    char* timepointsFile = (char*)malloc(strlen(outputDirString)+16);
+    char* outputFile = (char*)malloc(strlen(outputDirString)+strlen(outName)+6);
     timepointsFile[0] = '\0';
     outputFile[0] = '\0';
 
     strcat(outputFile,outputDirString);
-    strcat(outputFile,"/output.ims");
+    #ifdef _WIN32
+    strcat(outputFile,"\\");
+    #else
+    strcat(outputFile,"/");
+    #endif
+
+	strcat(outputFile,outName);
+	strcat(outputFile,".ims");
 
     strcat(timepointsFile,outputDirString);
+    #ifdef _WIN32
+    strcat(timepointsFile,"\\timepoints.txt");
+    #else
     strcat(timepointsFile,"/timepoints.txt");
+    #endif
 
 
     char* cPatt = NULL;
     char* cFolder = NULL;
     uint64_t nChannels = 0;
     uint64_t nTimepoints = 0;
+	uint64_t lnTimePoints = 0;
     char* pDup = strdup(patterns);
     char* fDup = NULL;
     char *saveptr1 = NULL, *saveptr2 = NULL;
@@ -210,9 +241,14 @@ void convertToImaris(int argc, char **argv)
         free(fDup);
         char* fDup = strdup(folderNames);
         cFolder = strtok_r(fDup,delim,&saveptr2);
-        while(cFolder){
+        lnTimePoints = nTimepoints;
+		while(cFolder){
             listFiles(cFolder,cPatt,0,0,NULL,1,&nTimepoints);
             cFolder = strtok_r(NULL,delim,&saveptr2);
+        }
+		if(lnTimePoints == nTimepoints){
+            printf("ERROR: Given pattern \"%s\" was not found in any of the provided folders.\n",cPatt);
+            return;
         }
         nChannels++;
         cPatt = strtok_r(NULL,delim,&saveptr1);
@@ -284,6 +320,7 @@ void convertToImaris(int argc, char **argv)
     char dtype[4];
     char order;
     uint64_t bits = 1;
+    char* cname = NULL;
 
     if(!strcmp(reader,"tiff")){
         uint64_t *size = getImageSize(files[0]);
@@ -296,10 +333,21 @@ void convertToImaris(int argc, char **argv)
         bits = getDataType(files[0]);
     }
     else{
-        setValuesFromJSON(files[0],&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ);
+        setValuesFromJSON(files[0],&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ,&cname);
         bits = dTypeToBits(dtype);
     }
-
+	// Use custom chunk sizes if provided
+    if(blockSizes){
+        char* saveptrB = NULL;
+        char* cB = NULL;
+        cB = strtok_r(blockSizes,delim,&saveptrB);
+        chunkXSize = strtof(cB,NULL);
+        cB = strtok_r(NULL,delim,&saveptrB);
+        chunkYSize = strtof(cB,NULL);
+        cB = strtok_r(NULL,delim,&saveptrB);
+        chunkZSize = strtof(cB,NULL);
+    }
+	printf("Block Sizes: %d,%d,%d\n",chunkXSize,chunkYSize,chunkZSize);
     // TODO: 64 BIT NOT YET SUPPORTED
     if(bits == 64){
         printf("64 bit data is not yet supported by the Imaris Converter");
