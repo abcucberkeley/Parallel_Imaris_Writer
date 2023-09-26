@@ -131,7 +131,10 @@ void convertToImaris(int argc, char **argv)
 	char* reader = NULL;
 	char* blockSizes = NULL;
 	
-    while (( option_index = getopt(argc, argv, ":c:P:t:f:F:o:r:v:n:b:")) != -1){
+	uint8_t crop = 0;
+	char* boundingBoxString = NULL;
+	uint64_t boundingBox[6] = {0,0,0,0,0,0};
+    while (( option_index = getopt(argc, argv, ":c:P:t:f:F:o:r:v:n:b:B:")) != -1){
         switch (option_index) {
         case 'c':
             channels = atoi(optarg);
@@ -162,6 +165,10 @@ void convertToImaris(int argc, char **argv)
 			break;
 		case 'b':
 			blockSizes = strdup(optarg);
+			break;
+		case 'B':
+			crop = 1;
+			boundingBoxString = strdup(optarg);
 			break;
         default:
             printf("Option incorrect\n");
@@ -372,6 +379,22 @@ void convertToImaris(int argc, char **argv)
 
     bpConverterTypesC_Size5D aImageSize;
 
+	// Bounding Box
+	if(crop){
+		char* saveptrV = NULL;
+        char* cV = NULL;
+        cV = strtok_r(boundingBoxString,delim,&saveptrV);
+        boundingBox[0] = strtof(cV,NULL);
+		for(uint8_t i = 1; i < 6; i++){
+			cV = strtok_r(NULL,delim,&saveptrV);
+        	boundingBox[i] = strtof(cV,NULL);
+		}
+		shapeX = boundingBox[3]-boundingBox[0];
+		shapeY = boundingBox[4]-boundingBox[1];
+		shapeZ = boundingBox[5]-boundingBox[2];
+		printf("Bounding Box: %d %d %d %d %d %d\n",boundingBox[0],boundingBox[1],boundingBox[2],boundingBox[3],boundingBox[4],boundingBox[5]);
+		printf("New Shape: %d %d %d\n",shapeX,shapeY,shapeZ);
+	}
 
     if (shapeX % chunkXSize != 0){
         aImageSize.mValueX = shapeX+(shapeX % chunkXSize);
@@ -492,7 +515,7 @@ void convertToImaris(int argc, char **argv)
             //uint16_t* vData = (uint16_t*)readTiffParallelWrapper(fileName);
             void* vData;
             if(!strcmp(reader,"tiff")) vData = readTiffParallelWrapper(fileName);
-            else vData = readZarrParallelWrapper(fileName,0,0,0,0,0,0,0);
+            else vData = readZarrParallelWrapper(fileName,crop,boundingBox[0],boundingBox[1],boundingBox[2],boundingBox[3],boundingBox[4],boundingBox[5]);
 
             for (uint64_t vZ = 0; vZ < vNBlocksZ; ++vZ) {
                 aBlockIndex.mValueZ = vZ;
