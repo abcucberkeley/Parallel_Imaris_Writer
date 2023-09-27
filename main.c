@@ -20,7 +20,8 @@ gcc -I. -L. -o bpImarisWriter96TestProgram.exe bpImarisWriter96TestProgram.c -lb
 */
 #include "bpImageConverterInterfaceC.h"
 #include "parallelReadTiff.h"
-#include "parallelReadZarr.h"
+#include "zarr.h"
+#include "parallelreadzarr.h"
 #include "mallocDynamic.h"
 
 #include <stdio.h>
@@ -250,7 +251,7 @@ void convertToImaris(int argc, char **argv)
         cFolder = strtok_r(fDup,delim,&saveptr2);
         lnTimePoints = nTimepoints;
 		while(cFolder){
-            listFiles(cFolder,cPatt,0,0,NULL,1,&nTimepoints);
+            listFiles(cFolder,cPatt,0,0,NULL,1,(int64_t*)&nTimepoints);
             cFolder = strtok_r(NULL,delim,&saveptr2);
         }
 		if(lnTimePoints == nTimepoints){
@@ -327,7 +328,8 @@ void convertToImaris(int argc, char **argv)
     char dtype[4];
     char order;
     uint64_t bits = 1;
-    char* cname = NULL;
+    std::string cname;
+	zarr Zarr;
 
     if(!strcmp(reader,"tiff")){
         uint64_t *size = getImageSize(files[0]);
@@ -340,8 +342,18 @@ void convertToImaris(int argc, char **argv)
         bits = getDataType(files[0]);
     }
     else{
-        setValuesFromJSON(files[0],&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ,&cname);
-        bits = dTypeToBits(dtype);
+		Zarr = zarr(files[0]);
+		chunkXSize = Zarr.get_chunks(0);
+		chunkYSize = Zarr.get_chunks(1);
+		chunkZSize = Zarr.get_chunks(2);
+		bits = Zarr.dtypeBytes()*8;
+		order = Zarr.get_order()[0];
+		shapeX = Zarr.get_shape(0);
+		shapeY = Zarr.get_shape(1);
+		shapeZ = Zarr.get_shape(2);
+		cname = Zarr.get_cname();
+        //setValuesFromJSON(files[0],&chunkXSize,&chunkYSize,&chunkZSize,dtype,&order,&shapeX,&shapeY,&shapeZ,&cname);
+        //bits = dTypeToBits(dtype);
     }
 	// Use custom chunk sizes if provided
     if(blockSizes){
@@ -515,7 +527,7 @@ void convertToImaris(int argc, char **argv)
             //uint16_t* vData = (uint16_t*)readTiffParallelWrapper(fileName);
             void* vData;
             if(!strcmp(reader,"tiff")) vData = readTiffParallelWrapper(fileName);
-            else vData = readZarrParallelWrapper(fileName,crop,boundingBox[0],boundingBox[1],boundingBox[2],boundingBox[3],boundingBox[4],boundingBox[5]);
+            else vData = readZarrParallelHelper(fileName,boundingBox[0],boundingBox[1],boundingBox[2],boundingBox[3],boundingBox[4],boundingBox[5],0);
 
             for (uint64_t vZ = 0; vZ < vNBlocksZ; ++vZ) {
                 aBlockIndex.mValueZ = vZ;
@@ -593,7 +605,7 @@ void convertToImaris(int argc, char **argv)
 
     unsigned int vNumberOfOtherSections = 1; // Image
     unsigned int vNumberOfSections = vNumberOfOtherSections + aImageSize.mValueC;
-    bpConverterTypesC_ParameterSection* vParameterSections = malloc(vNumberOfSections * sizeof(bpConverterTypesC_ParameterSection));
+    bpConverterTypesC_ParameterSection* vParameterSections = (bpConverterTypesC_ParameterSection*)malloc(vNumberOfSections * sizeof(bpConverterTypesC_ParameterSection));
 
     bpConverterTypesC_Parameter vUnitParameter = { "Unit", "um" };
     bpConverterTypesC_ParameterSection* vImageSection = &vParameterSections[0];
@@ -605,7 +617,7 @@ void convertToImaris(int argc, char **argv)
     char* vChannelNameBuffer = vChannelNamesBuffer;
 
     unsigned int vNumberOfParametersPerChannel = 3;
-    bpConverterTypesC_Parameter* vChannelParameters = malloc(aImageSize.mValueC * vNumberOfParametersPerChannel * sizeof(bpConverterTypesC_Parameter));
+    bpConverterTypesC_Parameter* vChannelParameters = (bpConverterTypesC_Parameter*)malloc(aImageSize.mValueC * vNumberOfParametersPerChannel * sizeof(bpConverterTypesC_Parameter));
     for (unsigned int vC = 0; vC < aImageSize.mValueC; ++vC) {
         bpConverterTypesC_Parameter* vThisChannelParameters = &vChannelParameters[vNumberOfParametersPerChannel * vC];
         vThisChannelParameters[0].mName = "Name";
@@ -626,7 +638,7 @@ void convertToImaris(int argc, char **argv)
     aParameters.mValuesCount = vNumberOfSections;
     aParameters.mValues = vParameterSections;
 
-    bpConverterTypesC_TimeInfo* vTimeInfos = malloc(aImageSize.mValueT * sizeof(bpConverterTypesC_TimeInfo));
+    bpConverterTypesC_TimeInfo* vTimeInfos = (bpConverterTypesC_TimeInfo*)malloc(aImageSize.mValueT * sizeof(bpConverterTypesC_TimeInfo));
     for (unsigned int vT = 0; vT < aImageSize.mValueT; ++vT) {
         vTimeInfos[vT].mJulianDay = 2458885; // 5 feb 2020
         unsigned long long vSeconds = vT + 4 + 60 * (27 + 60 * 15); // 3:27.04 PM + 1 sec per time point
@@ -636,7 +648,7 @@ void convertToImaris(int argc, char **argv)
     aTimeInfoPerTimePoint.mValuesCount = aImageSize.mValueT;
     aTimeInfoPerTimePoint.mValues = vTimeInfos;
 
-    bpConverterTypesC_ColorInfo* vColorInfos = malloc(aImageSize.mValueC * sizeof(bpConverterTypesC_ColorInfo));
+    bpConverterTypesC_ColorInfo* vColorInfos = (bpConverterTypesC_ColorInfo*)malloc(aImageSize.mValueC * sizeof(bpConverterTypesC_ColorInfo));
     for (unsigned int vC = 0; vC < aImageSize.mValueC; ++vC) {
         bpConverterTypesC_ColorInfo* vColor = &vColorInfos[vC];
         vColor->mIsBaseColorMode = true;
