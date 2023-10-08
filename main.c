@@ -407,6 +407,12 @@ void convertToImaris(int argc, char **argv)
 		printf("Bounding Box: %d %d %d %d %d %d\n",boundingBox[0],boundingBox[1],boundingBox[2],boundingBox[3],boundingBox[4],boundingBox[5]);
 		printf("New Shape: %d %d %d\n",shapeX,shapeY,shapeZ);
 	}
+	// If there is no bounding box then read the entire image
+	else{
+		boundingBox[3] = shapeX;
+		boundingBox[4] = shapeY;
+		boundingBox[5] = shapeZ;
+	}
 
     if (shapeX % chunkXSize != 0){
         aImageSize.mValueX = shapeX+(shapeX % chunkXSize);
@@ -461,9 +467,6 @@ void convertToImaris(int argc, char **argv)
     bpConverterTypesC_Size5D aBlockSize = {
         chunkXSize, chunkYSize, chunkZSize, 1, 1
     };
-    //char aOutputFile[256];
-    //sprintf(aOutputFile, "D:/imarisData/Matt_Test0.ims");
-    //sprintf(aOutputFile, "X:/imarisTesting/MattTestToph.ims");
 
     bpConverterTypesC_Options aOptions;
     aOptions.mThumbnailSizeXY = 256;
