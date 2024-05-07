@@ -2,3 +2,6 @@ g++ -O3 -DNDEBUG -Wl,-rpath='$ORIGIN' -I"/global/home/groups/software/sl-7.x86_6
 
 windows:
 g++ -O3 -DNDEBUG -Wl,-rpath='$ORIGIN' -I"C:\Program Files (x86)\ImarisWriter\include" -L"C:\Program Files (x86)\ImarisWriter\lib" -I"C:\Program Files (x86)\cpp-tiff\include" -L"C:\Program Files (x86)\cpp-tiff\lib" -I"C:\Program Files (x86)\cpp-zarr\include" -L"C:\Program Files (x86)\cpp-zarr\lib" -lpthread -fopenmp main.cpp -o parallelimariswriter -lbpImarisWriter96 -lcppTiff -lcppZarr
+
+mac:
+/usr/local/bin/g++-13 -O3 -DNDEBUG -I"/Users/abcx86mac/ImarisWriter/build/include" -I/Users/abcx86mac/c-tiff/src -I/usr/local/include -L/usr/local/lib -lcppTiff -lpthread -fopenmp -static-libstdc++ -static-libgcc -lcppZarr main.cpp -o parallelimariswriter /Users/abcx86mac/ImarisWriter/build/lib/libImarisWriter_static.a /usr/local/HDF_Group/HDF5/1.14.4/lib/libhdf5.a /usr/local/opt/zlib/lib/libz.a
