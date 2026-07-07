@@ -1,0 +1,251 @@
+cmake_minimum_required(VERSION 3.18)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+set(CMAKE_CXX_FLAGS "-Wall -Wextra")
+set(CMAKE_CXX_FLAGS_DEBUG "-g")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O3 -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+
+project(
+  parallel-imaris-writer
+  VERSION 1.1.0
+  LANGUAGES CXX)
+
+include(GNUInstallDirs)
+include(FetchContent)
+
+# Build the fetched static deps with position-independent code so they can be
+# linked into our (shared) libraries and the executable.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Everything we fetch is linked statically except the two abc libraries below,
+# which are declared SHARED explicitly and are therefore unaffected by this.
+set(BUILD_SHARED_LIBS OFF)
+
+# Set the RPATH so the executable finds the shared libraries shipped next to it.
+# Flat layout: everything lives in one folder. macOS uses @loader_path, not $ORIGIN.
+if(APPLE)
+  set(CMAKE_INSTALL_RPATH "@loader_path")
+else()
+  set(CMAKE_INSTALL_RPATH "$ORIGIN")
+endif()
+# Bake that RPATH into the binaries as they are built (not only at install time), so
+# the executable/libraries are relocatable straight out of the build tree -- this is
+# what lets the `release` target below just copy them into one folder and run.
+set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+
+# OpenMP is required for C++ only (main.cpp and the abc libraries use it; the C
+# deps do not, and requiring it for C would break Apple Clang's C compiler).
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+find_package(Threads REQUIRED)
+
+# ---------------------------------------------------------------------------
+# zlib -- one in-tree build shared by libtiff (inside cpp-tiff) and ImarisWriter.
+# Declaring it here first means cpp-tiff's own FetchContent(zlib) deduplicates to
+# this one instead of creating a second, conflicting zlibstatic target.
+# ---------------------------------------------------------------------------
+if(UNIX)
+  set(ZLIB_STATIC_NAME "libz.a")
+else()
+  set(ZLIB_STATIC_NAME "libzlibstatic.a")
+endif()
+set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(zlib
+    URL      https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+    URL_HASH SHA256=9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23
+)
+FetchContent_MakeAvailable(zlib)
+set_property(TARGET zlibstatic PROPERTY POSITION_INDEPENDENT_CODE ON)
+# zconf.h is generated into the binary dir, so expose both dirs to libtiff's FindZLIB.
+set(ZLIB_INCLUDE_DIR "${zlib_SOURCE_DIR};${zlib_BINARY_DIR}" CACHE STRING "" FORCE)
+set(ZLIB_LIBRARY     "${zlib_BINARY_DIR}/${ZLIB_STATIC_NAME}" CACHE STRING "" FORCE)
+
+# ---------------------------------------------------------------------------
+# lz4 -- ImarisWriter registers an HDF5 LZ4 filter (bpH5LZ4) and links liblz4.
+# ---------------------------------------------------------------------------
+set(LZ4_BUILD_CLI OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(lz4
+    URL      https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
+    URL_HASH SHA256=537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b
+    SOURCE_SUBDIR build/cmake
+)
+FetchContent_MakeAvailable(lz4)
+set(LZ4_INCLUDE_DIR "${lz4_SOURCE_DIR}/lib")
+
+# ---------------------------------------------------------------------------
+# HDF5 -- core C library only. ImarisWriter uses core H5Dwrite_chunk (no
+# high-level lib). Built without zlib/szip: this tool only ever writes with LZ4
+# (eCompressionAlgorithmLShuffleLZ4), and H5Pset_deflate still links fine without
+# the deflate filter -- so we skip the fragile "point HDF5 at an in-tree zlib" wiring.
+# ---------------------------------------------------------------------------
+set(HDF5_ENABLE_Z_LIB_SUPPORT OFF CACHE BOOL "" FORCE)
+set(HDF5_ENABLE_SZIP_SUPPORT  OFF CACHE BOOL "" FORCE)
+set(HDF5_BUILD_HL_LIB   OFF CACHE BOOL "" FORCE)
+set(HDF5_BUILD_CPP_LIB  OFF CACHE BOOL "" FORCE)
+set(HDF5_BUILD_FORTRAN  OFF CACHE BOOL "" FORCE)
+set(HDF5_BUILD_JAVA     OFF CACHE BOOL "" FORCE)
+set(HDF5_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
+set(HDF5_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(HDF5_BUILD_UTILS    OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING       OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(hdf5
+    URL      https://github.com/HDFGroup/hdf5/releases/download/hdf5_1.14.6/hdf5-1.14.6.tar.gz
+    URL_HASH SHA256=e4defbac30f50d64e1556374aa49e574417c9e72c6b1de7a4ff88c4b1bea6e9b
+)
+FetchContent_MakeAvailable(hdf5)
+
+# ---------------------------------------------------------------------------
+# cpp-tiff and cpp-zarr -- your reader libraries, built as libcppTiff/libcppZarr.
+# Pinned to specific commits for reproducibility; bump the GIT_TAGs (or use "main")
+# to pick up new versions.
+# ---------------------------------------------------------------------------
+# cpp-zarr's bundled c-blosc2 otherwise builds its own zlib-ng, whose "zlib"/
+# "zlibstatic" targets collide with the zlib we (and cpp-tiff) fetched above.
+# Point blosc2 at the shared zlib via find_package(ZLIB) instead.
+set(PREFER_EXTERNAL_ZLIB ON CACHE BOOL "" FORCE)
+FetchContent_Declare(cpptiff
+    GIT_REPOSITORY https://github.com/abcucberkeley/cpp-tiff.git
+    GIT_TAG        aaeb028a4f3df627c5771163c051f099f92d07c8
+)
+FetchContent_Declare(cppzarr
+    GIT_REPOSITORY https://github.com/abcucberkeley/cpp-zarr.git
+    GIT_TAG        322353728b32402024566a59452c4561e802a7b6
+)
+FetchContent_MakeAvailable(cpptiff cppzarr)
+
+# ---------------------------------------------------------------------------
+# ImarisWriter -- fetched but NOT configured with its own CMakeLists (which does
+# find_package(HDF5/ZLIB/LZ4 REQUIRED) and fights FetchContent). Pointing
+# SOURCE_SUBDIR at a headers-only dir makes MakeAvailable populate the source
+# without calling add_subdirectory; we then compile it ourselves below.
+# ---------------------------------------------------------------------------
+FetchContent_Declare(imariswriter
+    GIT_REPOSITORY https://github.com/imaris/ImarisWriter.git
+    GIT_TAG        b128e6e7d1a147261e9d5caf24ebc6b5c9c63779
+    SOURCE_SUBDIR  interfaceC
+)
+FetchContent_MakeAvailable(imariswriter)
+
+set(IW_DIR "${imariswriter_SOURCE_DIR}")
+file(GLOB IW_SRCS "${IW_DIR}/c/*.cxx" "${IW_DIR}/writer/*.cxx")
+
+add_library(ImarisWriter_static STATIC ${IW_SRCS})
+# ImarisWriter is C++14; keep it isolated from the C++11 used for the rest.
+set_target_properties(ImarisWriter_static PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
+target_include_directories(ImarisWriter_static
+    PUBLIC
+        ${IW_DIR}
+        ${IW_DIR}/interface
+        ${IW_DIR}/interfaceC
+        ${IW_DIR}/writer
+    PRIVATE
+        ${hdf5_SOURCE_DIR}/src
+        ${hdf5_BINARY_DIR}/src
+        ${zlib_SOURCE_DIR}
+        ${zlib_BINARY_DIR}
+        ${LZ4_INCLUDE_DIR}
+)
+# PUBLIC so the executable that links ImarisWriter_static inherits these static deps.
+target_link_libraries(ImarisWriter_static PUBLIC
+    hdf5-static
+    zlibstatic
+    lz4_static
+    Threads::Threads
+)
+
+# ---------------------------------------------------------------------------
+# parallelimariswriter executable
+# ---------------------------------------------------------------------------
+set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
+add_executable(parallelimariswriter ${SRC_DIR}/main.cpp)
+
+# cpp-tiff's src dir is listed before cpp-zarr's on purpose: both ship a
+# helperfunctions.h and main.cpp includes it unqualified -- cpp-tiff's must win,
+# matching the original gccImaris.txt include order.
+target_include_directories(parallelimariswriter PRIVATE
+    ${IW_DIR}/interfaceC        # bpImageConverterInterfaceC.h + bpConverterTypesC.h
+    ${cpptiff_SOURCE_DIR}/src   # parallelreadtiff.h, helperfunctions.h
+    ${cppzarr_SOURCE_DIR}/src   # zarr.h, parallelreadzarr.h
+)
+
+target_link_libraries(parallelimariswriter PRIVATE
+    ImarisWriter_static
+    cppTiff_shared
+    cppZarr_shared
+    nlohmann_json::nlohmann_json   # zarr.h includes <nlohmann/json.hpp>
+    OpenMP::OpenMP_CXX
+    Threads::Threads
+    ${CMAKE_DL_LIBS}
+)
+
+# Statically pull in libstdc++/libgcc so the ONLY dynamic dependencies are the
+# three libraries we ship in the folder (libcppTiff, libcppZarr, libgomp) plus the
+# system C libraries. Only valid for GNU; Apple Clang rejects these flags (build on
+# macOS with Homebrew gcc, as before).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_link_options(parallelimariswriter PRIVATE -static-libstdc++ -static-libgcc)
+    if(NOT APPLE)
+        # Emit DT_RPATH (searched before LD_LIBRARY_PATH) instead of DT_RUNPATH, so the
+        # bundled libgomp/libcppTiff/libcppZarr always take precedence -- matching the
+        # $ORIGIN RPATH of the previous release.
+        target_link_options(parallelimariswriter PRIVATE -Wl,--disable-new-dtags)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# Release layout. Everything is linked statically EXCEPT the three libraries we
+# ship next to the executable and load through the $ORIGIN / @loader_path RPATH:
+#   * libcppTiff, libcppZarr  -- your reader libraries
+#   * the OpenMP runtime (libgomp, for GCC)
+# ---------------------------------------------------------------------------
+
+# Resolve the real OpenMP runtime object and the file name the loader asks for
+# (its SONAME/install-name), so the copy we ship satisfies the executable's and
+# the cpp libraries' NEEDED entry.
+if(APPLE)
+    set(OPENMP_RUNTIME_SONAME "libgomp.1.dylib")
+else()
+    set(OPENMP_RUNTIME_SONAME "libgomp.so.1")
+endif()
+if(OpenMP_gomp_LIBRARY)
+    get_filename_component(OPENMP_RUNTIME "${OpenMP_gomp_LIBRARY}" REALPATH)
+else()
+    message(WARNING "OpenMP runtime (libgomp) not located -- it will not be bundled. "
+                    "Building with GCC is expected.")
+endif()
+
+set(RUNTIME_PERMS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+
+# `cmake --install <build> --prefix <dir>` produces a self-contained <dir>/bin.
+install(TARGETS parallelimariswriter RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
+install(FILES $<TARGET_FILE:cppTiff_shared> $<TARGET_FILE:cppZarr_shared>
+        DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
+if(OpenMP_gomp_LIBRARY)
+    install(FILES "${OPENMP_RUNTIME}" RENAME "${OPENMP_RUNTIME_SONAME}"
+            DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
+endif()
+
+# Convenience: `cmake --build <build> --target release` assembles the exact flat
+# folder you ship:  <build>/Parallel_Imaris_Writer/
+#   parallelimariswriter  libcppTiff.so  libcppZarr.so  libgomp.so.1
+set(RELEASE_DIR "${CMAKE_BINARY_DIR}/Parallel_Imaris_Writer")
+set(RELEASE_CMDS
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${RELEASE_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:parallelimariswriter> "${RELEASE_DIR}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:cppTiff_shared>       "${RELEASE_DIR}/"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:cppZarr_shared>       "${RELEASE_DIR}/")
+if(OpenMP_gomp_LIBRARY)
+    list(APPEND RELEASE_CMDS
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENMP_RUNTIME}" "${RELEASE_DIR}/${OPENMP_RUNTIME_SONAME}")
+endif()
+add_custom_target(release ${RELEASE_CMDS}
+    DEPENDS parallelimariswriter
+    COMMENT "Assembling self-contained release in ${RELEASE_DIR}"
+    VERBATIM)
