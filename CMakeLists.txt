@@ -139,6 +139,12 @@ file(GLOB IW_SRCS "${IW_DIR}/c/*.cxx" "${IW_DIR}/writer/*.cxx")
 add_library(ImarisWriter_static STATIC ${IW_SRCS})
 # ImarisWriter is C++14; keep it isolated from the C++11 used for the rest.
 set_target_properties(ImarisWriter_static PROPERTIES CXX_STANDARD 14 CXX_STANDARD_REQUIRED ON)
+# We link ImarisWriter statically, but its C interface header defaults to
+# __declspec(dllimport) on Windows -- which makes MinGW look for __imp_* symbols that
+# a static lib doesn't have. EXPORT_IMARISWRITER_DLL switches it to dllexport (plain
+# symbols); PUBLIC so main.cpp sees it too. No-op on Linux/macOS (visibility default
+# either way).
+target_compile_definitions(ImarisWriter_static PUBLIC EXPORT_IMARISWRITER_DLL)
 target_include_directories(ImarisWriter_static
     PUBLIC
         ${IW_DIR}
@@ -196,6 +202,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         # bundled libgomp/libcppTiff/libcppZarr always take precedence -- matching the
         # $ORIGIN RPATH of the previous release. ELF-only, so not on macOS or Windows/MinGW.
         target_link_options(parallelimariswriter PRIVATE -Wl,--disable-new-dtags)
+    endif()
+    if(WIN32)
+        # libcppTiff.dll / libcppZarr.dll (built with -static-libgcc) re-export libgcc's
+        # unwind symbols, which then clash with this exe's own static libgcc (e.g.
+        # _Unwind_Resume). Same fix cpp-zarr uses for MinGW.
+        target_link_options(parallelimariswriter PRIVATE -Wl,--allow-multiple-definition)
     endif()
 endif()
 
