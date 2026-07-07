@@ -191,10 +191,10 @@ target_link_libraries(parallelimariswriter PRIVATE
 # macOS with Homebrew gcc, as before).
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_link_options(parallelimariswriter PRIVATE -static-libstdc++ -static-libgcc)
-    if(NOT APPLE)
+    if(NOT APPLE AND NOT WIN32)
         # Emit DT_RPATH (searched before LD_LIBRARY_PATH) instead of DT_RUNPATH, so the
         # bundled libgomp/libcppTiff/libcppZarr always take precedence -- matching the
-        # $ORIGIN RPATH of the previous release.
+        # $ORIGIN RPATH of the previous release. ELF-only, so not on macOS or Windows/MinGW.
         target_link_options(parallelimariswriter PRIVATE -Wl,--disable-new-dtags)
     endif()
 endif()
@@ -206,19 +206,24 @@ endif()
 #   * the OpenMP runtime (libgomp, for GCC)
 # ---------------------------------------------------------------------------
 
-# Resolve the real OpenMP runtime object and the file name the loader asks for
-# (its SONAME/install-name), so the copy we ship satisfies the executable's and
-# the cpp libraries' NEEDED entry.
-if(APPLE)
-    set(OPENMP_RUNTIME_SONAME "libgomp.1.dylib")
-else()
-    set(OPENMP_RUNTIME_SONAME "libgomp.so.1")
-endif()
-if(OpenMP_gomp_LIBRARY)
-    get_filename_component(OPENMP_RUNTIME "${OpenMP_gomp_LIBRARY}" REALPATH)
-else()
-    message(WARNING "OpenMP runtime (libgomp) not located -- it will not be bundled. "
-                    "Building with GCC is expected.")
+# Locate the OpenMP runtime object (libgomp) to ship next to the executable, and the
+# file name the loader asks for. Bundled only on Linux/macOS (ELF/Mach-O); on Windows
+# the MinGW runtime DLLs (libgomp-1.dll, libwinpthread-1.dll) are resolved from the
+# executable's directory / PATH, as in the previous Windows release.
+set(BUNDLE_OPENMP FALSE)
+if(NOT WIN32)
+    if(OpenMP_gomp_LIBRARY)
+        get_filename_component(OPENMP_RUNTIME "${OpenMP_gomp_LIBRARY}" REALPATH)
+        if(APPLE)
+            set(OPENMP_RUNTIME_SONAME "libgomp.1.dylib")
+        else()
+            set(OPENMP_RUNTIME_SONAME "libgomp.so.1")
+        endif()
+        set(BUNDLE_OPENMP TRUE)
+    else()
+        message(WARNING "OpenMP runtime (libgomp) not located -- it will not be bundled. "
+                        "Building with GCC is expected.")
+    endif()
 endif()
 
 set(RUNTIME_PERMS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
@@ -227,7 +232,7 @@ set(RUNTIME_PERMS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE 
 install(TARGETS parallelimariswriter RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
 install(FILES $<TARGET_FILE:cppTiff_shared> $<TARGET_FILE:cppZarr_shared>
         DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
-if(OpenMP_gomp_LIBRARY)
+if(BUNDLE_OPENMP)
     install(FILES "${OPENMP_RUNTIME}" RENAME "${OPENMP_RUNTIME_SONAME}"
             DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
 endif()
@@ -241,9 +246,16 @@ set(RELEASE_CMDS
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:parallelimariswriter> "${RELEASE_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:cppTiff_shared>       "${RELEASE_DIR}/"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:cppZarr_shared>       "${RELEASE_DIR}/")
-if(OpenMP_gomp_LIBRARY)
+if(BUNDLE_OPENMP)
     list(APPEND RELEASE_CMDS
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENMP_RUNTIME}" "${RELEASE_DIR}/${OPENMP_RUNTIME_SONAME}")
+    if(APPLE)
+        # Homebrew's libgomp records an absolute install-name, so repoint the copied
+        # binaries at the bundled copy (@loader_path) -- otherwise the release only runs
+        # on Macs that have Homebrew GCC. (Standard install_name_tool fixup; verify on ARM.)
+        list(APPEND RELEASE_CMDS
+            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos_bundle_openmp.sh" "${RELEASE_DIR}")
+    endif()
 endif()
 add_custom_target(release ${RELEASE_CMDS}
     DEPENDS parallelimariswriter
