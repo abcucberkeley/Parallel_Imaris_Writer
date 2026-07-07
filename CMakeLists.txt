@@ -273,3 +273,46 @@ add_custom_target(release ${RELEASE_CMDS}
     DEPENDS parallelimariswriter
     COMMENT "Assembling self-contained release in ${RELEASE_DIR}"
     VERBATIM)
+
+# ---------------------------------------------------------------------------
+# Round-trip smoke test (CTest): a per-platform "does the shipped binary actually
+# run" check. tests/roundtrip.cpp generates a tiny TIFF and a tiny zstd/F-order
+# Zarr on the fly (no committed test data), runs the executable on each, and
+# verifies a valid Imaris/HDF5 file comes out. Enable with -DPIW_BUILD_TESTS=ON:
+#     cmake --build <build>
+#     ctest --test-dir <build> --output-on-failure
+# A project-specific option name avoids clashing with dependencies' BUILD_TESTS.
+# ---------------------------------------------------------------------------
+option(PIW_BUILD_TESTS "Build and register the round-trip smoke test" OFF)
+if(PIW_BUILD_TESTS)
+    enable_testing()
+
+    # Links the reader libraries to generate the inputs on the fly.
+    add_executable(roundtripTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.cpp)
+    set_target_properties(roundtripTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(roundtripTest PRIVATE
+        ${cpptiff_SOURCE_DIR}/src ${cppzarr_SOURCE_DIR}/src)
+    target_link_libraries(roundtripTest PRIVATE
+        cppTiff_shared cppZarr_shared nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX)
+    add_dependencies(release roundtripTest)
+
+    # The test binary and the executable it spawns both need the shared libs
+    # co-located ($ORIGIN / @loader_path / same-dir), which the build-tree binaries
+    # can't satisfy (libs live under _deps/). The setup fixture assembles the
+    # pristine release folder, then mirrors it -- plus the test binary -- into a
+    # separate staging dir, so the test runs self-contained WITHOUT leaking the test
+    # binary into the shipped release.
+    set(ROUNDTRIP_STAGE "${CMAKE_BINARY_DIR}/roundtrip_stage")
+    add_test(NAME roundtrip_setup COMMAND ${CMAKE_COMMAND}
+        -DRELEASE_DIR=${RELEASE_DIR} -DSTAGE_DIR=${ROUNDTRIP_STAGE}
+        -DTEST_EXE=$<TARGET_FILE:roundtripTest>
+        -DBUILD_DIR=${CMAKE_BINARY_DIR} -DCFG=$<CONFIG>
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/stage_roundtrip.cmake)
+    set_tests_properties(roundtrip_setup PROPERTIES FIXTURES_SETUP piw_release)
+
+    add_test(NAME roundtrip
+        COMMAND "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:roundtripTest>"
+                "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
+                "${CMAKE_CURRENT_BINARY_DIR}/roundtrip_work")
+    set_tests_properties(roundtrip PROPERTIES FIXTURES_REQUIRED piw_release)
+endif()
