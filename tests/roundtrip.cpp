@@ -28,8 +28,19 @@ static bool isHDF5(const fs::path& p){
 static bool runCase(const std::string& exe, const std::string& reader,
                     const fs::path& indir, const fs::path& outdir){
     fs::remove_all(outdir); fs::create_directories(outdir);
-    std::string cmd = "\"" + exe + "\" -P CamA -F \"" + indir.string() +
-                      "\" -o \"" + outdir.string() + "\" -r " + reader + " -v 1,1,1";
+    // Native separators: std::system() runs via cmd.exe on Windows, which cannot
+    // launch an executable given a forward-slash path (CMake passes C:/... paths).
+    const std::string exeN = fs::path(exe).make_preferred().string();
+    const std::string inN  = fs::path(indir).make_preferred().string();
+    const std::string outN = fs::path(outdir).make_preferred().string();
+    std::string cmd = "\"" + exeN + "\" -P CamA -F \"" + inN +
+                      "\" -o \"" + outN + "\" -r " + reader + " -v 1,1,1";
+#ifdef _WIN32
+    // std::system() runs `cmd /c <cmd>`; when <cmd> starts with a quoted path,
+    // cmd.exe mangles it ("The system cannot find the path specified") unless the
+    // whole command is wrapped in one more pair of quotes, which cmd then strips.
+    cmd = "\"" + cmd + "\"";
+#endif
     std::printf("[%s] running: %s\n", reader.c_str(), cmd.c_str()); std::fflush(stdout);
     int rc = std::system(cmd.c_str());
     fs::path ims = outdir / "output.ims";
