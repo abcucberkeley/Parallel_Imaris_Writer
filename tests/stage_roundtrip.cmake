@@ -20,3 +20,6 @@ file(MAKE_DIRECTORY "${STAGE_DIR}")
 file(GLOB _release_files "${RELEASE_DIR}/*")
 file(COPY ${_release_files} DESTINATION "${STAGE_DIR}")   # executable + shared libs
 file(COPY "${TEST_EXE}"     DESTINATION "${STAGE_DIR}")   # the smoke-test binary
+if(DEFINED TEST_EXE_2 AND NOT TEST_EXE_2 STREQUAL "")
+    file(COPY "${TEST_EXE_2}" DESTINATION "${STAGE_DIR}") # the block-equivalence test binary
+endif()

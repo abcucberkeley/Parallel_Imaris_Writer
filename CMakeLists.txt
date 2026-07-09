@@ -103,8 +103,9 @@ FetchContent_MakeAvailable(hdf5)
 
 # ---------------------------------------------------------------------------
 # cpp-tiff and cpp-zarr -- your reader libraries, built as libcppTiff/libcppZarr.
-# Pinned to specific commits for reproducibility; bump the GIT_TAGs (or use "main")
-# to pick up new versions.
+# Pinned to release tags for reproducibility; bump the GIT_TAGs to pick up new
+# versions. cpp-tiff v1.5.1 carries the Z-range readTiffParallelWrapper overload
+# the -C block feature needs.
 # ---------------------------------------------------------------------------
 # cpp-zarr's bundled c-blosc2 otherwise builds its own zlib-ng, whose "zlib"/
 # "zlibstatic" targets collide with the zlib we (and cpp-tiff) fetched above.
@@ -112,11 +113,11 @@ FetchContent_MakeAvailable(hdf5)
 set(PREFER_EXTERNAL_ZLIB ON CACHE BOOL "" FORCE)
 FetchContent_Declare(cpptiff
     GIT_REPOSITORY https://github.com/abcucberkeley/cpp-tiff.git
-    GIT_TAG        aaeb028a4f3df627c5771163c051f099f92d07c8
+    GIT_TAG        v1.5.1
 )
 FetchContent_Declare(cppzarr
     GIT_REPOSITORY https://github.com/abcucberkeley/cpp-zarr.git
-    GIT_TAG        322353728b32402024566a59452c4561e802a7b6
+    GIT_TAG        v1.5.0
 )
 FetchContent_MakeAvailable(cpptiff cppzarr)
 
@@ -283,7 +284,7 @@ add_custom_target(release ${RELEASE_CMDS}
 #     ctest --test-dir <build> --output-on-failure
 # A project-specific option name avoids clashing with dependencies' BUILD_TESTS.
 # ---------------------------------------------------------------------------
-option(PIW_BUILD_TESTS "Build and register the round-trip smoke test" OFF)
+option(PIW_BUILD_TESTS "Build and register the round-trip smoke + block-equivalence tests" OFF)
 if(PIW_BUILD_TESTS)
     enable_testing()
 
@@ -296,6 +297,19 @@ if(PIW_BUILD_TESTS)
         cppTiff_shared cppZarr_shared nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX)
     add_dependencies(release roundtripTest)
 
+    # Block-equivalence test: additionally links (static) HDF5 so it can compare the
+    # raw compressed chunks of the -C output against the whole-timepoint output
+    # (the .ims voxel data must be identical). Portable -- no h5py / HDF5 tools.
+    add_executable(blockTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/blocktest.cpp)
+    set_target_properties(blockTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(blockTest PRIVATE
+        ${cpptiff_SOURCE_DIR}/src ${cppzarr_SOURCE_DIR}/src
+        ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src)
+    target_link_libraries(blockTest PRIVATE
+        cppTiff_shared cppZarr_shared nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX
+        hdf5-static Threads::Threads ${CMAKE_DL_LIBS})
+    add_dependencies(release blockTest)
+
     # The test binary and the executable it spawns both need the shared libs
     # co-located ($ORIGIN / @loader_path / same-dir), which the build-tree binaries
     # can't satisfy (libs live under _deps/). The setup fixture assembles the
@@ -306,6 +320,7 @@ if(PIW_BUILD_TESTS)
     add_test(NAME roundtrip_setup COMMAND ${CMAKE_COMMAND}
         -DRELEASE_DIR=${RELEASE_DIR} -DSTAGE_DIR=${ROUNDTRIP_STAGE}
         -DTEST_EXE=$<TARGET_FILE:roundtripTest>
+        -DTEST_EXE_2=$<TARGET_FILE:blockTest>
         -DBUILD_DIR=${CMAKE_BINARY_DIR} -DCFG=$<CONFIG>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/stage_roundtrip.cmake)
     set_tests_properties(roundtrip_setup PROPERTIES FIXTURES_SETUP piw_release)
@@ -315,4 +330,11 @@ if(PIW_BUILD_TESTS)
                 "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
                 "${CMAKE_CURRENT_BINARY_DIR}/roundtrip_work")
     set_tests_properties(roundtrip PROPERTIES FIXTURES_REQUIRED piw_release)
+
+    # Verifies -C block processing yields byte-identical voxel data to a whole read.
+    add_test(NAME blockEquivalence
+        COMMAND "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:blockTest>"
+                "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
+                "${CMAKE_CURRENT_BINARY_DIR}/blocktest_work")
+    set_tests_properties(blockEquivalence PROPERTIES FIXTURES_REQUIRED piw_release)
 endif()
