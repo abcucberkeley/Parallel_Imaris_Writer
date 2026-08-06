@@ -23,3 +23,6 @@ file(COPY "${TEST_EXE}"     DESTINATION "${STAGE_DIR}")   # the smoke-test binar
 if(DEFINED TEST_EXE_2 AND NOT TEST_EXE_2 STREQUAL "")
     file(COPY "${TEST_EXE_2}" DESTINATION "${STAGE_DIR}") # the block-equivalence test binary
 endif()
+if(DEFINED TEST_EXE_3 AND NOT TEST_EXE_3 STREQUAL "")
+    file(COPY "${TEST_EXE_3}" DESTINATION "${STAGE_DIR}") # the parallel-equivalence test binary
+endif()

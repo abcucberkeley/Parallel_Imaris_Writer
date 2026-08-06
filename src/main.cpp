@@ -23,6 +23,7 @@ gcc -I. -L. -o bpImarisWriter96TestProgram.exe bpImarisWriter96TestProgram.c -lb
 #include "parallelreadtiff.h"
 #include "zarr.h"
 #include "parallelreadzarr.h"
+#include "parallel.h"
 #include <sstream>
 #include <stdio.h>
 #include <string.h>
@@ -483,26 +484,24 @@ void convertToImaris(int argc, char **argv)
 		boundingBox[5] = shapeZ;
 	}
 
-    if (shapeX % chunkXSize != 0){
-        aImageSize.mValueX = shapeX+(shapeX % chunkXSize);
-    }
-    else aImageSize.mValueX = shapeX;
-    if (shapeY % chunkYSize != 0){
-        aImageSize.mValueY = shapeY+(shapeY % chunkYSize);
-    }
-    else aImageSize.mValueY = shapeY;
-    if (shapeZ % chunkZSize != 0){
-        aImageSize.mValueZ = shapeZ+(shapeZ % chunkZSize);
-    }
-    else aImageSize.mValueZ = shapeZ;
+    // The Imaris image is exactly the data size; the writer pads each resolution
+    // level up to its chunk boundary internally. (Earlier code added shapeX %
+    // chunkXSize here to "round up" to a chunk multiple, but that formula was
+    // wrong -- it added the remainder, not its complement -- inflating a
+    // non-chunk-aligned dimension into extra zero-filled planes and skewing the
+    // pyramid. It also made the output depend on the arbitrary zarr chunk size,
+    // so the same data chunked differently produced different .ims files.)
+    aImageSize.mValueX = shapeX;
+    aImageSize.mValueY = shapeY;
+    aImageSize.mValueZ = shapeZ;
 
     aImageSize.mValueT = timepoints;
     aImageSize.mValueC = channels;
 
 
-    vVoxelSizeX = 1.08f;
-    vVoxelSizeY = 1.08f;
-    vVoxelSizeZ = 1.08f;
+    vVoxelSizeX = 0.108f;
+    vVoxelSizeY = 0.108f;
+    vVoxelSizeZ = 0.108f;
     if(vVoxelSizes){
         char* saveptrV = NULL;
         char* cV = NULL;
@@ -783,6 +782,9 @@ int main(int argc, char **argv)
 {
     //listFiles("C:/Users/Matt/Desktop/test","CamA");
     //return 0;
+
+    // Cluster subcommands (setup/worker/combine/monitor); otherwise the monolithic conversion.
+    if(argc >= 2 && isParallelCommand(argv[1])) return runParallel(argc, argv);
 
     convertToImaris(argc,argv);
     return 0;

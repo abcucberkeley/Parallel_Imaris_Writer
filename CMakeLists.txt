@@ -117,7 +117,7 @@ FetchContent_Declare(cpptiff
 )
 FetchContent_Declare(cppzarr
     GIT_REPOSITORY https://github.com/abcucberkeley/cpp-zarr.git
-    GIT_TAG        v1.5.0
+    GIT_TAG        v1.5.1
 )
 FetchContent_MakeAvailable(cpptiff cppzarr)
 
@@ -171,15 +171,21 @@ target_link_libraries(ImarisWriter_static PUBLIC
 # parallelimariswriter executable
 # ---------------------------------------------------------------------------
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
-add_executable(parallelimariswriter ${SRC_DIR}/main.cpp)
+# parallel.cpp adds the cluster subcommands (setup/worker/combine/monitor); it reads
+# zarr chunks and writes raw HDF5 chunks directly, so it needs the HDF5 + lz4 headers.
+add_executable(parallelimariswriter ${SRC_DIR}/main.cpp ${SRC_DIR}/parallel.cpp)
 
 # cpp-tiff's src dir is listed before cpp-zarr's on purpose: both ship a
 # helperfunctions.h and main.cpp includes it unqualified -- cpp-tiff's must win,
 # matching the original gccImaris.txt include order.
 target_include_directories(parallelimariswriter PRIVATE
     ${IW_DIR}/interfaceC        # bpImageConverterInterfaceC.h + bpConverterTypesC.h
+    ${IW_DIR}/writer            # bpDeriche.h (parallel.cpp reuses the Gaussian for channel ColorRange)
     ${cpptiff_SOURCE_DIR}/src   # parallelreadtiff.h, helperfunctions.h
     ${cppzarr_SOURCE_DIR}/src   # zarr.h, parallelreadzarr.h
+    ${hdf5_SOURCE_DIR}/src      # hdf5.h (parallel.cpp writes raw chunks)
+    ${hdf5_BINARY_DIR}/src      # H5pubconf.h (generated)
+    ${LZ4_INCLUDE_DIR}          # lz4.h (parallel.cpp compresses chunks)
 )
 
 target_link_libraries(parallelimariswriter PRIVATE
@@ -310,6 +316,20 @@ if(PIW_BUILD_TESTS)
         hdf5-static Threads::Threads ${CMAKE_DL_LIBS})
     add_dependencies(release blockTest)
 
+    # Parallel-equivalence test: the same static-HDF5 raw-chunk comparison, but it
+    # drives the cluster subcommands (setup/worker/combine) as independent processes
+    # and checks the assembled .ims has byte-identical voxel data to the monolithic
+    # conversion. Zarr-only (the parallel path reads Zarr), so no cpp-tiff link.
+    add_executable(parallelTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/paralleltest.cpp)
+    set_target_properties(parallelTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(parallelTest PRIVATE
+        ${cppzarr_SOURCE_DIR}/src
+        ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src)
+    target_link_libraries(parallelTest PRIVATE
+        cppZarr_shared nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX
+        hdf5-static Threads::Threads ${CMAKE_DL_LIBS})
+    add_dependencies(release parallelTest)
+
     # The test binary and the executable it spawns both need the shared libs
     # co-located ($ORIGIN / @loader_path / same-dir), which the build-tree binaries
     # can't satisfy (libs live under _deps/). The setup fixture assembles the
@@ -321,6 +341,7 @@ if(PIW_BUILD_TESTS)
         -DRELEASE_DIR=${RELEASE_DIR} -DSTAGE_DIR=${ROUNDTRIP_STAGE}
         -DTEST_EXE=$<TARGET_FILE:roundtripTest>
         -DTEST_EXE_2=$<TARGET_FILE:blockTest>
+        -DTEST_EXE_3=$<TARGET_FILE:parallelTest>
         -DBUILD_DIR=${CMAKE_BINARY_DIR} -DCFG=$<CONFIG>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/stage_roundtrip.cmake)
     set_tests_properties(roundtrip_setup PROPERTIES FIXTURES_SETUP piw_release)
@@ -337,4 +358,12 @@ if(PIW_BUILD_TESTS)
                 "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
                 "${CMAKE_CURRENT_BINARY_DIR}/blocktest_work")
     set_tests_properties(blockEquivalence PROPERTIES FIXTURES_REQUIRED piw_release)
+
+    # Verifies the cluster subcommands assemble a single .ims with voxel data
+    # byte-identical to the monolithic conversion.
+    add_test(NAME parallelEquivalence
+        COMMAND "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelTest>"
+                "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
+                "${CMAKE_CURRENT_BINARY_DIR}/paralleltest_work")
+    set_tests_properties(parallelEquivalence PROPERTIES FIXTURES_REQUIRED piw_release)
 endif()
