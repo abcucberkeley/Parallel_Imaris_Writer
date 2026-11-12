@@ -171,17 +171,23 @@ target_link_libraries(ImarisWriter_static PUBLIC
 )
 
 # ---------------------------------------------------------------------------
-# parallelimariswriter executable
+# Converter core (piw_core) and the parallelimariswriter executable
 # ---------------------------------------------------------------------------
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
-# parallel.cpp adds the cluster subcommands (setup/worker/combine/monitor); it reads
-# zarr chunks and writes raw HDF5 chunks directly, so it needs the HDF5 + lz4 headers.
-add_executable(parallelimariswriter ${SRC_DIR}/main.cpp ${SRC_DIR}/parallel.cpp)
+# Every src/*.cpp except main.cpp is the converter core: converter.cpp (piw::convert, the
+# library API of parallelimariswriter.h), cli.cpp (the command line, piw::runCli) and
+# parallel.cpp (the cluster subcommands; it reads zarr chunks and writes raw HDF5 chunks
+# directly, so it needs the HDF5 + lz4 headers). Compiled once, linked into the executable
+# and into the tests that call the API. After adding a source file, use a fresh build
+# directory (a re-configure breaks cpp-zarr's libuuid step).
+file(GLOB PIW_CORE_SOURCES CONFIGURE_DEPENDS ${SRC_DIR}/*.cpp)
+list(REMOVE_ITEM PIW_CORE_SOURCES ${SRC_DIR}/main.cpp)
+add_library(piw_core OBJECT ${PIW_CORE_SOURCES})
 
 # cpp-tiff's src dir is listed before cpp-zarr's on purpose: both ship a
-# helperfunctions.h and main.cpp includes it unqualified -- cpp-tiff's must win,
+# helperfunctions.h and converter.cpp includes it unqualified -- cpp-tiff's must win,
 # matching the original gccImaris.txt include order.
-target_include_directories(parallelimariswriter PRIVATE
+set(PIW_INCLUDE_DIRS
     ${IW_DIR}/interfaceC        # bpImageConverterInterfaceC.h + bpConverterTypesC.h
     ${IW_DIR}/writer            # bpDeriche.h (parallel.cpp reuses the Gaussian for channel ColorRange)
     ${cpptiff_SOURCE_DIR}/src   # parallelreadtiff.h, helperfunctions.h
@@ -190,8 +196,7 @@ target_include_directories(parallelimariswriter PRIVATE
     ${hdf5_BINARY_DIR}/src      # H5pubconf.h (generated)
     ${LZ4_INCLUDE_DIR}          # lz4.h (parallel.cpp compresses chunks)
 )
-
-target_link_libraries(parallelimariswriter PRIVATE
+set(PIW_LINK_LIBRARIES
     ImarisWriter_static
     cppTiff_shared
     cppZarr_shared
@@ -200,26 +205,36 @@ target_link_libraries(parallelimariswriter PRIVATE
     Threads::Threads
     ${CMAKE_DL_LIBS}
 )
+target_include_directories(piw_core PRIVATE ${PIW_INCLUDE_DIRS})
+target_compile_definitions(piw_core PRIVATE PIW_VERSION="${PROJECT_VERSION}")
+target_link_libraries(piw_core PRIVATE ${PIW_LINK_LIBRARIES})   # usage requirements only (object library)
+
+add_executable(parallelimariswriter ${SRC_DIR}/main.cpp $<TARGET_OBJECTS:piw_core>)
+target_include_directories(parallelimariswriter PRIVATE ${PIW_INCLUDE_DIRS})
+target_link_libraries(parallelimariswriter PRIVATE ${PIW_LINK_LIBRARIES})
 
 # Statically pull in libstdc++/libgcc so the ONLY dynamic dependencies are the
 # three libraries we ship in the folder (libcppTiff, libcppZarr, libgomp) plus the
 # system C libraries. Only valid for GNU; Apple Clang rejects these flags (build on
-# macOS with Homebrew gcc, as before).
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_link_options(parallelimariswriter PRIVATE -static-libstdc++ -static-libgcc)
-    if(NOT APPLE AND NOT WIN32)
-        # Emit DT_RPATH (searched before LD_LIBRARY_PATH) instead of DT_RUNPATH, so the
-        # bundled libgomp/libcppTiff/libcppZarr always take precedence -- matching the
-        # $ORIGIN RPATH of the previous release. ELF-only, so not on macOS or Windows/MinGW.
-        target_link_options(parallelimariswriter PRIVATE -Wl,--disable-new-dtags)
+# macOS with Homebrew gcc, as before). Also used for the test that links piw_core.
+function(piw_link_like_executable target)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_link_options(${target} PRIVATE -static-libstdc++ -static-libgcc)
+        if(NOT APPLE AND NOT WIN32)
+            # Emit DT_RPATH (searched before LD_LIBRARY_PATH) instead of DT_RUNPATH, so the
+            # bundled libgomp/libcppTiff/libcppZarr always take precedence -- matching the
+            # $ORIGIN RPATH of the previous release. ELF-only, so not on macOS or Windows/MinGW.
+            target_link_options(${target} PRIVATE -Wl,--disable-new-dtags)
+        endif()
+        if(WIN32)
+            # libcppTiff.dll / libcppZarr.dll (built with -static-libgcc) re-export libgcc's
+            # unwind symbols, which then clash with this exe's own static libgcc (e.g.
+            # _Unwind_Resume). Same fix cpp-zarr uses for MinGW.
+            target_link_options(${target} PRIVATE -Wl,--allow-multiple-definition)
+        endif()
     endif()
-    if(WIN32)
-        # libcppTiff.dll / libcppZarr.dll (built with -static-libgcc) re-export libgcc's
-        # unwind symbols, which then clash with this exe's own static libgcc (e.g.
-        # _Unwind_Resume). Same fix cpp-zarr uses for MinGW.
-        target_link_options(parallelimariswriter PRIVATE -Wl,--allow-multiple-definition)
-    endif()
-endif()
+endfunction()
+piw_link_like_executable(parallelimariswriter)
 
 # ---------------------------------------------------------------------------
 # Release layout. Everything is linked statically EXCEPT the three libraries we
@@ -351,4 +366,10 @@ if(PIW_BUILD_TESTS)
     # The cluster subcommands assemble a single .ims with the same data as the
     # monolithic conversion. Zarr-only (the parallel path reads Zarr).
     piw_add_test(parallelEquivalence tests/paralleltest.cpp LIBS cppZarr_shared)
+    # piw::convert (the core objects, linked like the executable) writes the same .ims as
+    # the executable, and fails cleanly: error returns, cancel, progress, concurrent calls.
+    piw_add_test(apiEquivalence tests/apitest.cpp LIBS ${PIW_LINK_LIBRARIES})
+    target_sources(apiEquivalenceTest PRIVATE $<TARGET_OBJECTS:piw_core>)
+    target_include_directories(apiEquivalenceTest PRIVATE ${SRC_DIR} ${PIW_INCLUDE_DIRS})
+    piw_link_like_executable(apiEquivalenceTest)
 endif()
