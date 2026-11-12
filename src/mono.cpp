@@ -32,7 +32,7 @@ using piw::Code;
 using piw::Status;
 
 const char* const NOSUP="the single-file cluster output is not supported on this platform";
-const char* const UINT16_ONLY="the single-file cluster output takes uint16 data only for now";
+const char* const TYPES="the single-file cluster output takes uint8, uint16 and float32 data (tile workers: uint8 and uint16)";
 Status internalError(const char* what){ return Status(Code::Internal,std::string("unexpected error: ")+what); }
 
 #ifndef _WIN32
@@ -43,6 +43,7 @@ std::string monoDir(const std::string& wd){ return imscore::monoClaimsDir(wd); }
 std::string partialPath(const std::string& wd){ return imscore::monoFilePath(wd); }
 std::string idxPath(const std::string& wd,int t,int c){ return monoDir(wd)+"/"+ownerOf(t,c)+".idx"; }
 std::string histPath(const std::string& wd,int r,int t,int c){ char b[64]; snprintf(b,sizeof b,"/h_L%d_C%d_T%d.hist",r,c,t); return monoDir(wd)+b; }
+std::string floatHistPath(const std::string& wd,int t,int c){ return monoDir(wd)+"/"+ownerOf(t,c)+".fhist"; }
 std::string finishedPath(const std::string& wd){ return monoDir(wd)+"/finished"; }
 double seconds(){ return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 int threadsOf(int n){ return n>0?n:std::max(1,piw::defaultThreads()); }
@@ -112,8 +113,9 @@ struct FirstError {
 };
 
 // ---------------- geometry: mono/layout.json ----------------
+const char* dtypeName(unsigned d);
 std::string geomText(const MonoIdxLevel& l){
-    char b[256]; snprintf(b,sizeof b,"size %llux%llux%llu, chunks %ux%ux%u",(unsigned long long)l.size[0],(unsigned long long)l.size[1],
+    char b[256]; snprintf(b,sizeof b,"%s, size %llux%llux%llu, chunks %ux%ux%u",dtypeName(l.dtype),(unsigned long long)l.size[0],(unsigned long long)l.size[1],
                           (unsigned long long)l.size[2],l.chunk[0],l.chunk[1],l.chunk[2]); return b;
 }
 bool sameGeom(const MonoIdxLevel& a,const MonoIdxLevel& b){
@@ -121,8 +123,10 @@ bool sameGeom(const MonoIdxLevel& a,const MonoIdxLevel& b){
     for(int i=0;i<3;i++) if(a.size[i]!=b.size[i]||a.chunk[i]!=b.chunk[i]||a.grid[i]!=b.grid[i]) return false;
     return true;
 }
+const char* dtypeName(unsigned d){ return d==MONO_U8?"uint8":d==MONO_U16?"uint16":d==MONO_U32?"uint32":d==MONO_F32?"float32":"unknown"; }
+unsigned dtypeCode(const std::string& n){ return n=="uint8"?MONO_U8:n=="uint16"?MONO_U16:n=="uint32"?MONO_U32:n=="float32"?MONO_F32:0; }
 std::string layoutText(const std::vector<MonoIdxLevel>& lv){
-    nlohmann::ordered_json j; j["dtype"]="uint16"; nlohmann::ordered_json a=nlohmann::ordered_json::array();
+    nlohmann::ordered_json j; j["dtype"]=dtypeName(lv[0].dtype); nlohmann::ordered_json a=nlohmann::ordered_json::array();
     for(size_t r=0;r<lv.size();r++){ const MonoIdxLevel& l=lv[r]; nlohmann::ordered_json e;
         e["size"]={(unsigned long long)l.size[0],(unsigned long long)l.size[1],(unsigned long long)l.size[2]};
         e["chunk"]={l.chunk[0],l.chunk[1],l.chunk[2]}; e["grid"]={l.grid[0],l.grid[1],l.grid[2]}; a.push_back(e); }
@@ -132,8 +136,9 @@ bool parseLayout(const std::vector<uint8_t>& b,std::vector<MonoIdxLevel>& lv,std
     lv.clear();
     try{
         nlohmann::json j=nlohmann::json::parse(b.begin(),b.end());
-        if(j.value("dtype",std::string())!="uint16"){ *err="unknown dtype"; return false; }
-        for(auto& e:j["levels"]){ MonoIdxLevel l; l.level=(uint32_t)lv.size(); l.dtype=MONO_U16;
+        const unsigned dt=dtypeCode(j.value("dtype",std::string()));
+        if(dt!=MONO_U8&&dt!=MONO_U16&&dt!=MONO_F32){ *err="unknown dtype"; return false; }
+        for(auto& e:j["levels"]){ MonoIdxLevel l; l.level=(uint32_t)lv.size(); l.dtype=dt;
             for(int a=0;a<3;a++){ l.size[a]=e["size"][a].get<uint64_t>(); l.chunk[a]=e["chunk"][a].get<uint32_t>(); l.grid[a]=e["grid"][a].get<uint32_t>(); }
             l.nChunks=(uint64_t)l.grid[0]*l.grid[1]*l.grid[2];
             lv.push_back(l); }
@@ -150,6 +155,8 @@ Status readLayout(const std::string& wd,std::vector<MonoIdxLevel>& lv){
 }
 Status compareLayout(const std::vector<MonoIdxLevel>& have,const std::vector<MonoIdxLevel>& lv,const std::string& p,const std::string& what){
     const char* hint=" (every part must come from the same converter settings, crop and data type)";
+    if(!have.empty()&&!lv.empty()&&have[0].dtype!=lv[0].dtype)
+        return Status(Code::InvalidArgument,what+" holds "+dtypeName(lv[0].dtype)+" data, "+p+" says "+dtypeName(have[0].dtype)+hint);
     if(have.size()!=lv.size()) return Status(Code::InvalidArgument,what+" has "+u64s(lv.size())+" resolution levels, "+p+" has "+u64s(have.size())+hint);
     for(size_t r=0;r<lv.size();r++) if(!sameGeom(have[r],lv[r]))
         return Status(Code::InvalidArgument,what+" level "+u64s(r)+": "+geomText(lv[r])+"; "+p+": "+geomText(have[r])+hint);
@@ -182,7 +189,10 @@ Status checkLayout(const std::string& wd,const std::vector<MonoIdxLevel>& lv,con
 
 // ---------------- part scan (HDF5: call with the library mutex held) ----------------
 struct PartChunk { uint64_t addr; uint32_t size, cx, cy, cz; };
-struct PartLevel { MonoIdxLevel g; std::vector<PartChunk> chunks; };
+// A level's stored histograms as ImarisWriter wrote them (float32 parts: copied, see monoPlace): the attribute texts
+// and the bins of Histogram (256) and, when written, Histogram1024 (the full histogram).
+struct PartHist { bool present=false, has1024=false; std::string min, max, min1024, max1024; std::vector<uint64_t> bins, bins1024; };
+struct PartLevel { MonoIdxLevel g; std::vector<PartChunk> chunks; PartHist hist; };
 bool lessZYX(const PartChunk& a,const PartChunk& b){
     if(a.cz!=b.cz) return a.cz<b.cz;
     if(a.cy!=b.cy) return a.cy<b.cy;
@@ -205,25 +215,35 @@ bool parseSize(const std::string& s,uint64_t& v){
     if(*end||errno||x==0) return false;
     v=x; return true;
 }
-// One level's Data: uint16, chunked, padded to whole chunks, shuffle + LZ4 like the converter writes, every
-// chunk of the grid stored (a silently failed conversion is caught here).
+// The sample type of a Data dataset: MONO_U8, MONO_U16 or MONO_F32 (little-endian), else 0.
+unsigned sampleType(hid_t ty){
+    if(ty<0) return 0;
+    const H5T_class_t k=H5Tget_class(ty); const size_t n=H5Tget_size(ty);
+    if(k==H5T_INTEGER&&H5Tget_sign(ty)==H5T_SGN_NONE&&(n==1||(n==2&&H5Tget_order(ty)==H5T_ORDER_LE))) return n==1?MONO_U8:MONO_U16;
+    if(k==H5T_FLOAT&&n==4&&H5Tget_order(ty)==H5T_ORDER_LE&&H5Tequal(ty,H5T_IEEE_F32LE)>0) return MONO_F32;
+    return 0;
+}
+// One level's Data: uint8, uint16 or float32, chunked, padded to whole chunks, (shuffle +) LZ4 like the converter
+// writes, every chunk of the grid stored (a silently failed conversion is caught here).
 Status scanData(hid_t d,const std::string& where,PartLevel& L){
     hid_t ty=H5Dget_type(d), sp=H5Dget_space(d), pl=H5Dget_create_plist(d);
     Status s;
-    bool u16=ty>=0&&H5Tget_class(ty)==H5T_INTEGER&&H5Tget_size(ty)==2&&H5Tget_sign(ty)==H5T_SGN_NONE&&H5Tget_order(ty)==H5T_ORDER_LE;
+    L.g.dtype=sampleType(ty);
     hsize_t dims[3]={0,0,0}, chk[3]={0,0,0};
-    if(!u16) s=Status(Code::Unsupported,std::string(UINT16_ONLY)+"; "+where+" holds another sample type");
+    if(!L.g.dtype) s=Status(Code::Unsupported,std::string(TYPES)+"; "+where+" holds another sample type");
     else if(sp<0||H5Sget_simple_extent_ndims(sp)!=3||H5Sget_simple_extent_dims(sp,dims,NULL)!=3) s=Status(Code::ReadFailed,where+" is not 3-D");
     else if(pl<0||H5Pget_layout(pl)!=H5D_CHUNKED||H5Pget_chunk(pl,3,chk)!=3) s=Status(Code::ReadFailed,where+" is not chunked");
     if(s.ok()){
-        // the pipeline mono_create_dataset gives the finished file: shuffle, then LZ4 (32004) with block size 1 GiB
-        bool pipe=H5Pget_nfilters(pl)==2;
-        for(unsigned i=0;pipe&&i<2;i++){
+        // the pipeline mono_create_dataset gives the finished file: shuffle (uint16 only), then LZ4 (32004)
+        // with block size 1 GiB
+        const bool shuf=mono_dtype_shuffle(L.g.dtype)>1; const unsigned nf=shuf?2:1;
+        bool pipe=H5Pget_nfilters(pl)==(int)nf;
+        for(unsigned i=0;pipe&&i<nf;i++){
             unsigned flags=0,cd[8]={0}; size_t ncd=8; char name[64]; unsigned cfg=0;
             H5Z_filter_t id=H5Pget_filter2(pl,i,&flags,&ncd,cd,sizeof name,name,&cfg);
-            pipe=i==0?id==H5Z_FILTER_SHUFFLE:(id==(H5Z_filter_t)32004&&ncd>=1&&cd[0]==(1u<<30));
+            pipe=(shuf&&i==0)?id==H5Z_FILTER_SHUFFLE:(id==(H5Z_filter_t)32004&&ncd>=1&&cd[0]==(1u<<30));
         }
-        if(!pipe) s=Status(Code::Unsupported,where+": filters other than shuffle + LZ4 (not a converter .ims?)");
+        if(!pipe) s=Status(Code::Unsupported,where+(shuf?": filters other than shuffle + LZ4":": filters other than LZ4")+" (not a converter .ims?)");
     }
     for(int a=0;s.ok()&&a<3;a++){
         hsize_t c=chk[2-a];
@@ -245,7 +265,26 @@ Status scanData(hid_t d,const std::string& where,PartLevel& L){
     if(pl>=0){ H5Pclose(pl); }
     return s;
 }
-Status scanOpenPart(hid_t f,const std::string& path,uint64_t fileBytes,std::vector<PartLevel>& lv){
+// A 1-D uint64 dataset of a group (a Histogram)
+bool readU64s(hid_t g,const char* name,std::vector<uint64_t>& v){
+    hid_t d=H5Dopen2(g,name,H5P_DEFAULT); if(d<0) return false;
+    hid_t sp=H5Dget_space(d); hsize_t n=0;
+    bool ok=sp>=0&&H5Sget_simple_extent_ndims(sp)==1&&H5Sget_simple_extent_dims(sp,&n,NULL)==1&&n>0&&n<=(1u<<20);
+    if(ok){ v.resize((size_t)n); ok=H5Dread(d,H5T_NATIVE_UINT64,H5S_ALL,H5S_ALL,H5P_DEFAULT,v.data())>=0; }
+    if(sp>=0){ H5Sclose(sp); }
+    H5Dclose(d); return ok;
+}
+// A level group's stored histograms (absent: ImarisWriter writes none for an empty level)
+Status readPartHist(hid_t g,const std::string& where,PartHist& h){
+    h=PartHist();
+    if(H5Lexists(g,"Histogram",H5P_DEFAULT)<=0) return Status();
+    h.present=true; h.min=imscore::readStrAttr(g,"HistogramMin"); h.max=imscore::readStrAttr(g,"HistogramMax");
+    if(!readU64s(g,"Histogram",h.bins)||h.min.empty()||h.max.empty()) return Status(Code::ReadFailed,where+": cannot read its Histogram");
+    if(H5Lexists(g,"Histogram1024",H5P_DEFAULT)>0){ h.has1024=true; h.min1024=imscore::readStrAttr(g,"HistogramMin1024"); h.max1024=imscore::readStrAttr(g,"HistogramMax1024");
+        if(!readU64s(g,"Histogram1024",h.bins1024)||h.min1024.empty()||h.max1024.empty()) return Status(Code::ReadFailed,where+": cannot read its Histogram1024"); }
+    return Status();
+}
+Status scanOpenPart(hid_t f,const std::string& path,uint64_t fileBytes,std::vector<PartLevel>& lv,std::string& colorRange){
     const std::string p0="/DataSet/ResolutionLevel 0/TimePoint 0/Channel 0";
     if(!imscore::h5PathExists(f,p0+"/Data")) return Status(Code::ReadFailed,"part "+path+" has no "+p0+"/Data (not a converter .ims?)");
     if(imscore::h5PathExists(f,"/DataSet/ResolutionLevel 0/TimePoint 1")||imscore::h5PathExists(f,"/DataSet/ResolutionLevel 0/TimePoint 0/Channel 1"))
@@ -254,7 +293,7 @@ Status scanOpenPart(hid_t f,const std::string& path,uint64_t fileBytes,std::vect
         const std::string lp="/DataSet/ResolutionLevel "+std::to_string(r), gp=lp+"/TimePoint 0/Channel 0";
         if(!imscore::h5PathExists(f,lp)) break;
         if(!imscore::h5PathExists(f,gp+"/Data")) return Status(Code::ReadFailed,"part "+path+" has no "+gp+"/Data");
-        PartLevel L; L.g.level=(uint32_t)r; L.g.dtype=MONO_U16;
+        PartLevel L; L.g.level=(uint32_t)r;
         hid_t g=H5Gopen2(f,gp.c_str(),H5P_DEFAULT);
         if(g<0) return Status(Code::ReadFailed,"part "+path+": cannot open "+gp);
         const char* k[3]={"ImageSizeX","ImageSizeY","ImageSizeZ"}; bool sized=true;
@@ -262,6 +301,8 @@ Status scanOpenPart(hid_t f,const std::string& path,uint64_t fileBytes,std::vect
         hid_t d=sized?H5Dopen2(g,"Data",H5P_DEFAULT):-1;
         Status s=!sized?Status(Code::ReadFailed,"part "+path+": "+gp+" has no valid ImageSizeX/Y/Z")
                 :d<0?Status(Code::ReadFailed,"part "+path+": cannot open "+gp+"/Data"):scanData(d,"part "+path+" "+gp+"/Data",L);
+        if(s.ok()&&!lv.empty()&&L.g.dtype!=lv[0].g.dtype) s=Status(Code::ReadFailed,"part "+path+": its levels have different sample types");
+        if(s.ok()&&L.g.dtype==MONO_F32) s=readPartHist(g,"part "+path+" "+gp,L.hist);
         if(d>=0){ H5Dclose(d); }
         H5Gclose(g);
         if(!s.ok()) return s;
@@ -269,10 +310,16 @@ Status scanOpenPart(hid_t f,const std::string& path,uint64_t fileBytes,std::vect
             return Status(Code::ReadFailed,"part "+path+": level "+u64s(r)+" has a chunk beyond the end of the file (truncated?)");
         lv.push_back(L);
     }
+    if(!lv.empty()&&lv[0].g.dtype==MONO_F32){   // the part's ColorRange (float32: what the finisher writes for one timepoint)
+        if(imscore::h5PathExists(f,"/DataSetInfo/Channel 0")){ hid_t g=H5Gopen2(f,"/DataSetInfo/Channel 0",H5P_DEFAULT);
+            if(g>=0){ colorRange=imscore::readStrAttr(g,"ColorRange"); H5Gclose(g); } }
+        float a=0,b=0; char tail=0;
+        if(sscanf(colorRange.c_str(),"%f %f%c",&a,&b,&tail)!=2) return Status(Code::ReadFailed,"part "+path+" has no valid /DataSetInfo/Channel 0 ColorRange");
+    }
     return Status();
 }
-Status scanPart(const std::string& path,std::vector<PartLevel>& lv){
-    lv.clear();
+Status scanPart(const std::string& path,std::vector<PartLevel>& lv,std::string& colorRange){
+    lv.clear(); colorRange.clear();
     struct stat st;
     if(stat(path.c_str(),&st)!=0) return Status(Code::NotFound,"cannot open part "+path+": "+strerror(errno));
     imscore::H5Quiet quiet;   // every failure below has its own message
@@ -281,23 +328,32 @@ Status scanPart(const std::string& path,std::vector<PartLevel>& lv){
     hid_t f=H5Fopen(path.c_str(),H5F_ACC_RDONLY,fapl>=0?fapl:H5P_DEFAULT);
     if(fapl>=0) H5Pclose(fapl);
     if(f<0) return Status(Code::ReadFailed,"cannot open part "+path+" (not an HDF5 file, or truncated)");
-    Status s=scanOpenPart(f,path,(uint64_t)st.st_size,lv);
+    Status s=scanOpenPart(f,path,(uint64_t)st.st_size,lv,colorRange);
     if(H5Fclose(f)<0&&s.ok()) s=Status(Code::ReadFailed,"cannot close part "+path);
     return s;
 }
 
 // ---------------- chunk decoding + exact histograms ----------------
-struct LevelInfo { uint32_t chunk[3]; uint64_t size[3]; size_t raw; };
+struct LevelInfo { uint32_t chunk[3]; uint64_t size[3]; size_t raw; unsigned dtype; };
 LevelInfo levelInfo(const MonoIdxLevel& g){
     LevelInfo li; for(int a=0;a<3;a++){ li.chunk[a]=g.chunk[a]; li.size[a]=g.size[a]; }
-    li.raw=(size_t)g.chunk[0]*g.chunk[1]*g.chunk[2]*2; return li;
+    li.dtype=g.dtype; li.raw=(size_t)g.chunk[0]*g.chunk[1]*g.chunk[2]*mono_dtype_bytes(g.dtype); return li;
 }
-// Decodes one chunk (LZ4 + size checks) and counts its in-image voxels into H (65536 bins). sh: scratch of
-// li.raw bytes. The shuffled bytes are read directly: byte 0 of every voxel first, then byte 1.
+// Whether a sample type has exact histograms (65536 bins, bin i = value i): uint8 and uint16. float32 parts carry
+// the histograms ImarisWriter stored.
+bool exactHist(unsigned dtype){ return dtype==MONO_U8||dtype==MONO_U16; }
+// Decodes one chunk (LZ4 + size checks) and counts its in-image voxels into H (65536 bins; uint8: 0..255). sh:
+// scratch of li.raw bytes. The shuffled bytes are read directly: byte 0 of every voxel first, then byte 1 (uint8:
+// not shuffled). float32: decoded only (H is not touched).
 imscore::Status countChunk(const uint8_t* c,size_t cs,uint32_t cx,uint32_t cy,uint32_t cz,const LevelInfo& li,uint8_t* sh,uint64_t* H){
     imscore::Status s=imscore::decodeChunkShuffled(c,cs,sh,li.raw); if(!s.ok()) return s;
+    if(!exactHist(li.dtype)) return s;
     const uint32_t bx=li.chunk[0],by=li.chunk[1],bz=li.chunk[2];
     const uint64_t xv=std::min<uint64_t>(bx,li.size[0]-(uint64_t)cx*bx), yv=std::min<uint64_t>(by,li.size[1]-(uint64_t)cy*by), zv=std::min<uint64_t>(bz,li.size[2]-(uint64_t)cz*bz);
+    if(li.dtype==MONO_U8){
+        for(uint64_t z=0;z<zv;z++) for(uint64_t y=0;y<yv;y++){ const uint8_t* row=sh+(size_t)bx*(y+(size_t)by*z); for(uint64_t x=0;x<xv;x++) H[row[x]]++; }
+        return s;
+    }
     const uint8_t* lo=sh; const uint8_t* hi=sh+li.raw/2;
     for(uint64_t z=0;z<zv;z++) for(uint64_t y=0;y<yv;y++){
         const size_t i0=(size_t)bx*(y+(size_t)by*z);
@@ -316,7 +372,7 @@ bool singleNodeLayout(const std::vector<MonoIdxLevel>& geo,int nT,std::vector<Mo
     to=geo; rechunk.assign(geo.size(),0);
     std::vector<imscore::Vec3> sz;
     for(size_t r=0;r<geo.size();r++){ imscore::Vec3 v={{geo[r].size[0],geo[r].size[1],geo[r].size[2]}}; sz.push_back(v); }
-    const imscore::bpSize budget=(1024*1024)/2;   // bpMultiresolutionImsImage::GetOptimalBlockSizes, uint16
+    const imscore::bpSize budget=(1024*1024)/mono_dtype_bytes(geo[0].dtype);   // bpMultiresolutionImsImage::GetOptimalBlockSizes
     std::vector<imscore::Vec3> one=imscore::GetOptimalBlockSizes(budget,sz,1), all=imscore::GetOptimalBlockSizes(budget,sz,(imscore::bpSize)nT);
     for(size_t r=0;r<geo.size();r++) for(int a=0;a<3;a++) if(one[r][a]!=geo[r].chunk[a]) return false;
     for(size_t r=0;r<geo.size();r++){
@@ -329,19 +385,20 @@ bool singleNodeLayout(const std::vector<MonoIdxLevel>& geo,int nT,std::vector<Mo
     return true;
 }
 // Decodes the n placed chunks at(0..n-1) of one level of one dataset (fd: the file being built) into its dense
-// X*Y*Z volume.
-Status decodeLevel(int fd,const MonoIdxLevel& from,size_t n,const MonoChunkAt& at,int T,std::vector<uint16_t>& vol){
+// X*Y*Z volume (the level's samples, as bytes).
+Status decodeLevel(int fd,const MonoIdxLevel& from,size_t n,const MonoChunkAt& at,int T,std::vector<uint8_t>& vol){
     const imscore::bpSize size[3]={from.size[0],from.size[1],from.size[2]}, b[3]={from.chunk[0],from.chunk[1],from.chunk[2]};
-    vol.assign((size_t)(size[0]*size[1]*size[2]),0);
-    const size_t rawFrom=(size_t)b[0]*b[1]*b[2]*2;
+    const size_t eb=mono_dtype_bytes(from.dtype), sb=mono_dtype_shuffle(from.dtype);
+    vol.assign((size_t)(size[0]*size[1]*size[2])*eb,0);
+    const size_t rawFrom=(size_t)b[0]*b[1]*b[2]*eb;
     std::atomic<size_t> next(0); FirstError fe;
     std::string x=runThreads(T,[&](int){
         std::vector<uint8_t> cb,vox;
         for(;;){ size_t i=next.fetch_add(1); if(i>=n||fe.set) break; MonoChunk ch; at(i,ch);
             cb.resize(ch.size); int re=preadAll(fd,cb.data(),ch.size,ch.offset);
-            imscore::Status ds=re?imscore::Status::fail(strerror(re)):imscore::decodeChunk(cb.data(),ch.size,vox,rawFrom);
+            imscore::Status ds=re?imscore::Status::fail(strerror(re)):imscore::decodeChunk(cb.data(),ch.size,vox,rawFrom,sb);
             if(!ds.ok()){ fe.put("level "+u64s(from.level)+" chunk ("+u64s(ch.cx)+","+u64s(ch.cy)+","+u64s(ch.cz)+") at "+u64s(ch.offset)+": "+ds.message); break; }
-            imscore::chunkToVolume((const uint16_t*)vox.data(),b,ch.cx,ch.cy,ch.cz,size,vol.data());
+            imscore::chunkToVolumeBytes(vox.data(),b,ch.cx,ch.cy,ch.cz,size,eb,vol.data());
         } });
     if(!fe.msg.empty()||!x.empty()) return Status(Code::ReadFailed,!fe.msg.empty()?fe.msg:x);
     return Status();
@@ -354,8 +411,8 @@ Status decodeLevel(int fd,const MonoIdxLevel& from,size_t n,const MonoChunkAt& a
 Status rechunkLevel(int fd,hid_t g,const MonoIdxLevel& from,const MonoIdxLevel& to,const MonoChunk* chunks,size_t n,int T,
                     std::vector<MonoChunk>& out){
     out.clear();
-    const uint64_t X=from.size[0],Y=from.size[1],Z=from.size[2];
-    std::vector<uint16_t> vol;
+    const uint64_t X=from.size[0],Y=from.size[1],Z=from.size[2]; const size_t eb=mono_dtype_bytes(from.dtype), sb=mono_dtype_shuffle(from.dtype);
+    std::vector<uint8_t> vol;
     Status ls=decodeLevel(fd,from,n,[chunks](size_t k,MonoChunk& ch){ ch=chunks[k]; },T,vol); if(!ls.ok()) return ls;
     std::string x;
     const uint64_t bx=to.chunk[0],by=to.chunk[1],bz=to.chunk[2],gx=to.grid[0],gy=to.grid[1];
@@ -363,13 +420,13 @@ Status rechunkLevel(int fd,hid_t g,const MonoIdxLevel& from,const MonoIdxLevel& 
     std::vector<std::vector<uint8_t> > enc(nn);
     std::atomic<size_t> next2(0); FirstError fe2;
     x=runThreads(T,[&](int){
-        std::vector<uint16_t> blk((size_t)(bx*by*bz));
+        std::vector<uint8_t> blk((size_t)(bx*by*bz)*eb);
         for(;;){ size_t k=next2.fetch_add(1); if(k>=nn||fe2.set) break;   // k = cx + gx*(cy + gy*cz): (z, y, x) order
             const uint64_t x0=(k%gx)*bx,y0=((k/gx)%gy)*by,z0=(k/(gx*gy))*bz;
             const uint64_t xv=std::min(bx,X-x0),yv=std::min(by,Y-y0),zv=std::min(bz,Z-z0);
-            std::fill(blk.begin(),blk.end(),(uint16_t)0);
-            for(uint64_t z=0;z<zv;z++) for(uint64_t y=0;y<yv;y++) memcpy(&blk[(size_t)((y+z*by)*bx)],&vol[(size_t)(x0+(y0+y)*X+(z0+z)*X*Y)],(size_t)xv*2);
-            if(!imscore::encodeChunk((const uint8_t*)blk.data(),blk.size()*2,enc[k])){ fe2.put("LZ4 could not compress a chunk"); break; }
+            std::fill(blk.begin(),blk.end(),(uint8_t)0);
+            for(uint64_t z=0;z<zv;z++) for(uint64_t y=0;y<yv;y++) memcpy(&blk[(size_t)((y+z*by)*bx)*eb],&vol[(size_t)(x0+(y0+y)*X+(z0+z)*X*Y)*eb],(size_t)xv*eb);
+            if(!imscore::encodeChunk(blk.data(),blk.size(),enc[k],sb)){ fe2.put("LZ4 could not compress a chunk"); break; }
         } });
     if(!fe2.msg.empty()||!x.empty()) return Status(Code::Internal,!fe2.msg.empty()?fe2.msg:x);
     std::string e;
@@ -391,6 +448,62 @@ Status rechunkLevel(int fd,hid_t g,const MonoIdxLevel& from,const MonoIdxLevel& 
             out.push_back(mc); } }
     if(H5Dclose(d)<0&&s.ok()) s=Status(Code::WriteFailed,"cannot close a re-chunked dataset");
     return s;
+}
+// ---------------- float32 parts: the histograms ImarisWriter stored, copied ----------------
+// ImarisWriter's float32 histograms are adaptive (bpHistogramBuilderAdaptive: 1000 bins whose range grows with the
+// values added, so the result depends on the order the values come in), not exact counts that could be summed or
+// rebuilt. A float32 part's sidecar mono/P_C<c>_T<t>.fhist therefore carries what the part's conversion stored: every
+// level's Histogram / Histogram1024 with their HistogramMin/Max texts (written into the file unchanged) and the
+// part's ColorRange (written unchanged when the file has one timepoint).
+std::string floatHistText(const std::vector<PartLevel>& lv,const std::string& colorRange){
+    nlohmann::ordered_json j; j["colorRange"]=colorRange; nlohmann::ordered_json a=nlohmann::ordered_json::array();
+    for(const PartLevel& L:lv){ const PartHist& h=L.hist; nlohmann::ordered_json e;
+        e["min"]=h.min; e["max"]=h.max; e["bins"]=h.bins;
+        if(h.has1024){ e["min1024"]=h.min1024; e["max1024"]=h.max1024; e["bins1024"]=h.bins1024; }
+        a.push_back(e); }
+    j["levels"]=a; return j.dump()+"\n";
+}
+// A level's histograms must count every voxel of the level once.
+bool countsLevel(const std::vector<uint64_t>& b,const MonoIdxLevel& g){ uint64_t n=0; for(uint64_t v:b) n+=v; return !b.empty()&&n==voxelsOf(g); }
+Status readFloatHist(const std::string& p,const std::vector<MonoIdxLevel>& geo,std::vector<PartHist>& h,std::string& colorRange){
+    std::vector<uint8_t> b; std::string e; h.clear();
+    if(!exists(p)) return Status(Code::NotFound,"missing histograms "+p);
+    if(!mono_read_file(p,b,&e)) return Status(Code::ReadFailed,e);
+    try{
+        nlohmann::json j=nlohmann::json::parse(b.begin(),b.end());
+        colorRange=j.at("colorRange").get<std::string>();
+        for(auto& x:j.at("levels")){ PartHist v; v.present=true;
+            v.min=x.at("min").get<std::string>(); v.max=x.at("max").get<std::string>(); v.bins=x.at("bins").get<std::vector<uint64_t> >();
+            if((v.has1024=x.contains("bins1024"))){ v.min1024=x.at("min1024").get<std::string>(); v.max1024=x.at("max1024").get<std::string>(); v.bins1024=x.at("bins1024").get<std::vector<uint64_t> >(); }
+            h.push_back(v); }
+    }catch(const std::exception& x){ return Status(Code::ReadFailed,"invalid "+p+": "+x.what()); }
+    if(h.size()!=geo.size()) return Status(Code::ReadFailed,p+" has "+u64s(h.size())+" levels, the layout "+u64s(geo.size()));
+    for(size_t r=0;r<h.size();r++) if(!countsLevel(h[r].bins,geo[r])||(h[r].has1024&&!countsLevel(h[r].bins1024,geo[r])))
+        return Status(Code::ReadFailed,p+": the histograms of level "+u64s(r)+" do not count its "+u64s(voxelsOf(geo[r]))+" voxels");
+    return Status();
+}
+// Writes a copied histogram as bpWriterHDF5::WriteHistogram does: Min, Max, Histogram, then the 1024 ones.
+bool writeCopiedHist(hid_t g,const PartHist& h){
+    bool ok=imscore::setStrAttr(g,"HistogramMin",h.min); ok&=imscore::setStrAttr(g,"HistogramMax",h.max); ok&=imscore::writeU64(g,"Histogram",h.bins);
+    if(h.has1024){ ok&=imscore::setStrAttr(g,"HistogramMin1024",h.min1024); ok&=imscore::setStrAttr(g,"HistogramMax1024",h.max1024); ok&=imscore::writeU64(g,"Histogram1024",h.bins1024); }
+    return ok;
+}
+// The full histogram of a copied level (GetHistogram: Histogram1024 when written, else the 256-bin one), as the
+// ColorRange's input: its range from the texts, rounded to 3 decimals (see finishParts).
+imscore::ColorHist fullHist(const PartHist& h){
+    imscore::ColorHist c; c.bins=h.has1024?h.bins1024:h.bins;
+    c.hmin=strtof((h.has1024?h.min1024:h.min).c_str(),NULL); c.hmax=strtof((h.has1024?h.max1024:h.max).c_str(),NULL);
+    return c;
+}
+// Whether every histogram sidecar of part (t, c) is there and whole (levels: its sidecar's; float32: the .fhist).
+bool partHistsThere(const std::string& wd,int t,int c,const std::vector<MonoIdxLevel>& levels,std::string* why){
+    if(levels.empty()) return false;
+    if(levels[0].dtype==MONO_F32){ std::vector<PartHist> h; std::string cr; Status s=readFloatHist(floatHistPath(wd,t,c),levels,h,cr);
+        if(!s.ok()&&why) *why=s.message;
+        return s.ok(); }
+    for(size_t r=0;r<levels.size();r++){ struct stat st; const std::string h=histPath(wd,(int)r,t,c);
+        if(stat(h.c_str(),&st)!=0||(uint64_t)st.st_size!=imscore::HIST_BYTES){ if(why) *why="missing or damaged histogram "+h; return false; } }
+    return true;
 }
 Status readHist(const std::string& p,const MonoIdxLevel& g,std::vector<uint64_t>& bins){
     std::vector<uint8_t> b;
@@ -466,9 +579,13 @@ Status monoPlace(const MonoPlaceOptions& o,MonoPlaceResult* result) noexcept{
             return Status(Code::InvalidArgument,"the tile workers of "+wd+" write its single file: it cannot also take parts (use a new workdir)");
 
         // 1. scan the part: geometry, every chunk's address and size
-        std::vector<PartLevel> lv;
-        { std::lock_guard<std::mutex> lock(detail::libraryMutex()); s=scanPart(o.partFile,lv); }
+        std::vector<PartLevel> lv; std::string colorRange;
+        { std::lock_guard<std::mutex> lock(detail::libraryMutex()); s=scanPart(o.partFile,lv,colorRange); }
         if(!s.ok()) return s;
+        const unsigned dtype=lv[0].g.dtype;
+        if(dtype==MONO_F32) for(size_t r=0;r<lv.size();r++)
+            if(!lv[r].hist.present||!countsLevel(lv[r].hist.bins,lv[r].g)||(lv[r].hist.has1024&&!countsLevel(lv[r].hist.bins1024,lv[r].g)))
+                return Status(Code::ReadFailed,"part "+o.partFile+": level "+u64s(r)+" has no histogram of all its voxels (an unfinished conversion? convert it again)");
         std::vector<MonoIdxLevel> geo; for(size_t r=0;r<lv.size();r++) geo.push_back(lv[r].g);
         s=checkLayout(wd,geo,o.partFile); if(!s.ok()) return s;
         res.levels=(int)lv.size();
@@ -538,7 +655,9 @@ Status monoPlace(const MonoPlaceOptions& o,MonoPlaceResult* result) noexcept{
         // 4. histograms, then the sidecar (the commit point)
         MonoIdx x; x.owner=res.owner; x.timepoint=t; x.channel=c; x.claimOffset=rec.offset; x.claimSize=rec.size; x.blobBytes=total;
         x.levels=geo; x.chunks.reserve(order.size());
-        for(size_t r=0;r<lv.size();r++){
+        if(dtype==MONO_F32){ const std::string ft=floatHistText(lv,colorRange);
+            if(!mono_write_atomic(floatHistPath(wd,t,c),ft.data(),ft.size(),&e)) return Status(Code::WriteFailed,e); }
+        else for(size_t r=0;r<lv.size();r++){
             std::vector<uint64_t> sum(65536,0);
             for(int w=0;w<T;w++){ const uint64_t* h=hist[(size_t)w].data()+r*65536; for(size_t i=0;i<65536;i++) sum[i]+=h[i]; }
             uint64_t n=0; for(size_t i=0;i<65536;i++) n+=sum[i];
@@ -580,7 +699,7 @@ std::vector<TileId> allTiles(const imscore::Manifest& im){
 }
 Status readTileManifest(const std::string& wd,imscore::Manifest& im){
     imscore::Status ms=imscore::readManifest(wd,im); if(!ms.ok()) return Status(Code::InvalidArgument,ms.message);
-    if(im.elem!=2) return Status(Code::Unsupported,std::string(UINT16_ONLY)+"; "+wd+" has "+u64s(im.elem)+"-byte voxels");
+    if(im.dtype!="uint8"&&im.dtype!="uint16") return Status(Code::Unsupported,std::string(TYPES)+"; "+wd+" holds "+im.dtype+" data");
     return Status();
 }
 }  // namespace
@@ -626,25 +745,34 @@ namespace {
 // raw region). Read before the HDF5 work, without the library mutex.
 typedef std::function<void(int c,size_t r,size_t& n,MonoChunkAt& at)> PlacedFn;
 Status readThumbnailVolumes(const std::string& partial,const std::vector<MonoIdxLevel>& geo,const PlacedFn& chunks,
-                            int nC,int T,std::vector<std::vector<uint16_t> >& vol){
+                            int nC,int T,std::vector<std::vector<uint8_t> >& vol){
     std::vector<imscore::Vec3> sizes;
     for(const MonoIdxLevel& g:geo){ imscore::Vec3 v={{g.size[0],g.size[1],g.size[2]}}; sizes.push_back(v); }
     const size_t r=imsthumb::thumbnailLevel(sizes);
     FdGuard fd(open(partial.c_str(),O_RDONLY));
     if(fd.fd<0) return Status(Code::ReadFailed,"cannot open "+partial+": "+strerror(errno));
-    vol.assign((size_t)nC,std::vector<uint16_t>());
+    vol.assign((size_t)nC,std::vector<uint8_t>());
     for(int c=0;c<nC;c++){ size_t n=0; MonoChunkAt at; chunks(c,r,n,at);
         Status s=decodeLevel(fd.fd,geo[r],n,at,T,vol[(size_t)c]);
         if(!s.ok()) return Status(s.code,"thumbnail of timepoint 0, channel "+std::to_string(c)+": "+s.message); }
     return Status();
 }
+// The volumes' bytes as samples of type T
+template<class T> std::vector<std::vector<T> > typedVolumes(const std::vector<std::vector<uint8_t> >& vol){
+    std::vector<std::vector<T> > v(vol.size());
+    for(size_t c=0;c<vol.size();c++){ v[c].resize(vol[c].size()/sizeof(T)); if(!vol[c].empty()) memcpy(v[c].data(),vol[c].data(),v[c].size()*sizeof(T)); }
+    return v;
+}
 // /Thumbnail, where ImarisWriter writes it: after /DataSetInfo, coloured as its channels.
 Status writeThumbnail(hid_t f,const std::vector<MonoIdxLevel>& geo,const imscore::Manifest& im,
-                      const std::vector<std::vector<uint16_t> >& vol,const std::vector<imscore::ChannelDisplay>& display){
+                      const std::vector<std::vector<uint8_t> >& vol,const std::vector<imscore::ChannelDisplay>& display){
     std::vector<imscore::Vec3> sizes;
     for(const MonoIdxLevel& g:geo){ imscore::Vec3 v={{g.size[0],g.size[1],g.size[2]}}; sizes.push_back(v); }
     float ext[3]; imscore::imsExtentMax(im.X,im.Y,im.Z,im.vox,ext);
-    imscore::Status s=imsthumb::writeThumbnail(f,sizes,vol,display,ext);
+    const unsigned dt=geo[0].dtype;
+    imscore::Status s=dt==MONO_U8?imsthumb::writeThumbnail(f,sizes,vol,display,ext)
+                     :dt==MONO_F32?imsthumb::writeThumbnail(f,sizes,typedVolumes<float>(vol),display,ext)
+                     :imsthumb::writeThumbnail(f,sizes,typedVolumes<uint16_t>(vol),display,ext);
     return s.ok()?Status():Status(Code::WriteFailed,s.message);
 }
 // Every writer's sidecar must name a range that the claims journal gives its owner.
@@ -681,12 +809,15 @@ struct FileSpec {
     imscore::Manifest im;            // the metadata's source: size, voxel size, channels, timepoints
     std::function<void(int k,size_t r,size_t& n,MonoChunkAt& at)> chunks;            // dataset (k, r): its chunks, (z, y, x) order
     std::function<Status(int r,int t,int c,std::vector<uint64_t>& bins)> hist;        // level r of (t, c): exact 65536 bins
+    std::function<Status(int r,int t,int c,hid_t g)> writeHist;                       // set: writes level r of (t, c)'s histograms
+                                                                                      // itself (float32), and hist is not used
+    imscore::ColorRangeFn colorRange;                                                 // set: the ColorRange (float32)
     std::function<Status(int k,size_t r,hid_t g,MonoVfd& vfd)> data;                  // writes <g>/Data (library mutex held)
     uint64_t armedWant=0;            // chunks indexed through the placement driver
 };
 // Step 3: the HDF5 structure over the placed chunks, in ImarisWriter's order (imscore.h): root attributes and
 // /DataSet, every (t, c) and its levels, /DataSetInfo, then the thumbnail.
-Status buildFile(const FileSpec& s,MonoVfd& vfd,const std::vector<std::vector<uint16_t> >& thumbVol,MonoFinishResult& res){
+Status buildFile(const FileSpec& s,MonoVfd& vfd,const std::vector<std::vector<uint8_t> >& thumbVol,MonoFinishResult& res){
     std::lock_guard<std::mutex> lock(detail::libraryMutex());
     const double ti=seconds(); std::string e;
     hid_t fapl=mono_vfd_fapl(vfd,&e);
@@ -705,15 +836,16 @@ Status buildFile(const FileSpec& s,MonoVfd& vfd,const std::vector<std::vector<ui
         if(g<0){ bs=Status(Code::WriteFailed,"cannot create "+gp+" (HDF5 error above)"); break; }
         bool ok=imscore::setStrAttr(g,"ImageSizeX",u64s(s.geo[r].size[0]))&&imscore::setStrAttr(g,"ImageSizeY",u64s(s.geo[r].size[1]))&&imscore::setStrAttr(g,"ImageSizeZ",u64s(s.geo[r].size[2]));
         if(ok){ Status ds=s.data(t*s.nC+c,r,g,vfd); if(!ds.ok()) bs=Status(ds.code,gp+": "+ds.message); }
-        if(bs.ok()&&ok){ Status hs=s.hist((int)r,t,c,bins);
-            if(!hs.ok()) bs=hs; else ok=imscore::writeHistogramFromBins(g,bins); }
+        if(bs.ok()&&ok&&s.writeHist){ Status hs=s.writeHist((int)r,t,c,g); if(!hs.ok()) bs=hs; }
+        else if(bs.ok()&&ok){ Status hs=s.hist((int)r,t,c,bins);
+            if(!hs.ok()) bs=hs; else ok=imscore::writeHistogramFromBins(g,bins,s.geo[r].dtype==MONO_U8); }
         if(bs.ok()&&!ok) bs=Status(Code::WriteFailed,"cannot write "+gp+" (HDF5 error above)");
         H5Gclose(g);
     }
     std::vector<imscore::ChannelDisplay> display;
     auto colorHist=[&](int r,int c,int t,std::vector<uint64_t>& b)->imscore::Status{
         Status hs=s.hist(r,t,c,b); return hs.ok()?imscore::Status():imscore::Status::fail(hs.message); };
-    if(bs.ok()){ ws=imscore::writeImsDataSetInfo(f,s.im,lcpl,chs,tps,colorHist,&display); if(!ws.ok()) bs=Status(Code::WriteFailed,ws.message); }
+    if(bs.ok()){ ws=imscore::writeImsDataSetInfo(f,s.im,lcpl,chs,tps,colorHist,&display,s.colorRange?&s.colorRange:NULL); if(!ws.ok()) bs=Status(Code::WriteFailed,ws.message); }
     if(bs.ok()) bs=writeThumbnail(f,s.geo,s.im,thumbVol,display);
     H5Pclose(lcpl);
     if(H5Fclose(f)<0&&bs.ok()) bs=Status(Code::WriteFailed,"cannot close "+s.partial+" (HDF5 error above)");
@@ -750,7 +882,8 @@ Status checkFile(const FileSpec& s,const MonoVfd& vfd,MonoFinishResult& res){
     res.checkSeconds=seconds()-tc;
     return Status();
 }
-// Step 5 (--verify): decode every chunk the file's index holds; each level's histogram must equal the writer's.
+// Step 5 (--verify): decode every chunk the file's index holds; each level's histogram must equal the writer's
+// (float32: decoded only).
 Status verifyFile(const FileSpec& s,MonoFinishResult& res){
     const double tv=seconds(); const int T=s.threads;
     FdGuard fd(open(s.partial.c_str(),O_RDONLY));
@@ -770,6 +903,7 @@ Status verifyFile(const FileSpec& s,MonoFinishResult& res){
                 else { imscore::Status ds=countChunk(cb.data(),ch.size,ch.cx,ch.cy,ch.cz,li,sh[(size_t)w].data(),hist[(size_t)w].data()); if(!ds.ok()) why=ds.message; }
                 if(!why.empty()){ fe.put("t="+std::to_string(t)+" c="+std::to_string(c)+" level "+u64s(r)+" chunk ("+u64s(ch.cx)+","+u64s(ch.cy)+","+u64s(ch.cz)+") at "+u64s(ch.offset)+": "+why); break; } } });
         if(!fe.msg.empty()||!x.empty()) return Status(Code::ReadFailed,"--verify: "+(!fe.msg.empty()?fe.msg:x));
+        if(!exactHist(li.dtype)) continue;
         std::vector<uint64_t> want; Status hs=s.hist((int)r,t,c,want); if(!hs.ok()) return Status(hs.code,"--verify: "+hs.message);
         for(size_t i=0;i<65536;i++){ uint64_t m=0; for(int w=0;w<T;w++) m+=hist[(size_t)w][i];
             if(m!=want[i]) return Status(Code::ReadFailed,"--verify: t="+std::to_string(t)+" c="+std::to_string(c)+" level "+u64s(r)
@@ -779,7 +913,7 @@ Status verifyFile(const FileSpec& s,MonoFinishResult& res){
     return Status();
 }
 // Steps 3 to 6: build, check, verify, record the output and rename the file to it.
-Status finishFile(const FileSpec& s,uint64_t rawEnd,bool verify,const std::vector<std::vector<uint16_t> >& thumbVol,MonoFinishResult& res,double t0){
+Status finishFile(const FileSpec& s,uint64_t rawEnd,bool verify,const std::vector<std::vector<uint8_t> >& thumbVol,MonoFinishResult& res,double t0){
     MonoVfd vfd(rawEnd);
     Status st=buildFile(s,vfd,thumbVol,res); if(!st.ok()) return st;
     st=checkFile(s,vfd,res); if(!st.ok()) return st;
@@ -828,8 +962,7 @@ Status finishParts(const MonoFinishOptions& o,const MonoManifest& m,const std::s
             if(!mono_idx_read(p,ix,&why)||!mono_idx_validate(ix,true,&why)){ fe.put(why+" (run monoplace for t="+std::to_string(t)+", c="+std::to_string(c)+" again)"); break; }
             if(ix.owner!=ownerOf(t,c)||ix.timepoint!=t||ix.channel!=c){ fe.put(p+" belongs to another part ("+ix.owner+")"); break; }
             Status ls=compareLayout(geo,ix.levels,monoDir(wd)+"/layout.json",p); if(!ls.ok()){ fe.put(ls.message); break; }
-            for(int r=0;r<(int)geo.size()&&why.empty();r++){ struct stat st; std::string h=histPath(wd,r,t,c);
-                if(stat(h.c_str(),&st)!=0||(uint64_t)st.st_size!=imscore::HIST_BYTES) why="missing or damaged histogram "+h; }
+            if(!partHistsThere(wd,t,c,geo,&why)&&why.empty()) why="missing histograms of "+ownerOf(t,c);
             if(!why.empty()){ fe.put(why+" (run monoplace for t="+std::to_string(t)+", c="+std::to_string(c)+" again)"); break; }
             have[(size_t)k]=1;
         } });
@@ -857,7 +990,7 @@ Status finishParts(const MonoFinishOptions& o,const MonoManifest& m,const std::s
     s=checkBlobEnds(partial,ends,T); if(!s.ok()) return s;
     auto placed=[&](int k,size_t r,size_t& n,MonoChunkAt& at){ const MonoChunk* base=idx[(size_t)k].chunks.data()+first[(size_t)k][r];
         n=first[(size_t)k][r+1]-first[(size_t)k][r]; at=[base](size_t i,MonoChunk& ch){ ch=base[i]; }; };
-    std::vector<std::vector<uint16_t> > thumbVol;
+    std::vector<std::vector<uint8_t> > thumbVol;
     s=readThumbnailVolumes(partial,geo,[&](int c,size_t r,size_t& n,MonoChunkAt& at){ placed(c,r,n,at); },nC,T,thumbVol); if(!s.ok()) return s;   // timepoint 0: k = c
     res.readSeconds=seconds()-t0;
 
@@ -866,7 +999,9 @@ Status finishParts(const MonoFinishOptions& o,const MonoManifest& m,const std::s
     std::vector<char> rechunk;
     if(!singleNodeLayout(geo,nT,fs.geo,rechunk)) res.note="the parts' chunks are not the converter's 1-timepoint layout: no level was re-chunked";
     for(size_t r=0;r<geo.size();r++){ if(rechunk[r]) res.rechunkedLevels.push_back((int)r); else fs.armedWant+=(uint64_t)nP*geo[r].nChunks; }
-    fs.im.nC=nC; fs.im.nT=nT; fs.im.X=geo[0].size[0]; fs.im.Y=geo[0].size[1]; fs.im.Z=geo[0].size[2]; fs.im.elem=2;
+    const unsigned dtype=geo[0].dtype;
+    fs.im.nC=nC; fs.im.nT=nT; fs.im.X=geo[0].size[0]; fs.im.Y=geo[0].size[1]; fs.im.Z=geo[0].size[2];
+    fs.im.elem=mono_dtype_bytes(dtype); fs.im.dtype=dtypeName(dtype);
     for(int a=0;a<3;a++) fs.im.vox[a]=m.vox[a];
     fs.im.meta=m.meta;
     std::vector<std::vector<std::vector<MonoChunk> > > newChunks((size_t)nP,std::vector<std::vector<MonoChunk> >(geo.size()));
@@ -874,6 +1009,22 @@ Status finishParts(const MonoFinishOptions& o,const MonoManifest& m,const std::s
         if(rechunk[r]){ const MonoChunk* base=newChunks[(size_t)k][r].data(); n=newChunks[(size_t)k][r].size(); at=[base](size_t i,MonoChunk& ch){ ch=base[i]; }; }
         else placed(k,r,n,at); };
     fs.hist=[&](int r,int t,int c,std::vector<uint64_t>& bins){ return readHist(histPath(wd,r,t,c),geo[(size_t)r],bins); };
+    // float32: every part's stored histograms are written as they are, and the ColorRange comes from them: with one
+    // timepoint it is the part's own (the same text a single-node conversion writes); with more, ImarisWriter's
+    // multi-timepoint channel histogram (channelColorHistMulti) of the parts' level-0 histograms + adjustColorRange.
+    // The histograms' ranges are known only as the texts ImarisWriter wrote (3 decimals), so this ColorRange can
+    // differ from a single-node conversion's: see monoFinish in mono.h for the bound.
+    std::vector<std::vector<PartHist> > fh; std::vector<std::string> fcr;
+    if(dtype==MONO_F32){ fh.resize((size_t)nP); fcr.resize((size_t)nP);
+        for(int k=0;k<nP;k++){ s=readFloatHist(floatHistPath(wd,k/nC,k%nC),geo,fh[(size_t)k],fcr[(size_t)k]); if(!s.ok()) return s; }
+        fs.writeHist=[&](int r,int t,int c,hid_t g)->Status{
+            return writeCopiedHist(g,fh[(size_t)(t*nC+c)][(size_t)r])?Status():Status(Code::WriteFailed,"cannot write the histograms (HDF5 error above)"); };
+        fs.colorRange=[&](int c,const std::vector<int>& tps,imscore::ChannelDisplay& d,std::string& text)->imscore::Status{
+            if(tps.size()==1){ text=fcr[(size_t)(tps[0]*nC+c)]; sscanf(text.c_str(),"%f %f",&d.rangeMin,&d.rangeMax); return imscore::Status(); }
+            std::vector<imscore::ColorHist> perTp; for(int t:tps) perTp.push_back(fullHist(fh[(size_t)(t*nC+c)][0]));
+            imscore::adjustColorRange(imscore::channelColorHistMulti(perTp),d.rangeMin,d.rangeMax);
+            text=imscore::fstr(d.rangeMin,3)+" "+imscore::fstr(d.rangeMax,3); return imscore::Status(); };
+    }
     FdGuard rfd(res.rechunkedLevels.empty()?-1:open(partial.c_str(),O_RDONLY));
     if(!res.rechunkedLevels.empty()&&rfd.fd<0) return Status(Code::ReadFailed,"cannot open "+partial+": "+strerror(errno));
     fs.data=[&](int k,size_t r,hid_t g,MonoVfd& vfd)->Status{
@@ -914,7 +1065,8 @@ Status finishTiles(const MonoFinishOptions& o,const std::string& wd,const std::s
     const int nT=im.nT, nC=im.nC, nR=(int)im.lev.size(); const std::string cd=wd+"/chunks"; std::string e;
     res.timepoints=nT; res.channels=nC; res.levels=nR;
     std::vector<MonoIdxLevel> geo((size_t)nR);
-    for(int r=0;r<nR;r++){ const imscore::Lev& L=im.lev[(size_t)r]; MonoIdxLevel& g=geo[(size_t)r]; g.level=(uint32_t)r; g.dtype=MONO_U16; g.nChunks=1;
+    const unsigned dtype=dtypeCode(im.dtype);
+    for(int r=0;r<nR;r++){ const imscore::Lev& L=im.lev[(size_t)r]; MonoIdxLevel& g=geo[(size_t)r]; g.level=(uint32_t)r; g.dtype=dtype; g.nChunks=1;
         for(int a=0;a<3;a++){ g.size[a]=L.size[a]; g.chunk[a]=(uint32_t)L.block[a]; g.grid[a]=(uint32_t)L.nch[a]; g.nChunks*=L.nch[a]; } }
     const int nD=nT*nC*nR;   // dataset (k, r) = d = k*nR + r
     std::vector<DenseChunks> dense((size_t)nD);
@@ -970,7 +1122,7 @@ Status finishTiles(const MonoFinishOptions& o,const std::string& wd,const std::s
         n=D.off.size();
         at=[O,S,gx,gy,lv](size_t i,MonoChunk& ch){ ch.offset=O[i]; ch.size=S[i]; ch.cx=(uint32_t)(i%gx); ch.cy=(uint32_t)((i/gx)%gy); ch.cz=(uint32_t)(i/((size_t)gx*gy));
             ch.mask=0; ch.level=lv; ch.reserved=0; }; };
-    std::vector<std::vector<uint16_t> > thumbVol;
+    std::vector<std::vector<uint8_t> > thumbVol;
     s=readThumbnailVolumes(partial,geo,[&](int c,size_t r,size_t& n,MonoChunkAt& at){ denseAt(c,r,n,at); },nC,T,thumbVol); if(!s.ok()) return s;   // timepoint 0: k = c
     res.readSeconds=seconds()-t0;
 
@@ -991,6 +1143,22 @@ Status finishTiles(const MonoFinishOptions& o,const std::string& wd,const std::s
 }
 }  // namespace
 #endif
+
+namespace detail {
+bool monoPartPlaced(const std::string& workdir,int t,int c) noexcept{
+    try{
+#ifdef _WIN32
+        (void)workdir; (void)t; (void)c; return false;
+#else
+        const std::string wd=trimSlash(workdir), p=idxPath(wd,t,c); if(!exists(p)) return false;
+        MonoIdx x; std::string e;
+        if(!mono_idx_read(p,x,&e)||!mono_idx_validate(x,true,&e)||x.owner!=ownerOf(t,c)||x.timepoint!=t||x.channel!=c) return false;
+        return partHistsThere(wd,t,c,x.levels,NULL);
+#endif
+    }
+    catch(...){ return false; }
+}
+}  // namespace detail
 
 Status monoFinish(const MonoFinishOptions& o,MonoFinishResult* result) noexcept{
     try{

@@ -41,6 +41,9 @@ static const uint64_t MONO_ALIGN = 4096;           // claims and blobs are multi
 // Sample types of a Data dataset (also stored in the .idx sidecar).
 enum { MONO_U8 = 1, MONO_U16 = 2, MONO_U32 = 3, MONO_F32 = 4 };
 unsigned mono_dtype_bytes(unsigned dtype);   // 1, 2 or 4; 0 for an unknown code
+// ImarisWriter's byte-shuffle width (bpCompressionAlgorithmFactory::GetNBytesShuffle): 2 for uint16, 4 for uint32,
+// 1 (no shuffle, and no HDF5 shuffle filter) for uint8 and float32.
+unsigned mono_dtype_shuffle(unsigned dtype);
 
 // One chunk whose compressed bytes are already in the raw region.
 struct MonoChunk {
@@ -96,7 +99,7 @@ const MonoVfdStats& mono_vfd_stats(const MonoVfd& s);
 // False after any rule violation or I/O error; err gets the first one.
 bool mono_vfd_ok(const MonoVfd& s, std::string* err);
 
-// Creates <loc>/<name> as a Data dataset like writeOneDataset: whole chunks, shuffle for 2/4-byte types,
+// Creates <loc>/<name> as a Data dataset like writeOneDataset: whole chunks, shuffle for 2/4-byte integers,
 // LZ4 filter 32004 (registered as a no-op if no LZ4 filter is available). Intermediate groups are created.
 hid_t mono_create_dataset(hid_t loc, const char* name, const MonoGeom& g, std::string* err);
 

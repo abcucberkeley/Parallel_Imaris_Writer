@@ -19,6 +19,8 @@
 //   mono/layout.json           every level's geometry: written by the first placer, checked by every later one
 //   mono/claims/, owners/ ...  the claims journal of the raw region (monoclaim.h)
 //   mono/h_L<r>_C<c>_T<t>.hist the exact 65536-bin histogram (uint64, in-image voxels) of level r of each part
+//                              (uint8 and uint16; uint8 uses bins 0..255)
+//   mono/P_C<c>_T<t>.fhist     float32 parts instead: the part's stored histograms and ColorRange (see monoFinish)
 //   mono/P_C<c>_T<t>.idx       the part's sidecar: written last, the part's commit point
 //   mono/finished              the output path, once monofinish has renamed the file
 //
@@ -45,7 +47,8 @@
 //
 // Every step is also a function here: it returns a Status (no exit, no printing; the command line prints the
 // results), takes its thread count as an argument, and holds the library's HDF5 mutex only around its HDF5
-// calls. uint16 parts only for now. Linux and macOS: on Windows every step returns Unsupported.
+// calls. Parts of uint8, uint16 or float32 data (every part of a workdir the same); tiles of uint8 or uint16. Linux and
+// macOS: on Windows every step returns Unsupported.
 #include "parallelimariswriter.h"
 #include <cstdint>
 #include <string>
@@ -78,7 +81,7 @@ Status monoInit(const MonoInitOptions& options) noexcept;
 struct MonoPlaceOptions {
     std::string workdir;
     int timepoint = -1, channel = -1;
-    std::string partFile;   // the converter's .ims of this one (timepoint, channel), uint16
+    std::string partFile;   // the converter's .ims of this one (timepoint, channel): uint8, uint16 or float32
     int numThreads = 0;     // threads that read, decode and write; 0: defaultThreads()
 };
 struct MonoPlaceResult {
@@ -93,9 +96,9 @@ struct MonoPlaceResult {
     bool direct = false;                       // O_DIRECT (or F_NOCACHE) writes
     int threads = 0;
 };
-// Checks the part (one timepoint and one channel, uint16, every chunk of every level present and decodable,
-// geometry equal to mono/layout.json), claims its range, writes its chunks there in (level, z, y, x) order,
-// then its histograms and its sidecar.
+// Checks the part (one timepoint and one channel, uint8, uint16 or float32, every chunk of every level present and
+// decodable, geometry and sample type equal to mono/layout.json), claims its range, writes its chunks there in
+// (level, z, y, x) order, then its histograms and its sidecar.
 Status monoPlace(const MonoPlaceOptions& options, MonoPlaceResult* result = nullptr) noexcept;
 
 struct MonoProgress {
@@ -143,7 +146,28 @@ struct MonoFinishResult {
 // chunks, cut into the nT-timepoint chunks, encoded again (the same bytes ImarisWriter writes) and stored after
 // the raw region, so the whole file equals the single-node conversion; their placed chunks stay unused in the
 // raw region. Tiles are already laid out for nT timepoints.
+//
+// float32 parts: the data equals a single-node conversion's (the chunk bytes are copied, re-chunked levels are
+// encoded as ImarisWriter encodes them). The histograms cannot be exact: ImarisWriter's float32 histogram
+// (bpHistogramBuilderAdaptive) is 1000 bins whose range grows with the values added, so its bins depend on the order
+// the values come in (for levels >= 1 even ImarisWriter's own runs differ by a bin now and then: the order of its
+// resample threads). Each part's stored histograms are copied as they are: every level of every (t, c) holds what
+// the part's own conversion wrote. ColorRange: with one timepoint it is the part's own (the text a single-node
+// conversion of that volume writes); with more, ImarisWriter's multi-timepoint rule (channelColorHistMulti +
+// adjustColorRange) on the parts' level-0 histograms, whose ranges are known only as the 3-decimal texts
+// HistogramMin/Max. That error, d <= 0.0005 + half a float ulp of the larger |min| or |max|, can move a count into
+// the next of the 65536 layout bins, and so (rarely) the mode or 99.8th-percentile bin by one of 1024 bins: then the
+// ColorRange minimum differs by at most d + R/1024 and the maximum by at most 1.4 (d + R/1024) + 1 (its integer
+// cut), R = the channel's value range over all timepoints; usually it is the same. The /Thumbnail is coloured with
+// that ColorRange's value; with one timepoint that is the 3-decimal text, not ImarisWriter's exact float, so a few
+// thumbnail bytes can differ by 1.
 Status monoFinish(const MonoFinishOptions& options, MonoFinishResult* result = nullptr) noexcept;
+
+namespace detail {
+// Whether part (t, c)'s commit point is there: its sidecar (whole, of this part) and every histogram sidecar it
+// needs (parallel.h's clusterTask skips a placed part).
+bool monoPartPlaced(const std::string& workdir, int t, int c) noexcept;
+}
 
 }  // namespace piw
 

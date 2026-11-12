@@ -215,7 +215,7 @@ static bool failureCases(const std::string& exe, const fs::path& work, const fs:
     ok &= expectFail("link without a manifest", E+" link "+q(none)+" "+q(none/"out.ims")+" parts", none/"out.ims");
     ok &= expectFail("linkparts without a manifest", E+" linkparts "+q(none)+" "+q(none/"out.ims")+" parts", none/"out.ims");
 
-    // uint8 data: setup records it (linkparts can take it), the uint16-only tile worker refuses it
+    // uint8 data: setup records it (linkparts can take it), the packs store's (uint16-only) tile worker refuses it
     fs::path z8 = work/"fc_zarr_u8"; fs::create_directories(z8, ec); ok &= fsOk("create fc_zarr_u8", ec); writeZarrU8(z8/"CamA_t0000.zarr");
     fs::path wd8 = work/"fc_u8";
     if(runCmd(E+" setup "+q(z8)+" CamA "+q(wd8)+" 64,64,64 1,1,1 --store packs") != 0){ std::printf("  FAIL: setup on uint8 data\n"); ok = false; }

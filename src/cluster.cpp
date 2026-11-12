@@ -46,7 +46,8 @@ using piw::Status;
 using nlohmann::ordered_json;
 
 const char* const NOSUP="the single-file cluster output is not supported on this platform (a tile plan with --store packs is)";
-const char* const UINT16_ONLY="the single-file cluster output takes uint16 data only for now";
+const char* const SERIES_TYPES="a time-series plan takes uint8, uint16 and float32 data";
+const char* const TILE_TYPES="a tile plan takes uint8 and uint16 data (the packs store: uint16 only; a float32 volume: a time-series plan of it)";
 Status internalError(const char* what){ return Status(Code::Internal,std::string("unexpected error: ")+what); }
 std::string u64s(uint64_t v){ char b[32]; snprintf(b,sizeof b,"%llu",(unsigned long long)v); return b; }
 double seconds(){ return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -94,7 +95,6 @@ bool typeFromName(const std::string& n,piw::DataType& t){
 std::string monoDir(const std::string& wd){ return imscore::monoClaimsDir(wd); }
 std::string partOwner(int t,int c){ char b[48]; snprintf(b,sizeof b,"P_C%d_T%d",c,t); return b; }
 std::string partIdx(const std::string& wd,int t,int c){ return monoDir(wd)+"/"+partOwner(t,c)+".idx"; }
-std::string partHist(const std::string& wd,int r,int t,int c){ char b[64]; snprintf(b,sizeof b,"/h_L%d_C%d_T%d.hist",r,c,t); return monoDir(wd)+b; }
 
 // ---------------- the plan of a workdir ----------------
 struct PlanFile {
@@ -140,7 +140,7 @@ Status readPlanFile(const std::string& workdir,PlanFile& pf){
             imscore::Status ms=imscore::readManifest(pf.wd,pf.tiles); if(!ms.ok()) return Status(Code::InvalidArgument,ms.message);
             const imscore::Manifest& m=pf.tiles;
             pf.nT=m.nT; pf.nC=m.nC; pf.levels=(int)m.lev.size(); pf.size[0]=m.X; pf.size[1]=m.Y; pf.size[2]=m.Z; pf.store=m.store;
-            pf.type=m.elem==1?piw::DataType::UInt8:m.elem==4?piw::DataType::UInt32:piw::DataType::UInt16;
+            if(!typeFromName(m.dtype,pf.type)) return Status(Code::InvalidArgument,p+": unknown dataType '"+m.dtype+"'");
             pf.tilesPerTask=std::max(1L,j.value("tilesPerTask",1L));
             pf.stages=tileStages(m,pf.tilesPerTask);
             return Status();
@@ -168,15 +168,8 @@ Status readPlanFile(const std::string& workdir,PlanFile& pf){
 
 // ---------------- what is done ----------------
 #ifndef _WIN32
-// A part's commit point: its sidecar (whole, of this part, every level's histogram there).
-bool partDone(const std::string& wd,int t,int c){
-    const std::string p=partIdx(wd,t,c); if(!exists(p)) return false;
-    MonoIdx x; std::string e;
-    if(!mono_idx_read(p,x,&e)||!mono_idx_validate(x,true,&e)||x.owner!=partOwner(t,c)||x.timepoint!=t||x.channel!=c) return false;
-    for(size_t r=0;r<x.levels.size();r++){ struct stat st;
-        if(stat(partHist(wd,(int)r,t,c).c_str(),&st)!=0||(uint64_t)st.st_size!=imscore::HIST_BYTES) return false; }
-    return true;
-}
+// A part's commit point: its sidecar (whole, of this part, every histogram it needs there).
+bool partDone(const std::string& wd,int t,int c){ return piw::detail::monoPartPlaced(wd,t,c); }
 #endif
 // A tile's commit point, what monitor waits for: its histogram and its sidecar (mono) or pack (packs).
 bool tileDone(const imscore::Manifest& m,const std::string& wd,int r,long i){
@@ -294,7 +287,8 @@ Status seriesTask(const PlanFile& pf,long index,const piw::ClusterTaskOptions& o
     char name[160]; snprintf(name,sizeof name,"%s%ld_t%d_c%d.ims",SHM_PREFIX,(long)getpid(),t,c);
     std::string dir=o.stageDir;
     if(dir.empty()){
-        const double raw=(double)pf.size[0]*(double)pf.size[1]*(double)pf.size[2]*2.0, need=raw*STAGE_FACTOR+STAGE_EXTRA;
+        const double eb=pf.type==piw::DataType::UInt8?1.0:pf.type==piw::DataType::UInt16?2.0:4.0;
+        const double raw=(double)pf.size[0]*(double)pf.size[1]*(double)pf.size[2]*eb, need=raw*STAGE_FACTOR+STAGE_EXTRA;
         if(need<=0.9*jobMemory()&&need<=shmFree()){ removeStaleShm(); dir="/dev/shm"; res.memoryStage=true; }
     }
     auto inWorkdir=[&](){
@@ -347,7 +341,7 @@ Status tilesTask(const PlanFile& pf,int r,long index,const piw::ClusterTaskOptio
 
 // ---------------- plan ----------------
 // The text of a series plan's manifest.
-std::string seriesManifest(const piw::ConvertOptions& co,const uint64_t size[3],int levels,const imsmeta::Metadata& md,const std::vector<piw::ClusterStage>& stages){
+std::string seriesManifest(const piw::ConvertOptions& co,const uint64_t size[3],piw::DataType type,int levels,const imsmeta::Metadata& md,const std::vector<piw::ClusterStage>& stages){
     ordered_json j;
     const int nC=(int)co.files.size(), nT=(int)co.files[0].size();
     const int ax[3]={co.xOnImarisX?1:0,co.xOnImarisX?0:1,2};   // Imaris axis i = input axis ax[i]
@@ -356,7 +350,7 @@ std::string seriesManifest(const piw::ConvertOptions& co,const uint64_t size[3],
     j["voxel"]={imscore::floatExact(co.voxelSize[ax[0]]),imscore::floatExact(co.voxelSize[ax[1]]),imscore::floatExact(co.voxelSize[ax[2]])};
     j["output"]=co.outputFile;
     j["size"]={(unsigned long long)size[0],(unsigned long long)size[1],(unsigned long long)size[2]};
-    j["dataType"]="uint16"; j["levels"]=levels; j["taskIndex"]="timepoint * channels + channel";
+    j["dataType"]=typeName(type); j["levels"]=levels; j["taskIndex"]="timepoint * channels + channel";
     ordered_json c;
     c["reader"]=co.reader;
     c["voxelSize"]={imscore::floatExact(co.voxelSize[0]),imscore::floatExact(co.voxelSize[1]),imscore::floatExact(co.voxelSize[2])};
@@ -392,14 +386,15 @@ Status planValidated(const piw::ClusterPlanOptions& o,piw::ClusterPlan* plan){
 #ifdef _WIN32
         return Status(Code::Unsupported,NOSUP);
 #endif
-        if(type!=piw::DataType::UInt16) return Status(Code::Unsupported,std::string(UINT16_ONLY)+"; "+co.files[0][0]+" is "+typeName(type));
-        std::vector<imscore::Vec3> sz=imscore::GetOptimalImagePyramid((1024*1024)/2,{size[0],size[1],size[2]},true); levels=(int)sz.size();
+        if(type==piw::DataType::UInt32) return Status(Code::Unsupported,std::string(SERIES_TYPES)+"; "+co.files[0][0]+" is "+typeName(type)+" (use linkparts)");
+        const imscore::bpSize eb=imscore::elemOfDtype(typeName(type));
+        std::vector<imscore::Vec3> sz=imscore::GetOptimalImagePyramid((1024*1024)/eb,{size[0],size[1],size[2]},true); levels=(int)sz.size();
         piw::ClusterStage st; st.name="convert"; st.tasks=(long)nT*nC; stages.push_back(st);
-        text=seriesManifest(co,size,levels,md,stages); store="mono";
+        text=seriesManifest(co,size,type,levels,md,stages); store="mono";
     }
     else{
         if(co.reader!="zarr") return Status(Code::Unsupported,"a tile plan reads Zarr input only");
-        if(type!=piw::DataType::UInt16) return Status(Code::Unsupported,"the tile workers take uint16 data only; "+co.files[0][0]+" is "+typeName(type));
+        if(type!=piw::DataType::UInt16&&type!=piw::DataType::UInt8) return Status(Code::Unsupported,std::string(TILE_TYPES)+"; "+co.files[0][0]+" is "+typeName(type));
         if(co.xOnImarisX) return Status(Code::Unsupported,"a tile plan keeps the input's axes 0, 1, 2 as Imaris X, Y, Z (no xOnImarisX)");
         if(!o.tileSize[0]||!o.tileSize[1]||!o.tileSize[2]) return Status(Code::InvalidArgument,"a tile plan needs a tile size of at least 1 voxel along every axis");
         if(o.tilesPerTask<1) return Status(Code::InvalidArgument,"tilesPerTask must be at least 1");
@@ -410,14 +405,15 @@ Status planValidated(const piw::ClusterPlanOptions& o,piw::ClusterPlan* plan){
         store=o.store.empty()?std::string("mono"):o.store;
 #endif
         if(store!="mono"&&store!="packs") return Status(Code::InvalidArgument,"unknown store '"+store+"' (expected mono or packs)");
+        if(store=="packs"&&type!=piw::DataType::UInt16) return Status(Code::Unsupported,std::string(TILE_TYPES)+"; "+co.files[0][0]+" is "+typeName(type));
 #ifdef _WIN32
         if(store=="mono") return Status(Code::Unsupported,NOSUP);
 #endif
-        m.nC=nC; m.nT=nT; m.X=size[0]; m.Y=size[1]; m.Z=size[2]; m.elem=2; m.store=store; m.meta=md;
+        m.nC=nC; m.nT=nT; m.X=size[0]; m.Y=size[1]; m.Z=size[2]; m.dtype=typeName(type); m.elem=imscore::elemOfDtype(m.dtype); m.store=store; m.meta=md;
         for(int a=0;a<3;a++){ m.vox[a]=co.voxelSize[a]; m.cap[a]=(imscore::bpSize)o.tileSize[a]; m.org[a]=co.hasBoundingBox?co.boundingBox[a]:0; }
         m.zarrs.resize((size_t)nC*nT); for(int c=0;c<nC;c++) for(int t=0;t<nT;t++) m.zarrs[(size_t)c*nT+t]=co.files[(size_t)c][(size_t)t];
         const uint64_t cb=o.chunkBytes?o.chunkBytes:imscore::chunkBudgetBytes();
-        m.lev=imscore::makeLevels(m.X,m.Y,m.Z,2,m.cap,(imscore::bpSize)cb,(imscore::bpSize)nT);
+        m.lev=imscore::makeLevels(m.X,m.Y,m.Z,m.elem,m.cap,(imscore::bpSize)cb,(imscore::bpSize)nT);
         levels=(int)m.lev.size(); perTask=o.tilesPerTask; stages=tileStages(m,perTask);
         ordered_json extra; extra["kind"]="tiles"; extra["stages"]=stagesJson(stages); extra["tilesPerTask"]=perTask;
         extra["output"]=co.outputFile; extra["chunkBytes"]=(unsigned long long)cb;

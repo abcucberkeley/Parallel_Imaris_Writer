@@ -16,7 +16,8 @@
 //   crop run : monoinit + 2 timepoints x 1 channel converted with -B, an image small enough that a single-node
 //              conversion of 2 timepoints chunks level 0 differently from the 1-timepoint parts: monofinish
 //              re-chunks it, and the file equals the cropped single-node conversion (monoinit and the reference
-//              given the same metadata options). Refused: a part of another geometry, a uint8 part, a file with
+//              given the same metadata options). Refused: a part of another geometry, a uint8 part (the workdir
+//              holds uint16 parts), a file with
 //              two channels, a monoinit with other metadata.
 //   thumbnail run: 1 timepoint x 2 channels, big enough that the thumbnail comes from level 1, with bright
 //              blocks off the middle slice (constant): ImarisWriter keeps the maximum projection. Non-default
@@ -282,7 +283,7 @@ int main(int argc, char** argv){
     auto place2 = [&](int t, const fs::path& p){ return E + " monoplace " + q(wd2) + " " + std::to_string(t) + " 0 " + q(p); };
     CHECK(run(place2(0, parts2 / "p0.ims")) == 0, "monoplace crop t0");
     CHECK(run(place2(1, keep / "part_t0_c0.ims"), &o, log) == 1 && o.find("layout.json") != std::string::npos, "a part of another geometry was accepted");
-    CHECK(run(place2(1, parts2 / "u8.ims"), &o, log) == 1 && o.find("uint16") != std::string::npos, "a uint8 part was accepted");
+    CHECK(run(place2(1, parts2 / "u8.ims"), &o, log) == 1 && o.find("holds uint8 data") != std::string::npos, "a uint8 part was accepted");
     CHECK(run(place2(1, refDir / "output.ims"), &o, log) == 1 && o.find("more than one") != std::string::npos, "a file with two channels was accepted as a part");
     CHECK(run(place2(1, parts2 / "p1.ims")) == 0, "monoplace crop t1");
     CHECK(run(E + " monofinish " + q(wd2), &o, log) == 0 && fs::exists(out2) && o.find("levels 0 re-chunked") != std::string::npos,

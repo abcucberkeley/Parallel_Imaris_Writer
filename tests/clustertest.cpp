@@ -2,7 +2,7 @@
 // every task a separate process of the shipped executable, on synthetic data.
 //
 //   series : 2 channels x 3 timepoints, cropped with -B, with metadata options and -C. The plan's refusals first
-//            (a uint8 input, a box that does not fit, inputs of two sizes, a bad metadata option, a second plan in the
+//            (a uint32 input, a box that does not fit, inputs of two sizes, a bad metadata option, a second plan in the
 //            same workdir); then status/finish (and monostatus/monofinish) of the empty workdir; the tasks in shuffled
 //            order, staged in a given folder or wherever the task decides, one by the stage's number, one twice at
 //            the same time, and one whose input has a truncated chunk: that one fails alone, status/finish (and
@@ -158,12 +158,12 @@ int main(int argc, char** argv){
 
     // ---------------- series: refusals ----------------
     std::printf("[plan refused] nothing is written\n");
-    const fs::path u8 = work / "u8", sizes = work / "sizes", wdx = work / "wd_refused";
-    fs::create_directories(u8); fs::create_directories(sizes);
-    writeZarr(u8 / "U8_t0000.zarr", makeVolume<uint8_t>(X, Y, Z, 0, 0), X, Y, Z, "|u1");
+    const fs::path u32 = work / "u32", sizes = work / "sizes", wdx = work / "wd_refused";
+    fs::create_directories(u32); fs::create_directories(sizes);
+    writeZarr(u32 / "U32_t0000.zarr", makeVolume<uint32_t>(X, Y, Z, 0, 0), X, Y, Z, "<u4");
     writeZarr(sizes / "S_t0000.zarr", makeVolume<uint16_t>(X, Y, Z, 0, 0), X, Y, Z, "<u2");
     writeZarr(sizes / "S_t0001.zarr", makeVolume<uint16_t>(X, Y - 1, Z, 1, 0), X, Y - 1, Z, "<u2");
-    CHECK(run(E + " plan " + q(wdx) + " -F " + q(u8) + " -P U8 -r zarr", &o, log) == 1 && has(o, "uint16"), "a uint8 series plan");
+    CHECK(run(E + " plan " + q(wdx) + " -F " + q(u32) + " -P U32 -r zarr", &o, log) == 1 && has(o, "uint32"), "a uint32 series plan");
     CHECK(run(E + " plan " + q(wdx) + " -F " + q(zdir) + " -P CamA,CamB -r zarr -B 0,0,0,999,10,10", &o, log) == 1 && has(o, "does not fit"), "a box that does not fit");
     CHECK(run(E + " plan " + q(wdx) + " -F " + q(sizes) + " -P S_ -r zarr", &o, log) == 1 && has(o, "same size"), "inputs of two sizes");
     CHECK(run(E + " plan " + q(wdx) + " -F " + q(zdir) + " -P CamA,CamB -r zarr --colors nocolor", &o, log) == 1 && has(o, "nocolor"), "a bad metadata option");

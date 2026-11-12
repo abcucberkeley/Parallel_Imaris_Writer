@@ -567,6 +567,12 @@ if(PIW_BUILD_TESTS)
     piw_add_test(cluster tests/clustertest.cpp LIBS cppZarr_shared)
     set_tests_properties(cluster PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
 
+    # uint8 and float32 through the single-file cluster output: uint8 parts, series plan and tiles identical to a
+    # single-node conversion; float32 data identical, its histograms and ColorRange within the documented bound
+    # (src/mono.h); the refused types. Reports "skipped" on Windows.
+    piw_add_test(types tests/typestest.cpp LIBS cppZarr_shared)
+    set_tests_properties(types PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
     # The converter's command line: options, values, input discovery and exit codes (every error
     # exits 1 with one ERROR line, never 0 or a signal); the POSIX-only cases are skipped on Windows.
     piw_add_test(clitest tests/clitest.cpp LIBS cppTiff_shared cppZarr_shared)

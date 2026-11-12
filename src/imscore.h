@@ -89,9 +89,21 @@ inline std::vector<Vec3> GetOptimalImagePyramid(bpSize aMax, Vec3 img, bool rZ){
 // ImarisWriter choice); override with env PIW_CHUNK_BYTES (e.g. 8388608 for ~8 MiB chunks).
 inline bpSize chunkBudgetBytes(){ bpSize b=1u<<20; const char* e=getenv("PIW_CHUNK_BYTES"); if(e){ char* end=NULL; unsigned long long v=strtoull(e,&end,10); if(end!=e&&v>=4096) b=(bpSize)v; } return b; }
 
-// ===================== chunk codec (bpShuffle 2-byte + bpLZ4) =====================
+// ===================== chunk codec (bpShuffle + bpLZ4) =====================
+// bpShuffle: the bytes of 2- and 4-byte integer samples are grouped by byte position (byte 0 of every sample
+// first); uint8 and float32 samples are not shuffled (bpCompressionAlgorithmFactory::GetNBytesShuffle is 1 for
+// them, and their datasets have no HDF5 shuffle filter). sb below: that width (1, 2 or 4).
 inline void shuffle2(const uint8_t* s,size_t n,uint8_t* d){ size_t h=n/2; for(size_t i=0;i<h;i++){d[i]=s[2*i];d[h+i]=s[2*i+1];} }
 inline void unshuffle2(const uint8_t* s,size_t n,uint8_t* d){ size_t h=n/2; for(size_t i=0;i<h;i++){d[2*i]=s[i];d[2*i+1]=s[h+i];} }
+// n bytes, shuffle width eb (1, 2 or 4)
+inline void shuffleN(const uint8_t* s,size_t n,size_t eb,uint8_t* d){
+    if(eb==2){ shuffle2(s,n,d); return; }
+    if(eb!=4){ memcpy(d,s,n); return; }
+    const size_t q=n/4; for(size_t i=0;i<q;i++){ d[i]=s[4*i]; d[q+i]=s[4*i+1]; d[2*q+i]=s[4*i+2]; d[3*q+i]=s[4*i+3]; } }
+inline void unshuffleN(const uint8_t* s,size_t n,size_t eb,uint8_t* d){
+    if(eb==2){ unshuffle2(s,n,d); return; }
+    if(eb!=4){ memcpy(d,s,n); return; }
+    const size_t q=n/4; for(size_t i=0;i<q;i++){ d[4*i]=s[i]; d[4*i+1]=s[q+i]; d[4*i+2]=s[2*q+i]; d[4*i+3]=s[3*q+i]; } }
 inline void wbe(uint8_t* d,uint64_t v,int nb){ for(int i=0;i<nb;i++) d[nb-1-i]=(uint8_t)((v>>(8*i))&0xff); }
 inline uint64_t rbe(const uint8_t* d,int nb){ uint64_t v=0; for(int i=0;i<nb;i++)v=(v<<8)|d[i]; return v; }
 // The LZ4 stage of encodeChunk: nb already shuffled bytes. false if LZ4 failed (or nb is beyond what one LZ4
@@ -104,13 +116,15 @@ inline bool encodeChunkShuffled(const uint8_t* sh,size_t nb,std::vector<uint8_t>
     wbe(out.data(),nb,8); wbe(out.data()+8,nb,4); wbe(out.data()+12,(uint64_t)c,4); out.resize(16+c);
     return true;
 }
-// false if LZ4 failed (or nb is beyond what one LZ4 block takes)
-inline bool encodeChunk(const uint8_t* vox,size_t nb,std::vector<uint8_t>& out){
+// nb voxel bytes, shuffle width eb; false if LZ4 failed (or nb is beyond what one LZ4 block takes)
+inline bool encodeChunk(const uint8_t* vox,size_t nb,std::vector<uint8_t>& out,size_t eb=2){
     if(nb>(size_t)LZ4_MAX_INPUT_SIZE){ out.clear(); return false; }
-    std::vector<uint8_t> sh(nb); shuffle2(vox,nb,sh.data());
+    if(eb==1) return encodeChunkShuffled(vox,nb,out);
+    std::vector<uint8_t> sh(nb); shuffleN(vox,nb,eb,sh.data());
     return encodeChunkShuffled(sh.data(),nb,out);
 }
-// The LZ4 stage of decodeChunk: the chunk's still shuffled bytes into sh (expectRaw bytes, the header must agree).
+// The LZ4 stage of decodeChunk: the chunk's still shuffled bytes into sh (expectRaw bytes, the header must agree);
+// unshuffled (uint8, float32) these are the voxels.
 inline Status decodeChunkShuffled(const uint8_t* c,size_t cs,uint8_t* sh,size_t expectRaw){
     if(cs<16) return Status::fail("chunk of "+std::to_string(cs)+" bytes is shorter than its 16-byte header");
     uint64_t t=rbe(c,8), comp=rbe(c+12,4);
@@ -121,27 +135,36 @@ inline Status decodeChunkShuffled(const uint8_t* c,size_t cs,uint8_t* sh,size_t 
     if(d<0||(uint64_t)d!=t) return Status::fail("LZ4 could not decode a chunk (corrupt data)");
     return Status();
 }
-// Decode one chunk written by encodeChunk; expectRaw = the chunk's voxel bytes (the header must agree).
-inline Status decodeChunk(const uint8_t* c,size_t cs,std::vector<uint8_t>& vox,size_t expectRaw){
+// Decode one chunk written by encodeChunk; expectRaw = the chunk's voxel bytes (the header must agree), eb = the
+// shuffle width.
+inline Status decodeChunk(const uint8_t* c,size_t cs,std::vector<uint8_t>& vox,size_t expectRaw,size_t eb=2){
+    if(eb==1){ vox.resize(expectRaw); return decodeChunkShuffled(c,cs,vox.data(),expectRaw); }
     std::vector<uint8_t> sh(expectRaw);
     Status s=decodeChunkShuffled(c,cs,sh.data(),expectRaw); if(!s.ok()) return s;
-    vox.resize(expectRaw); unshuffle2(sh.data(),expectRaw,vox.data());
+    vox.resize(expectRaw); unshuffleN(sh.data(),expectRaw,eb,vox.data());
     return Status();
 }
 // Copies the in-image part of a decoded chunk (block dims b, chunk index cx,cy,cz; x fastest) into a dense
 // volume of size[0]*size[1]*size[2] voxels.
-inline void chunkToVolume(const uint16_t* v,const bpSize b[3],bpSize cx,bpSize cy,bpSize cz,const bpSize size[3],uint16_t* vol){
+template<class T> inline void chunkToVolume(const T* v,const bpSize b[3],bpSize cx,bpSize cy,bpSize cz,const bpSize size[3],T* vol){
     const bpSize x0=cx*b[0],y0=cy*b[1],z0=cz*b[2];
     if(x0>=size[0]||y0>=size[1]||z0>=size[2]) return;
     const bpSize xv=std::min(b[0],size[0]-x0),yv=std::min(b[1],size[1]-y0),zv=std::min(b[2],size[2]-z0);
     for(bpSize z=0;z<zv;z++) for(bpSize y=0;y<yv;y++)
-        memcpy(vol+(size_t)(x0+(y0+y)*size[0]+(z0+z)*size[0]*size[1]),v+(size_t)(y+z*b[1])*b[0],(size_t)xv*2);
+        memcpy(vol+(size_t)(x0+(y0+y)*size[0]+(z0+z)*size[0]*size[1]),v+(size_t)(y+z*b[1])*b[0],(size_t)xv*sizeof(T));
+}
+// chunkToVolume for eb-byte samples given as bytes (eb 1, 2 or 4)
+inline void chunkToVolumeBytes(const uint8_t* v,const bpSize b[3],bpSize cx,bpSize cy,bpSize cz,const bpSize size[3],size_t eb,uint8_t* vol){
+    if(eb==1) chunkToVolume(v,b,cx,cy,cz,size,vol);
+    else if(eb==2) chunkToVolume((const uint16_t*)v,b,cx,cy,cz,size,(uint16_t*)vol);
+    else chunkToVolume((const uint32_t*)v,b,cx,cy,cz,size,(uint32_t*)vol);
 }
 // Box-average one pyramid step (ImarisWriter's ResampleBlockT: the sum as float, divided by the box volume,
 // truncated); dims/strides [x,y,z] (x fastest), di a multiple of st. Output planes in parallel (OpenMP).
 // Strides of 1 or 2 (every pyramid step) sum in integers and shift: the float sum of at most 8 uint16 values is
 // exact and dividing it by a power of two is too, so the result is the same. out: dOut[0]*dOut[1]*dOut[2] voxels.
-inline void boxDown(const uint16_t* in,const bpSize di[3],const bpSize st[3],uint16_t* out,bpSize dOut[3]){
+// T: uint8_t or uint16_t.
+template<class T> inline void boxDown(const T* in,const bpSize di[3],const bpSize st[3],T* out,bpSize dOut[3]){
     for(int a=0;a<3;a++) dOut[a]=di[a]/st[a];
     const long long nz=(long long)dOut[2]; const size_t pi=(size_t)di[0]*di[1], po=(size_t)dOut[0]*dOut[1];
     if(st[0]<=2&&st[1]<=2&&st[2]<=2){
@@ -149,11 +172,11 @@ inline void boxDown(const uint16_t* in,const bpSize di[3],const bpSize st[3],uin
         const size_t dx=(size_t)st[0]-1, dy=(size_t)(st[1]-1)*di[0], dz=(size_t)(st[2]-1)*pi;
         #pragma omp parallel for schedule(static)
         for(long long oz=0;oz<nz;oz++) for(bpSize oy=0;oy<dOut[1];oy++){
-            const uint16_t* a=in+(size_t)oz*st[2]*pi+(size_t)oy*st[1]*di[0];
-            uint16_t* o=out+(size_t)oz*po+(size_t)oy*dOut[0];
-            for(bpSize ox=0;ox<dOut[0];ox++){ const uint16_t* p=a+(size_t)ox*st[0];
+            const T* a=in+(size_t)oz*st[2]*pi+(size_t)oy*st[1]*di[0];
+            T* o=out+(size_t)oz*po+(size_t)oy*dOut[0];
+            for(bpSize ox=0;ox<dOut[0];ox++){ const T* p=a+(size_t)ox*st[0];
                 uint32_t s=(uint32_t)p[0]+p[dx]+p[dy]+p[dy+dx]+p[dz]+p[dz+dx]+p[dz+dy]+p[dz+dy+dx];   // repeats when an axis is not reduced
-                o[ox]=(uint16_t)((s>>(3-sh))>>sh); }   // s counts each voxel 8/2^sh times
+                o[ox]=(T)((s>>(3-sh))>>sh); }   // s counts each voxel 8/2^sh times
         }
         return;
     }
@@ -162,7 +185,7 @@ inline void boxDown(const uint16_t* in,const bpSize di[3],const bpSize st[3],uin
     for(long long oz=0;oz<nz;oz++)for(bpSize oy=0;oy<dOut[1];oy++)for(bpSize ox=0;ox<dOut[0];ox++){ float s=0;
         for(bpSize dz=0;dz<st[2];dz++)for(bpSize dy=0;dy<st[1];dy++)for(bpSize dx=0;dx<st[0];dx++)
             s+=in[(ox*st[0]+dx)+(oy*st[1]+dy)*di[0]+((bpSize)oz*st[2]+dz)*pi];
-        out[ox+oy*dOut[0]+(size_t)oz*po]=(uint16_t)(s/dn); }
+        out[ox+oy*dOut[0]+(size_t)oz*po]=(T)(s/dn); }
 }
 
 // ===================== files (portable: 64-bit offsets, atomic replace, mkdir -p) =====================
@@ -241,8 +264,12 @@ struct Lev { Vec3 size, block, nch, tb, nt; };   // tb = tile size in blocks; nt
 // store: where the tile workers put their chunks: "mono" = straight into the single file (sidecars in chunks/,
 // see mono.h), "packs" = one .pack per tile for monitor's serial combine, combineone and link (manifests written
 // before the field existed are "packs"). org: the image's first voxel in every zarr (a plan's bounding box; X, Y, Z
-// = the box's size), written as "origin" only when not 0.
-struct Manifest { std::vector<std::string> zarrs; int nC=1,nT=1; bpSize X,Y,Z,elem; float vox[3]; bpSize cap[3]={0,0,0}; std::vector<Lev> lev; imsmeta::Metadata meta; std::string store="packs"; bpSize org[3]={0,0,0}; };
+// = the box's size), written as "origin" only when not 0. dtype: the sample type (uint8, uint16, uint32 or float32),
+// written as "dataType" only when not uint16 (manifests without it: from elem, 4 bytes = float32 as imsDtype).
+struct Manifest { std::vector<std::string> zarrs; int nC=1,nT=1; bpSize X,Y,Z,elem; float vox[3]; bpSize cap[3]={0,0,0}; std::vector<Lev> lev; imsmeta::Metadata meta; std::string store="packs"; bpSize org[3]={0,0,0}; std::string dtype="uint16"; };
+// The sample type of elem-byte samples when nothing else says (imsDtype's choice)
+inline std::string dtypeOfElem(bpSize elem){ return elem==1?"uint8":elem==4?"float32":"uint16"; }
+inline bpSize elemOfDtype(const std::string& t){ return t=="uint8"?1:t=="uint16"?2:(t=="uint32"||t=="float32")?4:0; }
 inline const std::string& zarrAt(const Manifest& m,int c,int t){ return m.zarrs[(size_t)c*m.nT+t]; }
 inline bpSize levStride(const Manifest& m,int r,int a){ bpSize s=m.lev[r-1].size[a]/m.lev[r].size[a]; return s?s:1; }
 inline long jobsAtLevel(const Manifest& m,int r){ const Lev& L=m.lev[r]; return (long)m.nC*m.nT*L.nt[0]*L.nt[1]*L.nt[2]; }
@@ -302,6 +329,7 @@ inline std::string manifestText(const Manifest& m,const nlohmann::ordered_json* 
     j["voxel"]={voxClean(m.vox[0]),voxClean(m.vox[1]),voxClean(m.vox[2])};
     j["tile"]={(unsigned long long)m.cap[0],(unsigned long long)m.cap[1],(unsigned long long)m.cap[2]};
     j["store"]=m.store;
+    if(m.dtype!="uint16") j["dataType"]=m.dtype;
     if(m.org[0]||m.org[1]||m.org[2]) j["origin"]={(unsigned long long)m.org[0],(unsigned long long)m.org[1],(unsigned long long)m.org[2]};
     ordered_json lv=ordered_json::array();
     for(const Lev& L:m.lev){ ordered_json e;
@@ -334,6 +362,8 @@ inline Status readManifest(const std::string& wd,Manifest& m){
         if(j.contains("tile")){ auto&c=j["tile"]; for(int a=0;a<3;a++) m.cap[a]=c[a].get<bpSize>(); }
         if(j.contains("origin")){ auto&o=j["origin"]; for(int a=0;a<3;a++) m.org[a]=o[a].get<bpSize>(); }
         m.store=j.value("store",std::string("packs"));
+        m.dtype=j.value("dataType",dtypeOfElem(m.elem));
+        if(elemOfDtype(m.dtype)!=m.elem) return Status::fail(p+": dataType '"+m.dtype+"' does not fit "+std::to_string(m.elem)+"-byte voxels");
         if(m.store!="packs"&&m.store!="mono") return Status::fail(p+": unknown store '"+m.store+"' (expected mono or packs)");
         for(auto& e:j["level"]){ Lev L; for(int a=0;a<3;a++){ L.size[a]=e["size"][a].get<bpSize>(); L.block[a]=e["block"][a].get<bpSize>(); L.nch[a]=e["nchunks"][a].get<bpSize>(); L.tb[a]=e["tileBlocks"][a].get<bpSize>(); L.nt[a]=e["ntiles"][a].get<bpSize>(); } m.lev.push_back(L); }
         if(m.nC<1||m.nT<1||m.lev.empty()||m.X==0||m.Y==0||m.Z==0||(m.elem!=1&&m.elem!=2&&m.elem!=4)) return Status::fail(p+" has no levels, an empty size, or an unknown element size");
@@ -505,8 +535,12 @@ inline bool writeTimeInfo(hid_t out,const imsmeta::Metadata& md,hid_t lcpl,const
 // trim a 65536-bin histogram like bpHistogramBuilder<uint16>::GetHistogram (min 0, keep >=257 span). Written in
 // bpWriterHDF5::WriteHistogramImpl's order (Min, Max, then the dataset; 256 bins, then 1024): the group's object
 // header then stores its links and attributes in the same order as a single-node file.
-inline bool writeHistogramFromBins(hid_t g,const std::vector<uint64_t>& bins){
+// u8: uint8 data (bins 0..255 of the 65536 used): bpHistogramBuilder<uint8> always has 256 bins over [0, 255], so
+// only the 256-bin Histogram is written.
+inline bool writeHistogramFromBins(hid_t g,const std::vector<uint64_t>& bins,bool u8=false){
     bool any=false; for(uint64_t v:bins){ if(v){any=true;break;} } if(!any)return true;
+    if(u8){ std::vector<uint64_t> h256(bins.begin(),bins.begin()+256);
+        bool ok=setStrAttr(g,"HistogramMin","0.000"); ok&=setStrAttr(g,"HistogramMax","255.000"); ok&=writeU64(g,"Histogram",h256); return ok; }
     uint64_t vMax=65535; while(256<vMax&&bins[vMax]==0)--vMax; uint64_t nb=vMax+1; std::vector<uint64_t> tr(bins.begin(),bins.begin()+nb);
     auto rs=[](const std::vector<uint64_t>& in,uint64_t nN){ std::vector<uint64_t> o(nN,0); uint64_t on=in.size(); for(uint64_t i=0;i<on;i++) o[i*nN/on]+=in[i]; return o; };
     std::vector<uint64_t> h1024=nb>1024?rs(tr,1024):tr, h256=rs(h1024,256); std::string mn="0.000",mx=fstr((float)vMax,3);
@@ -514,8 +548,17 @@ inline bool writeHistogramFromBins(hid_t g,const std::vector<uint64_t>& bins){
     if(h1024.size()!=256){ ok&=setStrAttr(g,"HistogramMin1024",mn); ok&=setStrAttr(g,"HistogramMax1024",mx); ok&=writeU64(g,"Histogram1024",h1024); }
     return ok;
 }
-// per-channel auto ColorRange from the (exact, summed) level-0 histogram
+// per-channel auto ColorRange from the (exact, summed) level-0 histogram. A ColorHist is an ImarisWriter bpHistogram:
+// its bins over [hmin, hmax].
 struct ColorHist { std::vector<uint64_t> bins; float hmin,hmax; };
+// bpHistogramBuilder<T>::GetHistogram of 65536 counts (bin i = value i): uint16 trims empty top bins (min 0, keeps
+// >= 257 bins); uint8 is always 256 bins over [0, 255].
+inline ColorHist trimmedHist(const std::vector<uint64_t>& bins,bool u8){
+    ColorHist h; h.hmin=0.f;
+    if(u8){ h.bins.assign(bins.begin(),bins.begin()+256); h.hmax=255.f; return h; }
+    uint32_t vMax=65535; while(256u<vMax&&bins[vMax]==0)--vMax;
+    h.bins.assign(bins.begin(),bins.begin()+vMax+1); h.hmax=(float)vMax; return h;
+}
 inline void adjustColorRange(const ColorHist& h,float& rMin,float& rMax){
     bpSize vSize=h.bins.size(); if(vSize==0){rMin=0;rMax=0;return;}
     std::vector<float> vOriginal(vSize),vBins(vSize); for(bpSize i=0;i<vSize;i++) vOriginal[i]=(float)h.bins[i];
@@ -532,22 +575,36 @@ inline void adjustColorRange(const ColorHist& h,float& rMin,float& rMax){
 // many timepoints -> each timepoint's trimmed 65536-bin histogram remapped (GetBin of
 // GetBinValue) into a common [0,maxMax] layout, then resampled to 1024. perTp[t] is the
 // full 65536-bin level-0 histogram for timepoint t (bin i = count of value i).
-inline ColorHist channelColorHistMulti(const std::vector<std::vector<uint64_t>>& perTp){
-    std::vector<std::vector<uint64_t>> hs; std::vector<uint32_t> vmaxs; uint32_t gMax=0;
-    for(const auto& bins:perTp){ uint32_t vMax=65535; while(256u<vMax&&bins[vMax]==0)--vMax; hs.emplace_back(bins.begin(),bins.begin()+vMax+1); vmaxs.push_back(vMax); if(vMax>gMax)gMax=vMax; }
-    ColorHist h; h.hmin=0.f; h.hmax=(float)gMax;
+// The same from each timepoint's histogram as its builder gives it (trimmedHist for integers; ImarisWriter's adaptive
+// histogram for float32): the common layout spans [min of the minima, max of the maxima], with bpHistogram's GetBin
+// and GetBinValue arithmetic.
+inline ColorHist channelColorHistMulti(const std::vector<ColorHist>& hs){
+    ColorHist h; h.hmin=0.f; h.hmax=0.f;
     if(hs.empty()){ h.bins.assign(256,0); return h; }
-    if(hs.size()==1){ uint64_t nb=hs[0].size(); if(nb>1024){ std::vector<uint64_t> r(1024,0); for(uint64_t i=0;i<nb;i++) r[i*1024/nb]+=hs[0][i]; h.bins=std::move(r);} else h.bins=std::move(hs[0]); return h; }
+    if(hs.size()==1){ const ColorHist& a=hs[0]; uint64_t nb=a.bins.size(); h.hmin=a.hmin; h.hmax=a.hmax;
+        if(nb>1024){ std::vector<uint64_t> r(1024,0); for(uint64_t i=0;i<nb;i++) r[i*1024/nb]+=a.bins[i]; h.bins=std::move(r);} else h.bins=a.bins; return h; }
+    float vMin=0.f, vMax=0.f;
+    for(size_t t=0;t<hs.size();++t){ if(t==0||hs[t].hmin<vMin) vMin=hs[t].hmin; if(t==0||hs[t].hmax>vMax) vMax=hs[t].hmax; }
+    h.hmin=vMin; h.hmax=vMax;
     std::vector<uint64_t> layout(65536,0);
-    for(size_t t=0;t<hs.size();++t){ uint32_t vMax=vmaxs[t]; bpSize sz=hs[t].size();
-        for(bpSize b=0;b<sz;b++){ float val=(float)vMax*b/(float)sz; bpSize dest= val<=0.f?0:(val>=(float)gMax?65535:(bpSize)(val*65536.f/((float)gMax+1.f))); layout[dest]+=hs[t][b]; } }
+    for(size_t t=0;t<hs.size();++t){ const ColorHist& a=hs[t]; bpSize sz=a.bins.size();
+        for(bpSize b=0;b<sz;b++){ float val=a.hmin+(a.hmax-a.hmin)*(float)b/(float)sz;
+            bpSize dest= val<=vMin?0:(val>=vMax?65535:(bpSize)((val-vMin)*65536.f/(vMax-vMin+1.f))); layout[dest]+=a.bins[b]; } }
     std::vector<uint64_t> r(1024,0); for(uint64_t i=0;i<65536;i++) r[i*1024/65536]+=layout[i]; h.bins=std::move(r);
     return h;
+}
+// uint16 data: perTp[t] is the full 65536-bin level-0 histogram of timepoint t.
+inline ColorHist channelColorHistMulti(const std::vector<std::vector<uint64_t>>& perTp){
+    std::vector<ColorHist> hs; for(const auto& bins:perTp) hs.push_back(trimmedHist(bins,false));
+    return channelColorHistMulti(hs);
 }
 
 // ===================== Imaris metadata =====================
 // The full 65536-bin histogram of (level r, source channel c, source timepoint t), wherever a writer keeps it.
 typedef std::function<Status(int r,int c,int t,std::vector<uint64_t>& bins)> LevelHistFn;
+// Source channel c's ColorRange over the source timepoints tps, when a writer supplies it instead of the exact
+// histograms (float32 parts, mono.cpp): d.rangeMin/rangeMax (for the thumbnail) and the attribute's text.
+typedef std::function<Status(int c,const std::vector<int>& tps,ChannelDisplay& d,std::string& text)> ColorRangeFn;
 // The metadata is written in ImarisWriter's order, so that even listings in native (storage) order match a
 // single-node file: writeImsRoot (bpWriterHDF5's constructor, then /DataSet with the first data block), the
 // /DataSet tree (each level's groups in increasing t, then c), then writeImsDataSetInfo (WriteMetadata, after
@@ -568,9 +625,11 @@ inline Status writeImsRoot(hid_t out,hid_t lcpl){
 // their level-0 histograms, hist(0,c,t)) and written as TimeInfo TimePoint1,2,... (no value is longer than the 1024
 // characters above which ImarisWriter writes a string as a dataset: imsmeta's names are at most that long).
 // display (optional) receives each written channel's settings (its color and ColorRange), for the thumbnail.
+// The histograms are of m.dtype's samples (uint8: values 0..255 of the 65536 bins); colorRange (optional) replaces
+// them for the ColorRange.
 inline Status writeImsDataSetInfo(hid_t out,const Manifest& m,hid_t lcpl,const std::vector<int>& srcCh,
                                   const std::vector<int>& srcTps,const LevelHistFn& hist,
-                                  std::vector<ChannelDisplay>* display=NULL){
+                                  std::vector<ChannelDisplay>* display=NULL,const ColorRangeFn* colorRange=NULL){
     const Status bad=Status::fail("cannot write the Imaris metadata (HDF5 error above)");
     bool ok=true;
     std::map<std::string,std::map<std::string,std::string> > sec;   // section -> attribute -> value
@@ -583,17 +642,23 @@ inline Status writeImsDataSetInfo(hid_t out,const Manifest& m,hid_t lcpl,const s
     img["X"]=std::to_string(X); img["Y"]=std::to_string(Y); img["Z"]=std::to_string(Z); img["Unit"]="um";
     img["ResampleDimensionX"]="true"; img["ResampleDimensionY"]="true"; img["ResampleDimensionZ"]="true";
     img["RecordingDate"]=srcTps.empty()?std::string():imsmeta::timeString(m.meta.times[srcTps[0]]);
+    const bool u8=m.dtype=="uint8";
     for(size_t oc=0;oc<srcCh.size();oc++){ int c=srcCh[oc];
-        std::vector<std::vector<uint64_t>> perTp;
-        for(int t:srcTps){ perTp.emplace_back(); Status s=hist(0,c,t,perTp.back()); if(!s.ok()) return s; }
-        ChannelDisplay d=imsChannelDisplay(m.meta,c); adjustColorRange(channelColorHistMulti(perTp),d.rangeMin,d.rangeMax);
+        ChannelDisplay d=imsChannelDisplay(m.meta,c); std::string range;
+        if(colorRange){ Status s=(*colorRange)(c,srcTps,d,range); if(!s.ok()) return s; }
+        else{
+            std::vector<ColorHist> perTp; std::vector<uint64_t> bins;
+            for(int t:srcTps){ Status s=hist(0,c,t,bins); if(!s.ok()) return s; perTp.push_back(trimmedHist(bins,u8)); }
+            adjustColorRange(channelColorHistMulti(perTp),d.rangeMin,d.rangeMax);
+            range=fstr(d.rangeMin,3)+" "+fstr(d.rangeMax,3);
+        }
         if(display) display->push_back(d);
         std::map<std::string,std::string>& ch=sec["Channel "+std::to_string(oc)];
         ch["Name"]=m.meta.names[c]; ch["Description"]="(description not specified)";
         if(m.meta.emission[c]>0) ch["LSMEmissionWavelength"]=imsmeta::wavelengthString(m.meta.emission[c]);
         if(m.meta.excitation[c]>0) ch["LSMExcitationWavelength"]=imsmeta::wavelengthString(m.meta.excitation[c]);
         ch["ColorMode"]="BaseColor"; ch["Color"]=imsColorString(d);
-        ch["ColorRange"]=fstr(d.rangeMin,3)+" "+fstr(d.rangeMax,3); ch["ColorOpacity"]=fstr(d.opacity,3); ch["GammaCorrection"]=fstr(d.gamma,3);
+        ch["ColorRange"]=range; ch["ColorOpacity"]=fstr(d.opacity,3); ch["GammaCorrection"]=fstr(d.gamma,3);
     }
     sec["TimeInfo"]=timeInfoAttrs(m.meta,srcTps);
     std::map<std::string,std::string>& ids=sec["ImarisDataSet"];

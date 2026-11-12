@@ -13,6 +13,7 @@
 #endif
 
 unsigned mono_dtype_bytes(unsigned t){ return t==MONO_U8?1:(t==MONO_U16?2:((t==MONO_U32||t==MONO_F32)?4:0)); }
+unsigned mono_dtype_shuffle(unsigned t){ return t==MONO_U16?2:t==MONO_U32?4:1; }
 
 MonoVfd::MonoVfd(uint64_t r):rawEnd(r),armState(0),armAddr(0),armSize(0),inUse(false){ st.rawEnd=r; }
 
@@ -211,7 +212,7 @@ hid_t mono_create_dataset(hid_t loc,const char* name,const MonoGeom& g,std::stri
     hsize_t chk[3]={g.chunk[2],g.chunk[1],g.chunk[0]};
     unsigned bs=1u<<30;
     hid_t dcpl=H5Pcreate(H5P_DATASET_CREATE), lcpl=H5Pcreate(H5P_LINK_CREATE), sp=H5Screate_simple(3,dims,NULL), d=-1;
-    if(dcpl>=0&&lcpl>=0&&sp>=0&&H5Pset_chunk(dcpl,3,chk)>=0&&(eb==1||H5Pset_shuffle(dcpl)>=0)
+    if(dcpl>=0&&lcpl>=0&&sp>=0&&H5Pset_chunk(dcpl,3,chk)>=0&&(mono_dtype_shuffle(g.dtype)==1||H5Pset_shuffle(dcpl)>=0)
        &&H5Pset_filter(dcpl,LZ4_FILTER,H5Z_FLAG_MANDATORY,1,&bs)>=0&&H5Pset_create_intermediate_group(lcpl,1)>=0)
         d=H5Dcreate2(loc,name,fileType(g.dtype),sp,lcpl,dcpl,H5P_DEFAULT);
     if(sp>=0){ H5Sclose(sp); }

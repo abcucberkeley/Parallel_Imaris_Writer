@@ -29,7 +29,12 @@ struct Thumbnail { imscore::bpSize sizeX = 0, sizeY = 0; std::vector<uint8_t> rg
 // The thumbnail of one timepoint. levelSizes: every level's X, Y, Z; volumes[c]: channel c's voxels of level
 // thumbnailLevel(levelSizes) (X*Y*Z, x fastest); display[c]: its colour and ColorRange as written in /DataSetInfo;
 // extentMax: the image extent (ExtMax0..2; the minimum is 0).
+// uint8 and float32 volumes as the converter's uint8 and float32 conversions (bpThumbnailBuilder<T>).
 imscore::Status buildThumbnail(const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint16_t> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3], Thumbnail& out);
+imscore::Status buildThumbnail(const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint8_t> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3], Thumbnail& out);
+imscore::Status buildThumbnail(const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<float> >& volumes,
                                const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3], Thumbnail& out);
 
 // Writes /Thumbnail/Data as bpWriterHDF5::WriteThumbnail does (the group, then a contiguous uint8 dataset);
@@ -38,6 +43,10 @@ imscore::Status writeThumbnail(hid_t file, const Thumbnail& thumbnail);
 
 // buildThumbnail + writeThumbnail.
 imscore::Status writeThumbnail(hid_t file, const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint16_t> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3]);
+imscore::Status writeThumbnail(hid_t file, const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint8_t> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3]);
+imscore::Status writeThumbnail(hid_t file, const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<float> >& volumes,
                                const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3]);
 
 }  // namespace imsthumb

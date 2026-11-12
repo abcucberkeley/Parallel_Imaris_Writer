@@ -57,12 +57,34 @@ size_t thumbnailLevel(const std::vector<imscore::Vec3>& levelSizes){
     return levelSizes.empty() ? 0 : (size_t)bpComputeThumbnailIndexR(THUMBNAIL_SIZE, sizesOf(levelSizes));
 }
 
-imscore::Status buildThumbnail(const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint16_t> >& volumes,
-                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3], Thumbnail& out){
+namespace {
+template<class T>
+imscore::Status buildCaught(const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<T> >& volumes,
+                            const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3], Thumbnail& out){
     try{ return build(levelSizes, volumes, display, extentMax, out); }
     catch(const std::exception& e){ return imscore::Status::fail(std::string("thumbnail: ") + e.what()); }
     catch(const char* e){ return imscore::Status::fail(std::string("thumbnail: ") + e); }
     catch(...){ return imscore::Status::fail("thumbnail: unexpected error"); }
+}
+template<class T>
+imscore::Status buildAndWrite(hid_t file, const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<T> >& volumes,
+                              const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3]){
+    Thumbnail t; imscore::Status s = buildCaught(levelSizes, volumes, display, extentMax, t);
+    return s.ok() ? writeThumbnail(file, t) : s;
+}
+}  // namespace
+
+imscore::Status buildThumbnail(const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint16_t> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3], Thumbnail& out){
+    return buildCaught(levelSizes, volumes, display, extentMax, out);
+}
+imscore::Status buildThumbnail(const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint8_t> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3], Thumbnail& out){
+    return buildCaught(levelSizes, volumes, display, extentMax, out);
+}
+imscore::Status buildThumbnail(const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<float> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3], Thumbnail& out){
+    return buildCaught(levelSizes, volumes, display, extentMax, out);
 }
 
 imscore::Status writeThumbnail(hid_t file, const Thumbnail& t){
@@ -83,8 +105,15 @@ imscore::Status writeThumbnail(hid_t file, const Thumbnail& t){
 
 imscore::Status writeThumbnail(hid_t file, const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint16_t> >& volumes,
                                const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3]){
-    Thumbnail t; imscore::Status s = buildThumbnail(levelSizes, volumes, display, extentMax, t);
-    return s.ok() ? writeThumbnail(file, t) : s;
+    return buildAndWrite(file, levelSizes, volumes, display, extentMax);
+}
+imscore::Status writeThumbnail(hid_t file, const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<uint8_t> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3]){
+    return buildAndWrite(file, levelSizes, volumes, display, extentMax);
+}
+imscore::Status writeThumbnail(hid_t file, const std::vector<imscore::Vec3>& levelSizes, const std::vector<std::vector<float> >& volumes,
+                               const std::vector<imscore::ChannelDisplay>& display, const float extentMax[3]){
+    return buildAndWrite(file, levelSizes, volumes, display, extentMax);
 }
 
 }  // namespace imsthumb

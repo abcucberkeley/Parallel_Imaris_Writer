@@ -29,8 +29,9 @@
 //   parallelimariswriter link       <workdir> <out.ims> <partsDir>  -- external links to combineone's parts
 //   parallelimariswriter linkparts  <workdir> <out.ims> <partsDir>  -- external links to per-(t,c) converter outputs
 //   parallelimariswriter layout     <X> <Y> <Z> [elemSize] [timepoints]  -- debug: print the pyramid
-// partsDir is relative to out.ims and holds part_t<t>_c<c>.ims. The tile path (worker, monitor,
-// combineone, link) takes uint16 data only; linkparts takes whatever the converter wrote.
+// partsDir is relative to out.ims and holds part_t<t>_c<c>.ims. The tile path (worker, monitor) takes uint16 data,
+// and uint8 in the single-file store; the packs store (and combineone, link) uint16 only; linkparts takes whatever
+// the converter wrote.
 // One self-contained .ims from per-(t,c) converter outputs, without links or parts: monoinit, monoplace,
 // monofinish, monostatus (src/mono.h); monofinish and monostatus also take a mono-store tile workdir.
 //
@@ -42,7 +43,7 @@
 //                               [--chunk-bytes N]]
 //        checks every input as the converter does and writes <workdir>/manifest.json with the stages; without
 //        --tiles a time series (stage "convert": one task per (timepoint, channel)), with it one enormous volume
-//        per (timepoint, channel) cut into tiles (stages "level0", "level1", ...: Zarr, uint16)
+//        per (timepoint, channel) cut into tiles (stages "level0", "level1", ...: Zarr, uint8 or uint16)
 //   parallelimariswriter task   <workdir> <stage> <index> [--threads N] [--stage-dir DIR] [-C X,Y,Z]
 //        one task (stage by name or number); a task that is already done is skipped
 //   parallelimariswriter status <workdir>                      -- per stage the tasks not done (exit 3 if any)
@@ -70,10 +71,13 @@ namespace piw {
 // Time series ("series"): stage "convert", task i = timepoint i / channels, channel i % channels: converts that one
 // (timepoint, channel) with piw::convert into a staging folder, places it into the single file (monoPlace) and
 // removes the staged part. clusterFinish = monoFinish. The output equals a single-node conversion of all inputs with
-// the same options (data, metadata, /Thumbnail). Linux and macOS, uint16 for now.
+// the same options (data, metadata, /Thumbnail; float32: see monoFinish in src/mono.h). Linux and macOS; uint8,
+// uint16 and float32 (uint32: refused, use linkparts).
 // Tiled ("tiles"): stage "level<r>" (after "level<r-1>"), task i = tiles i*tilesPerTask .. of that level (setup's
 // tile workers, parallel.h); store "mono" writes straight into the single file (Linux and macOS), "packs" one file
-// per tile that clusterFinish merges (every platform). Zarr input, uint16.
+// per tile that clusterFinish merges (every platform). Zarr input; uint8 or uint16 (packs: uint16). float32 tiles are
+// refused: ImarisWriter's float32 histograms depend on the order of the values (a single float32 volume: a series
+// plan of it).
 
 struct ClusterPlanOptions {
     std::string workdir;                     // created if needed; must not hold another plan
