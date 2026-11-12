@@ -174,10 +174,11 @@ target_link_libraries(ImarisWriter_static PUBLIC
 # Converter core (piw_core) and the parallelimariswriter executable
 # ---------------------------------------------------------------------------
 set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
-# Every src/*.cpp except main.cpp is the converter core: converter.cpp (piw::convert, the
-# library API of parallelimariswriter.h), cli.cpp (the command line, piw::runCli) and
-# parallel.cpp (the cluster subcommands; it reads zarr chunks and writes raw HDF5 chunks
-# directly, so it needs the HDF5 + lz4 headers). Compiled once, linked into the executable
+# Every src/*.cpp except main.cpp is the converter core: converter.cpp (piw::convert and
+# piw::writeVolumes, the library API of parallelimariswriter.h), imsread.cpp (piw::imsInfo and
+# piw::readIms), cli.cpp (the command line, piw::runCli) and parallel.cpp (the cluster
+# subcommands; it reads zarr chunks and writes raw HDF5 chunks directly, so it needs the
+# HDF5 + lz4 headers). Compiled once, linked into the executable
 # and into the tests that call the API. After adding a source file, use a fresh build
 # directory (a re-configure breaks cpp-zarr's libuuid step).
 file(GLOB PIW_CORE_SOURCES CONFIGURE_DEPENDS ${SRC_DIR}/*.cpp)
@@ -198,7 +199,9 @@ set(PIW_INCLUDE_DIRS
     ${cppzarr_SOURCE_DIR}/src   # zarr.h, parallelreadzarr.h
     ${hdf5_SOURCE_DIR}/src      # hdf5.h (parallel.cpp writes raw chunks)
     ${hdf5_BINARY_DIR}/src      # H5pubconf.h (generated)
-    ${LZ4_INCLUDE_DIR}          # lz4.h (parallel.cpp compresses chunks)
+    ${LZ4_INCLUDE_DIR}          # lz4.h (parallel.cpp compresses chunks, imsread.cpp decodes them)
+    ${zlib_SOURCE_DIR}          # zlib.h (imsread.cpp: crc32 checksums)
+    ${zlib_BINARY_DIR}          # zconf.h (generated)
 )
 set(PIW_LINK_LIBRARIES
     ImarisWriter_static

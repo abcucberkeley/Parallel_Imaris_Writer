@@ -33,6 +33,9 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <omp.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <climits>
@@ -52,52 +55,27 @@ extern const char* const kNo64BitData;
 const char* const kNo64BitData = "64 bit data is not yet supported by the Imaris Converter";
 
 // HDF5 in this build is not thread-safe, and every Imaris writer has its own HDF5-calling thread:
-// one conversion at a time per process. The single-file cluster steps (src/mono.cpp) take it too.
+// one library call (conversion, write or read) at a time per process (src/imsread.cpp and the single-file
+// cluster steps in src/mono.cpp take it too).
+std::mutex& libraryMutex();
 std::mutex& libraryMutex(){
     static std::mutex vMutex;
     return vMutex;
 }
 }
+using detail::libraryMutex;
 
 namespace {
 
-// Fill one Imaris block-sized buffer from the read-block data. Row-wise
-// memcpy/memset instead of per-voxel index math + a per-voxel type switch --
-// profiling showed the old per-voxel loop was ~1/4 of the whole conversion's CPU.
-// src==NULL (a pure zero-pad read-block) yields all zeros. Indexing reduces to the
-// whole-image indices when there is a single read-block (x0=y0=z0=0, xN=shapeX,
-// yN=shapeY).
-// No OpenMP here: an OpenMP region per block (thousands per volume) kept the idle
-// workers spinning between regions for the whole conversion, on the cores that
-// ImarisWriter's compression threads need. Blocks of 8 MiB or more are copied by
-// threads that live only for this call; smaller ones on the caller's thread.
-template<typename T>
-static void fillBlock(T* buf, const T* src,
-        uint64_t vX, uint64_t vY, uint64_t vZ,
-        uint64_t bx, uint64_t by, uint64_t bz,
-        uint64_t shapeX, uint64_t shapeY, uint64_t shapeZ,
-        uint64_t x0, uint64_t y0, uint64_t z0, uint64_t xN, uint64_t yN){
-    const uint64_t gxBase = vX*bx, gyBase = vY*by, gzBase = vZ*bz;
-    const uint64_t avail  = (gxBase < shapeX) ? (shapeX - gxBase) : 0;
-    const uint64_t xValid = !src ? 0 : (avail < bx ? avail : bx);   // in-image cols of this block
-    const uint64_t nRows  = by*bz;
-    auto fillRows = [&](uint64_t r0, uint64_t r1){                  // rows r = y + z*by
-        for(uint64_t r = r0; r < r1; ++r){
-            const uint64_t z = r / by, y = r % by;
-            T* brow = buf + y*bx + z*bx*by;
-            const uint64_t gy = gyBase + y, gz = gzBase + z;
-            if(xValid == 0 || gy >= shapeY || gz >= shapeZ){
-                memset(brow, 0, bx*sizeof(T));                       // row entirely outside the image
-            } else {
-                const T* srow = src + (gxBase - x0) + (gy - y0)*xN + (gz - z0)*xN*yN;
-                memcpy(brow, srow, xValid*sizeof(T));               // contiguous in-image run
-                if(xValid < bx) memset(brow + xValid, 0, (bx - xValid)*sizeof(T));  // zero-pad tail
-            }
-        }
-    };
+// Runs fn(r0, r1) over the rows [0, nRows) of one block. No OpenMP here: an OpenMP region per
+// block (thousands per volume) kept the idle workers spinning between regions for the whole
+// conversion, on the cores that ImarisWriter's compression threads need. Blocks of 8 MiB or more
+// are copied by threads that live only for this call; smaller ones on the caller's thread.
+template<typename F>
+static void forBlockRows(uint64_t nRows, uint64_t blockBytes, const F& fn){
     const int nThreads = std::min(omp_get_max_threads(), 16);
-    if(nRows*bx*sizeof(T) < (8ull << 20) || nThreads <= 1){
-        fillRows(0, nRows);
+    if(blockBytes < (8ull << 20) || nThreads <= 1){
+        fn(0, nRows);
         return;
     }
     const uint64_t rowsPerChunk = 64;
@@ -106,7 +84,7 @@ static void fillBlock(T* buf, const T* src,
         for(;;){
             const uint64_t r0 = next.fetch_add(rowsPerChunk);
             if(r0 >= nRows) break;
-            fillRows(r0, std::min(r0 + rowsPerChunk, nRows));
+            fn(r0, std::min(r0 + rowsPerChunk, nRows));
         }
     };
     std::vector<std::thread> threads;
@@ -114,6 +92,159 @@ static void fillBlock(T* buf, const T* src,
     for(int i = 0; i < nThreads - 1; ++i) threads.emplace_back(worker);
     worker();
     for(auto& t : threads) t.join();
+}
+
+// Copies one K x K tile, transposed: d[i + j*ds] = s[i*ss + j] for i, j < K. Scalar here; SSE2
+// versions (always there on x86-64) for 2- and 4-byte samples below.
+template<typename T>
+struct TransposeTile {
+    static const int K = 8;
+    static void copy(const T* s, int64_t ss, T* d, uint64_t ds){
+        for(int i = 0; i < K; ++i)
+            for(int j = 0; j < K; ++j) d[i + j*ds] = s[i*ss + j];
+    }
+};
+#if defined(__SSE2__)
+template<>
+struct TransposeTile<uint16_t> {
+    static const int K = 8;
+    static void copy(const uint16_t* s, int64_t ss, uint16_t* d, uint64_t ds){
+        __m128i r[8], a[8], b[8];
+        for(int i = 0; i < 8; ++i) r[i] = _mm_loadu_si128((const __m128i*)(s + i*ss));
+        for(int i = 0; i < 4; ++i){
+            a[2*i] = _mm_unpacklo_epi16(r[2*i], r[2*i + 1]);
+            a[2*i + 1] = _mm_unpackhi_epi16(r[2*i], r[2*i + 1]);
+        }
+        for(int i = 0; i < 2; ++i){
+            b[4*i] = _mm_unpacklo_epi32(a[4*i], a[4*i + 2]);
+            b[4*i + 1] = _mm_unpackhi_epi32(a[4*i], a[4*i + 2]);
+            b[4*i + 2] = _mm_unpacklo_epi32(a[4*i + 1], a[4*i + 3]);
+            b[4*i + 3] = _mm_unpackhi_epi32(a[4*i + 1], a[4*i + 3]);
+        }
+        for(int j = 0; j < 4; ++j){
+            _mm_storeu_si128((__m128i*)(d + (2*j)*ds), _mm_unpacklo_epi64(b[j], b[j + 4]));
+            _mm_storeu_si128((__m128i*)(d + (2*j + 1)*ds), _mm_unpackhi_epi64(b[j], b[j + 4]));
+        }
+    }
+};
+template<typename T>
+struct TransposeTile4 {
+    static const int K = 4;
+    static void copy(const T* s, int64_t ss, T* d, uint64_t ds){
+        const __m128i r0 = _mm_loadu_si128((const __m128i*)(s)), r1 = _mm_loadu_si128((const __m128i*)(s + ss));
+        const __m128i r2 = _mm_loadu_si128((const __m128i*)(s + 2*ss)), r3 = _mm_loadu_si128((const __m128i*)(s + 3*ss));
+        const __m128i t0 = _mm_unpacklo_epi32(r0, r1), t1 = _mm_unpacklo_epi32(r2, r3);
+        const __m128i t2 = _mm_unpackhi_epi32(r0, r1), t3 = _mm_unpackhi_epi32(r2, r3);
+        _mm_storeu_si128((__m128i*)(d), _mm_unpacklo_epi64(t0, t1));
+        _mm_storeu_si128((__m128i*)(d + ds), _mm_unpackhi_epi64(t0, t1));
+        _mm_storeu_si128((__m128i*)(d + 2*ds), _mm_unpacklo_epi64(t2, t3));
+        _mm_storeu_si128((__m128i*)(d + 3*ds), _mm_unpackhi_epi64(t2, t3));
+    }
+};
+template<> struct TransposeTile<uint32_t> : TransposeTile4<uint32_t> {};
+template<> struct TransposeTile<float> : TransposeTile4<float> {};
+#endif
+
+// fillBlock for sources whose X stride is not 1: the in-image part of the block is copied in
+// lines along the source axis with the smallest stride, so the source is read in contiguous runs
+// (for a (z, y, x) C-contiguous array: along its x, which is Imaris Y) and never element by
+// element with a large stride. When that axis is contiguous and the block's X runs across the
+// lines (the (z, y, x) case), K x K tiles are transposed at once, which keeps the writes into the
+// block contiguous too: 1.4 s -> 0.5 s for the 757 M voxels of a 1 GB tile, against 0.37 s for
+// the row memcpy of an X-contiguous source (one thread, 64^3 uint16 blocks).
+template<typename T>
+static void fillBlockStrided(T* buf, const T* origin, const uint64_t aBlock[3], const uint64_t aValid[3],
+                             const int64_t aStride[3]){
+    const uint64_t blockElems = aBlock[0]*aBlock[1]*aBlock[2];
+    if(aValid[0] < aBlock[0] || aValid[1] < aBlock[1] || aValid[2] < aBlock[2]) memset(buf, 0, blockElems*sizeof(T));
+    const uint64_t bufStride[3] = {1, aBlock[0], aBlock[0]*aBlock[1]};
+    int inner = 0;
+    for(int a = 1; a < 3; ++a) if(aStride[a] < aStride[inner]) inner = a;
+    const int middle = inner == 0 ? 1 : 0;              // of the other two, the one with the
+    const int outer = inner == 2 ? 1 : 2;               // smaller block stride runs faster
+    const uint64_t n = aValid[inner], nMiddle = aValid[middle], nOuter = aValid[outer];
+    const int64_t sIn = aStride[inner], sMid = aStride[middle], sOut = aStride[outer];
+    const uint64_t dIn = bufStride[inner], dMid = bufStride[middle], dOut = bufStride[outer];
+    if(sIn == 1 && middle == 0){
+        const uint64_t K = TransposeTile<T>::K;
+        const uint64_t nTiles = (nMiddle + K - 1)/K;
+        forBlockRows(nTiles*nOuter, blockElems*sizeof(T), [&](uint64_t r0, uint64_t r1){   // rows: (tile of X, outer)
+            for(uint64_t r = r0; r < r1; ++r){
+                const uint64_t m0 = (r % nTiles)*K, o = r / nTiles;
+                const uint64_t mEnd = std::min(m0 + K, nMiddle);
+                const T* s = origin + (int64_t)o*sOut;
+                T* d = buf + o*dOut;
+                uint64_t j = 0;
+                if(mEnd - m0 == K){
+                    for(; j + K <= n; j += K) TransposeTile<T>::copy(s + (int64_t)m0*sMid + j, sMid, d + m0 + j*dIn, dIn);
+                }
+                for(uint64_t m = m0; m < mEnd; ++m){             // what is left of the lines
+                    const T* sl = s + (int64_t)m*sMid;
+                    T* dl = d + m;
+                    for(uint64_t i = j; i < n; ++i) dl[i*dIn] = sl[i];
+                }
+            }
+        });
+        return;
+    }
+    forBlockRows(nMiddle*nOuter, blockElems*sizeof(T), [&](uint64_t r0, uint64_t r1){
+        for(uint64_t r = r0; r < r1; ++r){
+            const uint64_t m = r % nMiddle, o = r / nMiddle;
+            const T* s = origin + (int64_t)m*sMid + (int64_t)o*sOut;
+            T* d = buf + m*dMid + o*dOut;
+            if(sIn == 1){
+                for(uint64_t i = 0; i < n; ++i) d[i*dIn] = s[i];
+            } else {
+                for(uint64_t i = 0; i < n; ++i) d[i*dIn] = s[(int64_t)i*sIn];
+            }
+        }
+    });
+}
+
+// Fill one Imaris block-sized buffer from the read-block data: image voxel (gx, gy, gz) is
+// src[(gx-x0)*sx + (gy-y0)*sy + (gz-z0)*sz] (element strides; the readers' buffers have
+// sx = 1, sy = xN, sz = xN*yN). With sx == 1, row-wise memcpy/memset instead of per-voxel index
+// math + a per-voxel type switch -- profiling showed the old per-voxel loop was ~1/4 of the
+// whole conversion's CPU. src==NULL (a pure zero-pad read-block) yields all zeros. Indexing
+// reduces to the whole-image indices when there is a single read-block (x0=y0=z0=0).
+template<typename T>
+static void fillBlock(T* buf, const T* src,
+        uint64_t vX, uint64_t vY, uint64_t vZ,
+        uint64_t bx, uint64_t by, uint64_t bz,
+        uint64_t shapeX, uint64_t shapeY, uint64_t shapeZ,
+        uint64_t x0, uint64_t y0, uint64_t z0, int64_t sx, int64_t sy, int64_t sz){
+    const uint64_t gxBase = vX*bx, gyBase = vY*by, gzBase = vZ*bz;
+    const uint64_t avail  = (gxBase < shapeX) ? (shapeX - gxBase) : 0;
+    const uint64_t xValid = !src ? 0 : (avail < bx ? avail : bx);   // in-image cols of this block
+    if(src && sx != 1){
+        const uint64_t yAvail = (gyBase < shapeY) ? (shapeY - gyBase) : 0;
+        const uint64_t zAvail = (gzBase < shapeZ) ? (shapeZ - gzBase) : 0;
+        const uint64_t vBlock[3] = {bx, by, bz};
+        const uint64_t vValid[3] = {xValid, yAvail < by ? yAvail : by, zAvail < bz ? zAvail : bz};
+        if(!vValid[0] || !vValid[1] || !vValid[2]){
+            memset(buf, 0, bx*by*bz*sizeof(T));
+            return;
+        }
+        const int64_t vStride[3] = {sx, sy, sz};
+        const T* origin = src + (int64_t)(gxBase - x0)*sx + (int64_t)(gyBase - y0)*sy + (int64_t)(gzBase - z0)*sz;
+        fillBlockStrided(buf, origin, vBlock, vValid, vStride);
+        return;
+    }
+    const uint64_t nRows  = by*bz;
+    forBlockRows(nRows, nRows*bx*sizeof(T), [&](uint64_t r0, uint64_t r1){   // rows r = y + z*by
+        for(uint64_t r = r0; r < r1; ++r){
+            const uint64_t z = r / by, y = r % by;
+            T* brow = buf + y*bx + z*bx*by;
+            const uint64_t gy = gyBase + y, gz = gzBase + z;
+            if(xValid == 0 || gy >= shapeY || gz >= shapeZ){
+                memset(brow, 0, bx*sizeof(T));                       // row entirely outside the image
+            } else {
+                const T* srow = src + (gxBase - x0) + (int64_t)(gy - y0)*sy + (int64_t)(gz - z0)*sz;
+                memcpy(brow, srow, xValid*sizeof(T));               // contiguous in-image run
+                if(xValid < bx) memset(brow + xValid, 0, (bx - xValid)*sizeof(T));  // zero-pad tail
+            }
+        }
+    });
 }
 
 // OpenMP's thread count of the calling thread for the duration of a call (numThreads > 0).
@@ -276,20 +407,29 @@ Status validate(const ConvertOptions& aOptions){
     return Status();
 }
 
+size_t dataTypeBytes(DataType aType){
+    return aType == DataType::UInt8 ? 1 : aType == DataType::UInt16 ? 2 : 4;
+}
+
+bool validDataType(DataType aType){
+    return aType == DataType::UInt8 || aType == DataType::UInt16 || aType == DataType::Float32 || aType == DataType::UInt32;
+}
+
 // One output file through the ImarisWriter C interface. open, writeRegion and finish make the
 // file; without a successful finish the destructor stops the writer and removes the partial file.
 class ImsWriter {
 public:
     explicit ImsWriter(const Callbacks& aCallbacks)
-        : mCallbacks(aCallbacks), mConverter(NULL), mBits(0), mBuffer(NULL), mFinished(false), mWriterFailed(false) {}
+        : mCallbacks(aCallbacks), mConverter(NULL), mDataType(DataType::UInt16), mBuffer(NULL), mFinished(false), mWriterFailed(false) {}
     ~ImsWriter();
 
-    Status open(uint64_t aBits, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
+    Status open(DataType aDataType, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
                 const float aVoxelSize[3], const imsmeta::Metadata& aMetadata, const std::string& aOutputFile);
     // Copies the Imaris blocks [aBlockBase, aBlockLimit) of (aC, aT) from one read-block: aSrc holds
-    // the image region that starts at (aX0, aY0, aZ0) and is aXN x aYN wide (NULL: all zero padding).
+    // the image region that starts at (aX0, aY0, aZ0), with element strides aStride along X, Y, Z
+    // (NULL: all zero padding).
     Status writeRegion(uint64_t aC, uint64_t aT, const uint64_t aBlockBase[3], const uint64_t aBlockLimit[3],
-                       const void* aSrc, uint64_t aX0, uint64_t aY0, uint64_t aZ0, uint64_t aXN, uint64_t aYN);
+                       const void* aSrc, uint64_t aX0, uint64_t aY0, uint64_t aZ0, const int64_t aStride[3]);
     Status finish();
 
 private:
@@ -302,7 +442,7 @@ private:
 
     const Callbacks& mCallbacks;
     bpImageConverterCPtr mConverter;
-    uint64_t mBits;
+    DataType mDataType;
     bpConverterTypesC_Size5D mImageSize;
     bpConverterTypesC_Size5D mBlockSize;
     float mVoxelSize[3];
@@ -337,9 +477,9 @@ Status ImsWriter::checkErrors(){
     return Status(Code::WriteFailed, vException);
 }
 
-Status ImsWriter::open(uint64_t aBits, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
+Status ImsWriter::open(DataType aDataType, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
                        const float aVoxelSize[3], const imsmeta::Metadata& aMetadata, const std::string& aOutputFile){
-    mBits = aBits;
+    mDataType = aDataType;
     mImageSize = aImageSize;
     mBlockSize = aBlockSize;
     mVoxelSize[0] = aVoxelSize[0];
@@ -348,8 +488,9 @@ Status ImsWriter::open(uint64_t aBits, const bpConverterTypesC_Size5D& aImageSiz
     mMetadata = aMetadata;
     mOutputFile = aOutputFile;
 
-    bpConverterTypesC_DataType aDataType = aBits == 8 ? bpConverterTypesC_UInt8Type :
-                                           aBits == 16 ? bpConverterTypesC_UInt16Type : bpConverterTypesC_FloatType;
+    bpConverterTypesC_DataType vType = aDataType == DataType::UInt8 ? bpConverterTypesC_UInt8Type :
+                                       aDataType == DataType::UInt16 ? bpConverterTypesC_UInt16Type :
+                                       aDataType == DataType::UInt32 ? bpConverterTypesC_UInt32Type : bpConverterTypesC_FloatType;
     bpConverterTypesC_Size5D aSample = { 1, 1, 1, 1, 1 };
 
     bpConverterTypesC_DimensionSequence5D aDimensionSequence = {
@@ -375,7 +516,7 @@ Status ImsWriter::open(uint64_t aBits, const bpConverterTypesC_Size5D& aImageSiz
     bpConverterTypesC_ProgressCallback aProgressCallback = mCallbacks.progress ? onProgress : NULL;
 
     mConverter = bpImageConverterC_Create(
-                aDataType, &mImageSize, &aSample,
+                vType, &mImageSize, &aSample,
                 &aDimensionSequence, &mBlockSize,
                 mOutputFile.c_str(), &aOptions,
                 aApplicationName, aApplicationVersion,
@@ -388,13 +529,14 @@ Status ImsWriter::open(uint64_t aBits, const bpConverterTypesC_Size5D& aImageSiz
             (unsigned long long)mBlockSize.mValueX *
             mBlockSize.mValueY * mBlockSize.mValueZ *
             mBlockSize.mValueC * mBlockSize.mValueT;
-    mBuffer = malloc(vBlockSize*(mBits/8));
+    mBuffer = malloc(vBlockSize*dataTypeBytes(mDataType));
     if(!mBuffer) return Status(Code::Internal, "Out of memory for one block of " + std::to_string(vBlockSize) + " voxels.");
     return Status();
 }
 
 Status ImsWriter::writeRegion(uint64_t aC, uint64_t aT, const uint64_t aBlockBase[3], const uint64_t aBlockLimit[3],
-                              const void* aSrc, uint64_t aX0, uint64_t aY0, uint64_t aZ0, uint64_t aXN, uint64_t aYN){
+                              const void* aSrc, uint64_t aX0, uint64_t aY0, uint64_t aZ0, const int64_t aStride[3]){
+    const int64_t sx = aStride[0], sy = aStride[1], sz = aStride[2];
     const uint64_t bx = mBlockSize.mValueX, by = mBlockSize.mValueY, bz = mBlockSize.mValueZ;
     const uint64_t shapeX = mImageSize.mValueX, shapeY = mImageSize.mValueY, shapeZ = mImageSize.mValueZ;
     bpConverterTypesC_Index5D aBlockIndex = { 0, 0, 0, (unsigned int)aC, (unsigned int)aT };
@@ -404,20 +546,25 @@ Status ImsWriter::writeRegion(uint64_t aC, uint64_t aT, const uint64_t aBlockBas
             aBlockIndex.mValueY = (unsigned int)vY;
             for (uint64_t vX = aBlockBase[0]; vX < aBlockLimit[0]; ++vX) {
                 aBlockIndex.mValueX = (unsigned int)vX;
-                switch(mBits){
-                    case 8:
+                switch(mDataType){
+                    case DataType::UInt8:
                         fillBlock<uint8_t> ((uint8_t*)mBuffer, (const uint8_t*)aSrc, vX,vY,vZ, bx,by,bz,
-                                            shapeX,shapeY,shapeZ, aX0,aY0,aZ0, aXN,aYN);
+                                            shapeX,shapeY,shapeZ, aX0,aY0,aZ0, sx,sy,sz);
                         bpImageConverterC_CopyBlockUInt8(mConverter, (uint8_t*)mBuffer, &aBlockIndex);
                         break;
-                    case 16:
+                    case DataType::UInt16:
                         fillBlock<uint16_t>((uint16_t*)mBuffer, (const uint16_t*)aSrc, vX,vY,vZ, bx,by,bz,
-                                            shapeX,shapeY,shapeZ, aX0,aY0,aZ0, aXN,aYN);
+                                            shapeX,shapeY,shapeZ, aX0,aY0,aZ0, sx,sy,sz);
                         bpImageConverterC_CopyBlockUInt16(mConverter, (uint16_t*)mBuffer, &aBlockIndex);
                         break;
-                    case 32:
+                    case DataType::UInt32:
+                        fillBlock<uint32_t>((uint32_t*)mBuffer, (const uint32_t*)aSrc, vX,vY,vZ, bx,by,bz,
+                                            shapeX,shapeY,shapeZ, aX0,aY0,aZ0, sx,sy,sz);
+                        bpImageConverterC_CopyBlockUInt32(mConverter, (uint32_t*)mBuffer, &aBlockIndex);
+                        break;
+                    case DataType::Float32:
                         fillBlock<float>   ((float*)mBuffer,    (const float*)aSrc,    vX,vY,vZ, bx,by,bz,
-                                            shapeX,shapeY,shapeZ, aX0,aY0,aZ0, aXN,aYN);
+                                            shapeX,shapeY,shapeZ, aX0,aY0,aZ0, sx,sy,sz);
                         bpImageConverterC_CopyBlockFloat(mConverter, (float*)mBuffer, &aBlockIndex);
                         break;
                 }
@@ -525,11 +672,14 @@ uint64_t numBlocks(uint64_t aSize, uint64_t aBlockSize){
     return (aSize + aBlockSize - 1) / aBlockSize;
 }
 
-// The conversion itself (options validated, library mutex held).
+// The conversion itself (options validated, library mutex held). The options and the printed
+// lines are along the input's axes 0, 1, 2; the writer gets Imaris X, Y, Z, and vAxis[i] is the
+// input axis that becomes Imaris axis i.
 Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallbacks){
     const bool vTiff = aOptions.reader == "tiff";
     const uint64_t channels = aOptions.files.size();
     const uint64_t timepoints = aOptions.files[0].size();
+    const int vAxis[3] = {aOptions.xOnImarisX ? 1 : 0, aOptions.xOnImarisX ? 0 : 1, 2};
 
     // The metadata first: a bad metadata option fails before any input is read.
     imsmeta::Metadata vMetadata;
@@ -557,8 +707,12 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     if(bits != 8 && bits != 16 && bits != 32){
         return Status(Code::Unsupported, std::to_string(bits) + "-bit data is not supported.");
     }
+    // The type comes from the bit depth alone: 32-bit input is written as float.
+    const DataType vType = bits == 8 ? DataType::UInt8 : bits == 16 ? DataType::UInt16 : DataType::Float32;
+    const size_t vBytes = dataTypeBytes(vType);
 
     // Bounding Box
+    const uint64_t vFull[3] = {vShape[0], vShape[1], vShape[2]};   // the whole input
     uint64_t boundingBox[6] = {0, 0, 0, vShape[0], vShape[1], vShape[2]};
     if(aOptions.hasBoundingBox){
         for(int i = 0; i < 6; i++) boundingBox[i] = aOptions.boundingBox[i];
@@ -571,7 +725,7 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
         say(aCallbacks, "New Shape: %llu %llu %llu\n",
             (unsigned long long)vShape[0], (unsigned long long)vShape[1], (unsigned long long)vShape[2]);
     }
-    const uint64_t shapeX = vShape[0], shapeY = vShape[1], shapeZ = vShape[2];
+    const uint64_t shapeX = vShape[vAxis[0]], shapeY = vShape[vAxis[1]], shapeZ = vShape[vAxis[2]];
     if(shapeX > UINT_MAX || shapeY > UINT_MAX || shapeZ > UINT_MAX || channels > UINT_MAX || timepoints > UINT_MAX ||
        vChunks[0] > UINT_MAX || vChunks[1] > UINT_MAX || vChunks[2] > UINT_MAX){
         return Status(Code::Unsupported, "The image or block size does not fit the Imaris writer (at most " +
@@ -590,13 +744,14 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     };
 
     say(aCallbacks, "Voxel Sizes: %f,%f,%f\n", aOptions.voxelSize[0], aOptions.voxelSize[1], aOptions.voxelSize[2]);
+    const float vVoxelSize[3] = {aOptions.voxelSize[vAxis[0]], aOptions.voxelSize[vAxis[1]], aOptions.voxelSize[vAxis[2]]};
 
     bpConverterTypesC_Size5D aBlockSize = {
-        (unsigned int)vChunks[0], (unsigned int)vChunks[1], (unsigned int)vChunks[2], 1, 1
+        (unsigned int)vChunks[vAxis[0]], (unsigned int)vChunks[vAxis[1]], (unsigned int)vChunks[vAxis[2]], 1, 1
     };
 
     ImsWriter vWriter(aCallbacks);
-    vStatus = vWriter.open(bits, aImageSize, aBlockSize, aOptions.voxelSize, vMetadata, aOptions.outputFile);
+    vStatus = vWriter.open(vType, aImageSize, aBlockSize, vVoxelSize, vMetadata, aOptions.outputFile);
     if(!vStatus.ok()) return vStatus;
 
     const uint64_t vNBlocksX = numBlocks(aImageSize.mValueX, aBlockSize.mValueX);
@@ -611,9 +766,9 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     // only Z is blocked (full X/Y slabs); zarr blocks in all three.
     uint64_t cbX = vNBlocksX, cbY = vNBlocksY, cbZ = vNBlocksZ;
     if(aOptions.hasProcessBlock){
-        const uint64_t userX = aOptions.processBlock[0];
-        const uint64_t userY = aOptions.processBlock[1];
-        const uint64_t userZ = aOptions.processBlock[2];
+        const uint64_t userX = aOptions.processBlock[vAxis[0]];
+        const uint64_t userY = aOptions.processBlock[vAxis[1]];
+        const uint64_t userZ = aOptions.processBlock[vAxis[2]];
         cbZ = userZ < aBlockSize.mValueZ ? 1 : (userZ + aBlockSize.mValueZ - 1) / aBlockSize.mValueZ;
         if(!vTiff){   // non-tiff (zarr): also block X and Y
             cbX = userX < aBlockSize.mValueX ? 1 : (userX + aBlockSize.mValueX - 1) / aBlockSize.mValueX;
@@ -652,30 +807,46 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
             // Read this read-block. NULL when it is entirely in the zero-pad region
             // (nothing to read) -- the fill loop zero-fills those blocks.
             void* vData = NULL;
+            const void* vSrc = NULL;
+            int64_t vStride[3] = {1, 1, 1};
             if(xN && yN && zN){
+                // The region along the input's axes (inside the bounding box).
+                const uint64_t vStart[3] = {x0, y0, z0}, vEnd[3] = {xEnd, yEnd, zEnd};
+                uint64_t inStart[3], inEnd[3];
+                for(int i = 0; i < 3; ++i){
+                    inStart[vAxis[i]] = boundingBox[vAxis[i]] + vStart[i];
+                    inEnd[vAxis[i]] = boundingBox[vAxis[i]] + vEnd[i];
+                }
                 std::string vWhy;
                 try{
                     if(vTiff){
-                        // full X/Y, a Z-slab; a whole-Z read uses the original call so the
-                        // default (no -C) path stays byte-identical (and ImageJ-safe).
-                        if(zN == shapeZ) vData = readTiffParallelWrapper(fileName);
-                        else vData = readTiffParallelWrapper(fileName, {z0, z0+zN});
+                        // whole pages, the region's Z-slab; a read of every page uses the original
+                        // call so the default (no -C) path stays byte-identical (and ImageJ-safe).
+                        if(inStart[2] == 0 && inEnd[2] == vFull[2]) vData = readTiffParallelWrapper(fileName);
+                        else vData = readTiffParallelWrapper(fileName, {inStart[2], inEnd[2]});
                     }
                     else vData = readZarrParallelHelper(fileName,
-                                     boundingBox[0]+x0, boundingBox[1]+y0, boundingBox[2]+z0,
-                                     boundingBox[0]+xEnd, boundingBox[1]+yEnd, boundingBox[2]+zEnd, 0);
+                                     inStart[0], inStart[1], inStart[2], inEnd[0], inEnd[1], inEnd[2], 0);
                 }
                 catch(const std::string& vError){ vWhy = vError; }
                 catch(const std::exception& vError){ vWhy = vError.what(); }
                 catch(...){ vWhy = "unknown error"; }
                 // The readers return NULL on failure; don't let it zero-fill like padding.
                 if(!vData) return Status(Code::ReadFailed, "could not read " + vFile + (vWhy.empty() ? "" : ": " + vWhy));
+                // The buffer runs along the input's axes, axis 0 fastest. A TIFF read holds whole
+                // pages, so the region starts at the box's row and column inside them.
+                const uint64_t vRows = vTiff ? vFull[0] : inEnd[0] - inStart[0];
+                const uint64_t vCols = vTiff ? vFull[1] : inEnd[1] - inStart[1];
+                const int64_t vInStride[3] = {1, (int64_t)vRows, (int64_t)(vRows*vCols)};
+                for(int i = 0; i < 3; ++i) vStride[i] = vInStride[vAxis[i]];
+                const uint64_t vOffset = vTiff ? inStart[0] + inStart[1]*vRows : 0;
+                vSrc = (const char*)vData + vOffset*vBytes;
             }
             ReadBuffer vHold(vData);
 
             const uint64_t vBase[3] = {vXbase, vYbase, vZbase};
             const uint64_t vLimit[3] = {vXlimit, vYlimit, vZlimit};
-            vStatus = vWriter.writeRegion(vC, vT, vBase, vLimit, vData, x0, y0, z0, xN, yN);
+            vStatus = vWriter.writeRegion(vC, vT, vBase, vLimit, vSrc, x0, y0, z0, vStride);
             if(!vStatus.ok()) return vStatus;
             }
             }
@@ -728,6 +899,87 @@ bool lessPath(const std::string& aA, const std::string& aB){
     #endif
 }
 
+Status validateWrite(const WriteOptions& aOptions, const std::vector<Volume>& aVolumes){
+    if(aOptions.outputFile.empty()) return Status(Code::InvalidArgument, "No output file was given.");
+    if(!validDataType(aOptions.dataType)) return Status(Code::InvalidArgument, "Unknown data type " +
+                                                        std::to_string((int)aOptions.dataType) + ".");
+    for(int i = 0; i < 3; ++i){
+        if(!aOptions.size[i] || aOptions.size[i] > UINT_MAX){
+            return Status(Code::InvalidArgument, "The volume size " + sizeText(aOptions.size) + " must be 1 to " +
+                          std::to_string(UINT_MAX) + " along every axis.");
+        }
+        if(aOptions.hasBlockSize && (!aOptions.blockSize[i] || aOptions.blockSize[i] > UINT_MAX)){
+            return Status(Code::InvalidArgument, "Block sizes must be 1 to " + std::to_string(UINT_MAX) + ".");
+        }
+    }
+    if(!aOptions.channels || !aOptions.timepoints){
+        return Status(Code::InvalidArgument, "At least one channel and one time point are needed.");
+    }
+    const uint64_t vCount = (uint64_t)aOptions.channels*aOptions.timepoints;
+    if(aVolumes.size() != vCount){
+        return Status(Code::InvalidArgument, std::to_string(aVolumes.size()) + " volumes were given for " +
+                      std::to_string(aOptions.channels) + " channels x " + std::to_string(aOptions.timepoints) +
+                      " time points; one per channel and time point is needed.");
+    }
+    if(aOptions.numThreads < 0) return Status(Code::InvalidArgument, "The number of threads cannot be negative.");
+    for(size_t vI = 0; vI < aVolumes.size(); ++vI){
+        const Volume& vVolume = aVolumes[vI];
+        if(!vVolume.data) return Status(Code::InvalidArgument, "Volume " + std::to_string(vI) + " has no data.");
+        // Positive strides, and the farthest element's offset must fit in 63 bits.
+        uint64_t vLast = 0;
+        for(int i = 0; i < 3; ++i){
+            if(vVolume.stride[i] <= 0){
+                return Status(Code::InvalidArgument, "Volume " + std::to_string(vI) + " has stride " +
+                              std::to_string((long long)vVolume.stride[i]) + " along axis " + std::to_string(i) +
+                              "; strides must be positive.");
+            }
+            const uint64_t vSpan = aOptions.size[i] - 1, vStep = (uint64_t)vVolume.stride[i];
+            if(vSpan && vStep > ((uint64_t)INT64_MAX - vLast)/vSpan){
+                return Status(Code::InvalidArgument, "Volume " + std::to_string(vI) + ": its strides overflow.");
+            }
+            vLast += vSpan*vStep;
+        }
+    }
+    return Status();
+}
+
+// The write itself (options validated, library mutex held).
+Status writeValidated(const WriteOptions& aOptions, const std::vector<Volume>& aVolumes, const Callbacks& aCallbacks){
+    // The metadata first: a bad metadata option fails before the output is created.
+    imsmeta::Metadata vMetadata;
+    const std::string vMetadataError = imsmeta::resolveMetadataFields(aOptions, aOptions.channels, aOptions.timepoints, NULL, vMetadata);
+    if(!vMetadataError.empty()) return Status(Code::InvalidArgument, vMetadataError);
+    const uint64_t vBlock[3] = {aOptions.hasBlockSize ? aOptions.blockSize[0] : 64,
+                                aOptions.hasBlockSize ? aOptions.blockSize[1] : 64,
+                                aOptions.hasBlockSize ? aOptions.blockSize[2] : 64};
+    say(aCallbacks, "Block Sizes: %llu,%llu,%llu\n",
+        (unsigned long long)vBlock[0], (unsigned long long)vBlock[1], (unsigned long long)vBlock[2]);
+    say(aCallbacks, "Voxel Sizes: %f,%f,%f\n", aOptions.voxelSize[0], aOptions.voxelSize[1], aOptions.voxelSize[2]);
+    const bpConverterTypesC_Size5D aImageSize = {
+        (unsigned int)aOptions.size[0], (unsigned int)aOptions.size[1], (unsigned int)aOptions.size[2],
+        aOptions.channels, aOptions.timepoints
+    };
+    const bpConverterTypesC_Size5D aBlockSize = {(unsigned int)vBlock[0], (unsigned int)vBlock[1], (unsigned int)vBlock[2], 1, 1};
+
+    ImsWriter vWriter(aCallbacks);
+    Status vStatus = vWriter.open(aOptions.dataType, aImageSize, aBlockSize, aOptions.voxelSize, vMetadata, aOptions.outputFile);
+    if(!vStatus.ok()) return vStatus;
+    const uint64_t vBase[3] = {0, 0, 0};
+    const uint64_t vLimit[3] = {numBlocks(aOptions.size[0], vBlock[0]), numBlocks(aOptions.size[1], vBlock[1]),
+                                numBlocks(aOptions.size[2], vBlock[2])};
+    // Channels outside, time points inside, as the converter walks its files.
+    for(unsigned vC = 0; vC < aOptions.channels; ++vC){
+        for(unsigned vT = 0; vT < aOptions.timepoints; ++vT){
+            say(aCallbacks, "Current Volume: channel %u, time point %u\n", vC, vT);
+            if(cancelled(aCallbacks)) return cancelledStatus();
+            const Volume& vVolume = aVolumes[(size_t)vC*aOptions.timepoints + vT];
+            vStatus = vWriter.writeRegion(vC, vT, vBase, vLimit, vVolume.data, 0, 0, 0, vVolume.stride);
+            if(!vStatus.ok()) return vStatus;
+        }
+    }
+    return vWriter.finish();
+}
+
 }  // namespace
 
 Status findInputFiles(const std::vector<std::string>& folders, const std::vector<std::string>& patterns,
@@ -757,6 +1009,18 @@ Status convert(const ConvertOptions& options, const Callbacks& callbacks) noexce
         std::lock_guard<std::mutex> vLock(detail::libraryMutex());
         ThreadCount vThreads(options.numThreads);
         return convertValidated(options, callbacks);
+    }
+    catch(const std::exception& vError){ return internalError(vError.what()); }
+    catch(...){ return internalError("unknown exception"); }
+}
+
+Status writeVolumes(const WriteOptions& options, const std::vector<Volume>& volumes, const Callbacks& callbacks) noexcept{
+    try{
+        Status vStatus = validateWrite(options, volumes);
+        if(!vStatus.ok()) return vStatus;
+        std::lock_guard<std::mutex> vLock(libraryMutex());
+        ThreadCount vThreads(options.numThreads);
+        return writeValidated(options, volumes, callbacks);
     }
     catch(const std::exception& vError){ return internalError(vError.what()); }
     catch(...){ return internalError("unknown exception"); }

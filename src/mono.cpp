@@ -48,14 +48,12 @@ int threadsOf(int n){ return n>0?n:std::max(1,piw::defaultThreads()); }
 
 // ---------------- manifest (timepoints, channels, voxel size, optional output, metadata) ----------------
 struct MonoManifest { int nT=0, nC=0; float vox[3]={0,0,0}; std::string output; imsmeta::Metadata meta; };
-// The metadata of nC channels x nT timepoints for these options (imsmeta::resolveMetadata). Without input files
-// it resolves placeholders: names, colors and wavelengths as given or the defaults, time stamps 1 s apart (or
-// timeInterval) from startTime, else from the current time.
-std::string resolveMonoMetadata(piw::ConvertOptions o,int nT,int nC,imsmeta::Metadata& md){
-    if(o.files.empty()) o.files.assign((size_t)nC,std::vector<std::string>((size_t)nT));
-    bool fits=o.files.size()==(size_t)nC; for(size_t c=0;fits&&c<o.files.size();c++) fits=o.files[c].size()==(size_t)nT;
+// The metadata of o's fields for nC channels x nT timepoints (imsmeta::resolveMetadataFields; without input files
+// the start time is startTime, else the current time)
+std::string resolveMonoMetadata(const piw::MonoInitOptions& o,int nT,int nC,imsmeta::Metadata& md){
+    bool fits=o.files.empty()||o.files.size()==(size_t)nC; for(size_t c=0;fits&&c<o.files.size();c++) fits=o.files[c].size()==(size_t)nT;
     if(!fits) return "the input files are not "+std::to_string(nC)+" channels x "+std::to_string(nT)+" timepoints";
-    return imsmeta::resolveMetadata(o,md);
+    return imsmeta::resolveMetadataFields(o,(size_t)nC,(size_t)nT,o.files.empty()?NULL:&o.files,md);
 }
 Status readMonoManifest(const std::string& wd,MonoManifest& m){
     std::string p=wd+"/manifest.json"; std::vector<uint8_t> b;
@@ -72,7 +70,7 @@ Status readMonoManifest(const std::string& wd,MonoManifest& m){
     }catch(const std::exception& e){ return Status(Code::InvalidArgument,"invalid "+p+": "+e.what()); }
     if(m.nT<1||m.nC<1) return Status(Code::InvalidArgument,p+" needs timepoints >= 1 and channels >= 1");
     for(int a=0;a<3;a++) if(!(m.vox[a]>0)||!std::isfinite(m.vox[a])) return Status(Code::InvalidArgument,p+" has a voxel size that is not > 0");
-    if(!hasMeta){ std::string e=resolveMonoMetadata(piw::ConvertOptions(),m.nT,m.nC,m.meta); if(!e.empty()) return Status(Code::InvalidArgument,p+": "+e); }
+    if(!hasMeta){ std::string e=resolveMonoMetadata(piw::MonoInitOptions(),m.nT,m.nC,m.meta); if(!e.empty()) return Status(Code::InvalidArgument,p+": "+e); }
     return Status();
 }
 // Whether two resolved metadata are the same; clockStart: b's start time came from the clock (only the spacing
@@ -409,10 +407,8 @@ Status monoInit(const MonoInitOptions& o) noexcept{
         if(o.timepoints<1||o.channels<1) return Status(Code::InvalidArgument,"monoinit needs timepoints >= 1 and channels >= 1");
         for(int a=0;a<3;a++) if(!(o.voxelSize[a]>0)||!std::isfinite(o.voxelSize[a])) return Status(Code::InvalidArgument,"monoinit needs voxel sizes > 0");
         // the metadata, resolved once here, as the converter resolves it (a bad option fails before anything is written)
-        piw::ConvertOptions mo; mo.files=o.files; mo.channelNames=o.channelNames; mo.channelColors=o.channelColors;
-        mo.emissionWavelengths=o.emissionWavelengths; mo.excitationWavelengths=o.excitationWavelengths; mo.timeInterval=o.timeInterval; mo.startTime=o.startTime;
         imsmeta::Metadata md;
-        { std::string me=resolveMonoMetadata(mo,o.timepoints,o.channels,md); if(!me.empty()) return Status(Code::InvalidArgument,me); }
+        { std::string me=resolveMonoMetadata(o,o.timepoints,o.channels,md); if(!me.empty()) return Status(Code::InvalidArgument,me); }
         const bool metaGiven=!o.files.empty()||!o.channelNames.empty()||!o.channelColors.empty()||!o.emissionWavelengths.empty()||
                              !o.excitationWavelengths.empty()||o.timeInterval!=0||!o.startTime.empty();
         const std::string wd=trimSlash(o.workdir), p=wd+"/manifest.json";

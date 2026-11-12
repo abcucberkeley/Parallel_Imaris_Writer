@@ -176,11 +176,15 @@ inline piw::Color defaultColor(size_t aChannel){
 inline std::string defaultName(size_t aChannel){ return "Channel " + std::to_string(aChannel); }
 
 // ===================== options =====================
-// Resolves the metadata of a conversion of options.files (which must not be empty): checks the
-// metadata fields, applies the defaults and computes the time stamps. Returns "" or what is wrong.
-inline std::string resolveMetadata(const piw::ConvertOptions& o, Metadata& m){
+// Resolves the metadata of nC channels x nT time points from the metadata fields of o (those of
+// piw::ConvertOptions; piw::WriteOptions and piw::MonoInitOptions have the same ones): checks
+// them, applies the defaults and computes the time stamps. aFiles = the inputs, [channel][time
+// point], or NULL when there are none: then the start time defaults to the current time and the
+// time points are 1 s (or timeInterval) apart. Returns "" or what is wrong.
+template<class Options>
+inline std::string resolveMetadataFields(const Options& o, size_t nC, size_t nT,
+                                         const std::vector<std::vector<std::string> >* aFiles, Metadata& m){
     m = Metadata();
-    const size_t nC = o.files.size(), nT = nC ? o.files[0].size() : 0;
     if(!nC || !nT) return "No input files were given.";
     auto count = [&](size_t n, const char* what) -> std::string {
         if(n == 0 || n == nC) return std::string();
@@ -215,8 +219,8 @@ inline std::string resolveMetadata(const piw::ConvertOptions& o, Metadata& m){
         if(!parseTime(o.startTime, vStart))
             return "Could not read the start time \"" + o.startTime + "\": expected YYYY-MM-DD HH:MM:SS[.mmm].";
     }
-    else if(!modificationTime(o.files[0][0], vStart) && !localTime(time(NULL), vStart)){
-        vStart = (int64_t)time(NULL) * 1000;          // the current time: an input that does not exist (monoinit's)
+    else if(!(aFiles && modificationTime((*aFiles)[0][0], vStart)) && !localTime(time(NULL), vStart)){
+        vStart = (int64_t)time(NULL) * 1000;          // the current time: no input, or one that does not exist
     }
     std::vector<int64_t> vOffsets(nT, 0);
     bool vStamped = false;
@@ -224,10 +228,10 @@ inline std::string resolveMetadata(const piw::ConvertOptions& o, Metadata& m){
         for(size_t t = 0; t < nT; ++t) vOffsets[t] = (int64_t)std::llround((double)t * o.timeInterval * 1000.0);
     }
     else{
-        for(size_t c = 0; c < nC && !vStamped; ++c){
+        for(size_t c = 0; aFiles && c < nC && !vStamped; ++c){
             std::vector<int64_t> vStamps(nT);
             bool vAll = true;
-            for(size_t t = 0; t < nT && vAll; ++t) vAll = msecAbsStamp(o.files[c][t], vStamps[t]);
+            for(size_t t = 0; t < nT && vAll; ++t) vAll = msecAbsStamp((*aFiles)[c][t], vStamps[t]);
             if(!vAll) continue;
             for(size_t t = 0; t < nT; ++t) vOffsets[t] = vStamps[t] - vStamps[0];
             vStamped = true;
@@ -242,6 +246,11 @@ inline std::string resolveMetadata(const piw::ConvertOptions& o, Metadata& m){
         m.times.push_back(vTime);
     }
     return std::string();
+}
+// Resolves the metadata of a conversion of options.files (which must not be empty).
+inline std::string resolveMetadata(const piw::ConvertOptions& o, Metadata& m){
+    const size_t nC = o.files.size(), nT = nC ? o.files[0].size() : 0;
+    return resolveMetadataFields(o, nC, nT, &o.files, m);
 }
 
 // The metadata options of the command line and of `setup`, as --<name> <value> or --<name>=<value>.
