@@ -4,13 +4,15 @@
 // Shared .ims building blocks of the cluster path (header-only): the ported ImarisWriter block layout,
 // the chunk codec (2-byte shuffle + LZ4 with ImarisWriter's 16-byte header), the pyramid box-average,
 // the workdir manifest, the per-tile .pack/.hist files, and the HDF5 writers for the Imaris 5.5 metadata
-// and histograms. Everything here returns its result (Status or bool; HDF5 prints its own error stack),
-// never exits, never changes the working directory, and takes its options as arguments (the environment
-// variables are only defaults, e.g. chunkBudgetBytes() for PIW_CHUNK_BYTES).
+// (the values from imsmeta.h, shared with the single-node converter) and histograms. Everything here returns
+// its result (Status or bool; HDF5 prints its own error stack), never exits, never changes the working
+// directory, and takes its options as arguments (the environment variables are only defaults, e.g.
+// chunkBudgetBytes() for PIW_CHUNK_BYTES).
 #include "hdf5.h"
 #include <lz4.h>
 #include <nlohmann/json.hpp>
 #include "bpDeriche.h"
+#include "imsmeta.h"
 #include <vector>
 #include <array>
 #include <cmath>
@@ -201,7 +203,8 @@ inline bool readFileBytes(const std::string& p,std::vector<uint8_t>& b){
 
 // ===================== manifest (JSON) =====================
 struct Lev { Vec3 size, block, nch, tb, nt; };   // tb = tile size in blocks; nt = tile grid
-struct Manifest { std::vector<std::string> zarrs; int nC=1,nT=1; bpSize X,Y,Z,elem; float vox[3]; bpSize cap[3]={0,0,0}; std::vector<Lev> lev; };
+// meta = the metadata setup resolved (imsmeta::resolveMetadata of the zarrs and setup's options)
+struct Manifest { std::vector<std::string> zarrs; int nC=1,nT=1; bpSize X,Y,Z,elem; float vox[3]; bpSize cap[3]={0,0,0}; std::vector<Lev> lev; imsmeta::Metadata meta; };
 inline const std::string& zarrAt(const Manifest& m,int c,int t){ return m.zarrs[(size_t)c*m.nT+t]; }
 inline bpSize levStride(const Manifest& m,int r,int a){ bpSize s=m.lev[r-1].size[a]/m.lev[r].size[a]; return s?s:1; }
 inline long jobsAtLevel(const Manifest& m,int r){ const Lev& L=m.lev[r]; return (long)m.nC*m.nT*L.nt[0]*L.nt[1]*L.nt[2]; }
@@ -212,6 +215,7 @@ inline void tileBlockRange(const Lev& L,long tile,bpSize cb0[3],bpSize cb1[3]){
     for(int a=0;a<3;a++){ cb0[a]=t[a]*L.tb[a]; cb1[a]=std::min(cb0[a]+L.tb[a],L.nch[a]); }
 }
 inline double voxClean(float f){ char b[32]; snprintf(b,sizeof b,"%.7g",(double)f); return atof(b); }
+inline double floatExact(float f){ char b[32]; snprintf(b,sizeof b,"%.9g",(double)f); return atof(b); }   // reads back to f
 // The pyramid of an X*Y*Z volume of elem-byte voxels: per level its size, block (chunk) size, chunk grid, and
 // the grid of cap-voxel tiles (one worker each). chunkBytes = the chunk budget, chunkBudgetBytes() by default.
 inline std::vector<Lev> makeLevels(bpSize X,bpSize Y,bpSize Z,bpSize elem,const bpSize cap[3],bpSize chunkBytes){
@@ -221,6 +225,31 @@ inline std::vector<Lev> makeLevels(bpSize X,bpSize Y,bpSize Z,bpSize elem,const 
         for(int a=0;a<3;a++){ L.nch[a]=(ls[r][a]+bs[r][a]-1)/bs[r][a]; L.tb[a]=std::max((bpSize)1,(cap[a]+bs[r][a]-1)/bs[r][a]); L.nt[a]=(L.nch[a]+L.tb[a]-1)/L.tb[a]; }
         lev.push_back(L); }
     return lev;
+}
+// The manifest's "metadata" object: what the finishers write (names, colors, wavelengths in nm with 0 = none,
+// time stamps); setup and monoinit resolve it once, so every step and every rerun writes the same.
+inline nlohmann::ordered_json metadataJson(const imsmeta::Metadata& md){
+    using nlohmann::ordered_json;
+    ordered_json j, names=ordered_json::array(), colors=ordered_json::array(), em=ordered_json::array(), ex=ordered_json::array(), times=ordered_json::array();
+    for(size_t c=0;c<md.names.size();c++){ const piw::Color& k=md.colors[c];
+        names.push_back(md.names[c]); colors.push_back({floatExact(k.red),floatExact(k.green),floatExact(k.blue)});
+        em.push_back(floatExact(md.emission[c])); ex.push_back(floatExact(md.excitation[c])); }
+    for(int64_t t:md.times) times.push_back(imsmeta::timeString(t));
+    j["channelNames"]=names; j["channelColors"]=colors; j["emissionWavelengths"]=em; j["excitationWavelengths"]=ex; j["timePoints"]=times;
+    return j;
+}
+// metadataJson's object back, for nC channels and nT timepoints (throws nlohmann's exceptions on a malformed one)
+inline Status readMetadataJson(const nlohmann::json& md,int nC,int nT,imsmeta::Metadata& mm){
+    mm=imsmeta::Metadata();
+    for(auto& n:md.at("channelNames")) mm.names.push_back(n.get<std::string>());
+    for(auto& k:md.at("channelColors")){ piw::Color v={k.at(0).get<float>(),k.at(1).get<float>(),k.at(2).get<float>()}; mm.colors.push_back(v); }
+    for(auto& w:md.at("emissionWavelengths")) mm.emission.push_back(w.get<float>());
+    for(auto& w:md.at("excitationWavelengths")) mm.excitation.push_back(w.get<float>());
+    for(auto& t:md.at("timePoints")){ int64_t v; if(!imsmeta::parseTime(t.get<std::string>(),v)) return Status::fail("bad time point '"+t.get<std::string>()+"'"); mm.times.push_back(v); }
+    const size_t c=(size_t)nC;
+    if(mm.names.size()!=c||mm.colors.size()!=c||mm.emission.size()!=c||mm.excitation.size()!=c||mm.times.size()!=(size_t)nT)
+        return Status::fail("the metadata lists do not match "+std::to_string(nC)+" channels and "+std::to_string(nT)+" timepoints");
+    return Status();
 }
 inline Status writeManifest(const std::string& wd,const Manifest& m){
     using nlohmann::ordered_json; ordered_json j;
@@ -241,6 +270,7 @@ inline Status writeManifest(const std::string& wd,const Manifest& m){
     j["level"]=lv;
     ordered_json zs=ordered_json::array(); for(int c=0;c<m.nC;c++){ ordered_json ch=ordered_json::array(); for(int t=0;t<m.nT;t++) ch.push_back(zarrAt(m,c,t)); zs.push_back(ch); }
     j["zarrs"]=zs;
+    j["metadata"]=metadataJson(m.meta);
     std::string s=j.dump(2)+"\n";
     return writeFileAtomic(wd+"/manifest.json",s.data(),s.size());
 }
@@ -262,6 +292,12 @@ inline Status readManifest(const std::string& wd,Manifest& m){
         auto&z=j["zarrs"]; if((int)z.size()!=m.nC) return Status::fail(p+": zarrs lists "+std::to_string(z.size())+" channels, expected "+std::to_string(m.nC));
         for(int c=0;c<m.nC;c++){ if((int)z[c].size()!=m.nT) return Status::fail(p+": channel "+std::to_string(c)+" lists "+std::to_string(z[c].size())+" timepoints, expected "+std::to_string(m.nT));
             for(int t=0;t<m.nT;t++) m.zarrs[(size_t)c*m.nT+t]=z[c][t].get<std::string>(); }
+        if(j.contains("metadata")){ Status s=readMetadataJson(j["metadata"],m.nC,m.nT,m.meta); if(!s.ok()) return Status::fail(p+": "+s.message); }
+        else{   // a manifest from before the metadata: the defaults for its zarrs
+            piw::ConvertOptions o; o.files.assign(m.nC,std::vector<std::string>());
+            for(int c=0;c<m.nC;c++) for(int t=0;t<m.nT;t++) o.files[c].push_back(zarrAt(m,c,t));
+            std::string e=imsmeta::resolveMetadata(o,m.meta); if(!e.empty()) return Status::fail(p+": "+e);
+        }
     }catch(const std::exception& e){ return Status::fail("invalid "+p+": "+e.what()); }
     return Status();
 }
@@ -368,11 +404,32 @@ inline bool writeU64(hid_t g,const char* n,const std::vector<uint64_t>& v){
     hid_t ds=H5Dcreate2(g,n,H5T_STD_U64LE,sp,H5P_DEFAULT,H5P_DEFAULT,H5P_DEFAULT); bool ok=ds>=0&&H5Dwrite(ds,H5T_NATIVE_UINT64,H5S_ALL,H5S_ALL,H5P_DEFAULT,v.data())>=0;
     if(ds>=0)H5Dclose(ds);
     H5Sclose(sp); return ok; }
-inline std::string fmtTime(unsigned long long s){ char b[32]; snprintf(b,sizeof b,"%02llu:%02llu:%02llu",s/3600,(s/60)%60,s%60); return std::string("2020-02-05 ")+b; }
 inline hid_t imsCreate(const std::string& path){ hid_t fapl=H5Pcreate(H5P_FILE_ACCESS); H5Pset_libver_bounds(fapl,H5F_LIBVER_V18,H5F_LIBVER_V18); hid_t f=H5Fcreate(path.c_str(),H5F_ACC_TRUNC,H5P_DEFAULT,fapl); H5Pclose(fapl); return f; }
 inline hid_t imsDtype(bpSize elem){ return elem==2?H5Tcopy(H5T_STD_U16LE):(elem==1?H5Tcopy(H5T_STD_U8LE):H5Tcopy(H5T_IEEE_F32LE)); }
-inline const char* imsChannelName(int c){ static const char* N[3]={"First channel","Second channel","Third channel"}; return c>=0&&c<3?N[c]:"Other channel"; }
-inline std::string imsChannelColor(int c){ return fstr(c%3==0?1.f:0.f,3)+" "+fstr(c%3==1?1.f:0.f,3)+" "+fstr(c%3==2?1.f:0.f,3); }
+// DataSetInfo/Channel Color as ImarisWriter writes it (bpConvColorToString)
+inline std::string imsColorString(const piw::Color& k){ return fstr(k.red,3)+" "+fstr(k.green,3)+" "+fstr(k.blue,3); }
+// The per-channel attributes of imsmeta's metadata (Name, the wavelengths that were given, Color) on a
+// DataSetInfo/Channel group, for source channel c; an attribute already there is replaced, and a
+// wavelength attribute without a value is removed (linkparts edits a copied channel group with this).
+inline bool setChannelMeta(hid_t ch,const imsmeta::Metadata& md,int c){
+    auto put=[&](const char* n,const std::string& v){ if(H5Aexists(ch,n)>0&&H5Adelete(ch,n)<0) return false; return setStrAttr(ch,n,v); };
+    auto wave=[&](const char* n,float nm){ if(nm>0) return put(n,imsmeta::wavelengthString(nm)); return !(H5Aexists(ch,n)>0)||H5Adelete(ch,n)>=0; };
+    bool ok=put("Name",md.names[c]); ok&=wave("LSMEmissionWavelength",md.emission[c]); ok&=wave("LSMExcitationWavelength",md.excitation[c]);
+    ok&=put("Color",imsColorString(md.colors[c])); return ok;
+}
+// The DataSetInfo/TimeInfo attributes for the source timepoints tps (TimePoint1.. = their time stamps), by name
+inline std::map<std::string,std::string> timeInfoAttrs(const imsmeta::Metadata& md,const std::vector<int>& tps){
+    std::map<std::string,std::string> ti;
+    ti["FileTimePoints"]=std::to_string(tps.size()); ti["DatasetTimePoints"]=std::to_string(tps.size());
+    for(size_t i=0;i<tps.size();i++) ti["TimePoint"+std::to_string(i+1)]=imsmeta::timeString(md.times[tps[i]]);
+    return ti;
+}
+// DataSetInfo/TimeInfo for the source timepoints tps, attributes in ImarisWriter's (name) order
+inline bool writeTimeInfo(hid_t out,const imsmeta::Metadata& md,hid_t lcpl,const std::vector<int>& tps){
+    hid_t ti=H5Gcreate2(out,"DataSetInfo/TimeInfo",lcpl,H5P_DEFAULT,H5P_DEFAULT); if(ti<0) return false;
+    bool ok=true; for(const auto& a:timeInfoAttrs(md,tps)) ok&=setStrAttr(ti,a.first.c_str(),a.second);
+    return H5Gclose(ti)>=0&&ok;
+}
 
 // ===================== histograms + color range =====================
 // trim a 65536-bin histogram like bpHistogramBuilder<uint16>::GetHistogram (min 0, keep >=257 span). Written in
@@ -435,11 +492,13 @@ inline Status writeImsRoot(hid_t out,hid_t lcpl){
     return Status();
 }
 // The full DataSetInfo (Channels w/ ColorRange, Image, ImarisDataSet, Log, TimeInfo): its sections and each
-// section's attributes sorted by name, as bpWriterHDF5::WriteMetadata walks its std::maps. srcCh = source channel
-// indices written as Channel 0,1,... (color/name from the SOURCE index); colorTps = source timepoints aggregated
-// for each channel's ColorRange (from their level-0 histograms, hist(0,c,t)); nTime = number of TimeInfo entries.
+// section's attributes sorted by name, as bpWriterHDF5::WriteMetadata walks its std::maps. The values are m.meta's,
+// as the single-node converter writes them. srcCh = source channel indices written as Channel 0,1,... (name, color
+// and wavelengths from the SOURCE index); srcTps = source timepoints, aggregated for each channel's ColorRange (from
+// their level-0 histograms, hist(0,c,t)) and written as TimeInfo TimePoint1,2,... (no value is longer than the 1024
+// characters above which ImarisWriter writes a string as a dataset: imsmeta's names are at most that long).
 inline Status writeImsDataSetInfo(hid_t out,const Manifest& m,hid_t lcpl,const std::vector<int>& srcCh,
-                                  const std::vector<int>& colorTps,int nTime,const LevelHistFn& hist){
+                                  const std::vector<int>& srcTps,const LevelHistFn& hist){
     const Status bad=Status::fail("cannot write the Imaris metadata (HDF5 error above)");
     bool ok=true;
     std::map<std::string,std::map<std::string,std::string> > sec;   // section -> attribute -> value
@@ -449,22 +508,22 @@ inline Status writeImsDataSetInfo(hid_t out,const Manifest& m,hid_t lcpl,const s
     img["ExtMin0"]=fstr(0.f,9); img["ExtMin1"]=fstr(0.f,9); img["ExtMin2"]=fstr(0.f,9);
     img["ExtMax0"]=fstr((float)X*m.vox[0],9); img["ExtMax1"]=fstr((float)Y*m.vox[1],9); img["ExtMax2"]=fstr((float)Z*m.vox[2],9);
     img["X"]=std::to_string(X); img["Y"]=std::to_string(Y); img["Z"]=std::to_string(Z); img["Unit"]="um";
-    img["ResampleDimensionX"]="true"; img["ResampleDimensionY"]="true"; img["ResampleDimensionZ"]="true"; img["RecordingDate"]=fmtTime(55624);
+    img["ResampleDimensionX"]="true"; img["ResampleDimensionY"]="true"; img["ResampleDimensionZ"]="true";
+    img["RecordingDate"]=srcTps.empty()?std::string():imsmeta::timeString(m.meta.times[srcTps[0]]);
     for(size_t oc=0;oc<srcCh.size();oc++){ int c=srcCh[oc];
         std::vector<std::vector<uint64_t>> perTp;
-        for(int t:colorTps){ perTp.emplace_back(); Status s=hist(0,c,t,perTp.back()); if(!s.ok()) return s; }
+        for(int t:srcTps){ perTp.emplace_back(); Status s=hist(0,c,t,perTp.back()); if(!s.ok()) return s; }
         float rMin=0,rMax=0; adjustColorRange(channelColorHistMulti(perTp),rMin,rMax);
         std::map<std::string,std::string>& ch=sec["Channel "+std::to_string(oc)];
-        ch["Name"]=imsChannelName(c); ch["Description"]="(description not specified)";
-        ch["LSMEmissionWavelength"]="700"; ch["OtherChannelParameter"]="OtherChannelValue";
-        ch["ColorMode"]="BaseColor"; ch["Color"]=imsChannelColor(c);
+        ch["Name"]=m.meta.names[c]; ch["Description"]="(description not specified)";
+        if(m.meta.emission[c]>0) ch["LSMEmissionWavelength"]=imsmeta::wavelengthString(m.meta.emission[c]);
+        if(m.meta.excitation[c]>0) ch["LSMExcitationWavelength"]=imsmeta::wavelengthString(m.meta.excitation[c]);
+        ch["ColorMode"]="BaseColor"; ch["Color"]=imsColorString(m.meta.colors[c]);
         ch["ColorRange"]=fstr(rMin,3)+" "+fstr(rMax,3); ch["ColorOpacity"]="0.000"; ch["GammaCorrection"]="1.000";
     }
-    std::map<std::string,std::string>& ti=sec["TimeInfo"];
-    ti["FileTimePoints"]=std::to_string(nTime); ti["DatasetTimePoints"]=std::to_string(nTime);
-    for(int t=0;t<nTime;t++) ti["TimePoint"+std::to_string(t+1)]=fmtTime(55624+t);
+    sec["TimeInfo"]=timeInfoAttrs(m.meta,srcTps);
     std::map<std::string,std::string>& ids=sec["ImarisDataSet"];
-    ids["NumberOfImages"]="1"; ids["Creator"]="TestC"; ids["Version"]="1.0.0";
+    ids["NumberOfImages"]="1"; ids["Creator"]=imsmeta::creatorName(); ids["Version"]=piw::version();
     sec["Log"]["Entries"]="0";
     for(const auto& s:sec){
         hid_t g=H5Gcreate2(out,("DataSetInfo/"+s.first).c_str(),lcpl,H5P_DEFAULT,H5P_DEFAULT); if(g<0) return bad;
@@ -477,9 +536,9 @@ inline Status writeImsDataSetInfo(hid_t out,const Manifest& m,hid_t lcpl,const s
 // Root attributes, /DataSet and /DataSetInfo at once, with the histograms summed from the per-tile partial
 // histograms in cd (the tile path).
 inline Status writeImsMeta(hid_t out,const Manifest& m,const std::string& cd,hid_t lcpl,
-                           const std::vector<int>& srcCh,const std::vector<int>& colorTps,int nTime){
+                           const std::vector<int>& srcCh,const std::vector<int>& srcTps){
     Status s=writeImsRoot(out,lcpl); if(!s.ok()) return s;
-    return writeImsDataSetInfo(out,m,lcpl,srcCh,colorTps,nTime,[&](int r,int c,int t,std::vector<uint64_t>& bins){ return sumPartialHists(m,cd,r,c,t,bins); });
+    return writeImsDataSetInfo(out,m,lcpl,srcCh,srcTps,[&](int r,int c,int t,std::vector<uint64_t>& bins){ return sumPartialHists(m,cd,r,c,t,bins); });
 }
 
 } // namespace imscore

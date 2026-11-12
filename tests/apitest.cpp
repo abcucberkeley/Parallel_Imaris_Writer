@@ -13,6 +13,11 @@
 //   - cancel after a few polls; progress never decreasing and ending at 1
 //   - two conversions one after the other, two at once from two threads, numThreads (and the
 //     caller's OpenMP setting restored), piw::runCli twice in one process
+//   - metadata (A-10): every /DataSetInfo attribute with the defaults (names "Channel c", R/G/B,
+//     no wavelengths, 1 s apart from the first input's modification time), with the options
+//     (names, colors, wavelengths, start time, interval), from "<n>msecAbs" stamps in the file
+//     names; the same options as command-line flags give the same file; bad metadata options
+//     are refused before any output; imsmeta.h's time and color helpers
 //   usage: apiTest <path-to-parallelimariswriter> [workdir]
 #include <algorithm>
 #include <atomic>
@@ -31,12 +36,16 @@
 #include <sys/wait.h>
 #endif
 
+#include <sys/stat.h>
+#include <ctime>
 #include <omp.h>
 #include "parallelimariswriter.h"
+#include "imsmeta.h"             // src/: the metadata helpers both conversion paths use
 #include "parallelwritetiff.h"   // cpp-tiff
 #include "zarr.h"                // cpp-zarr
 #include "parallelwritezarr.h"
 #include "hdf5.h"                // core HDF5 (statically linked)
+#include "imsutil.h"             // imsCheckDataSetInfo, imsCompare
 
 namespace fs = std::filesystem;
 
@@ -230,11 +239,14 @@ static piw::Callbacks callbacksFor(Recorder& r){
     return cb;
 }
 
+// names: the channel names (the executable names the channels after their -P patterns).
 static piw::ConvertOptions optionsFor(const std::string& reader, const std::vector<std::vector<std::string>>& files,
-                                      const fs::path& out, const std::string& processBlock){
+                                      const fs::path& out, const std::string& processBlock,
+                                      const std::vector<std::string>& names = std::vector<std::string>()){
     piw::ConvertOptions o;
     o.reader = reader;
     o.files = files;
+    o.channelNames = names;
     o.outputFile = native(out);
     o.voxelSize[0] = o.voxelSize[1] = o.voxelSize[2] = 1.0f;   // the executable runs with -v 1,1,1
     if(!processBlock.empty()){
@@ -265,6 +277,175 @@ static size_t countLines(const std::string& text, const std::string& prefix){
 }
 
 struct Case { std::string name, reader; fs::path dir; std::vector<std::string> patterns; std::string processBlock; };
+
+// --- metadata (A-10) ---
+
+// The modification time of p plus aSeconds as "YYYY-MM-DD HH:MM:SS", local time (strftime, not the
+// converter's own calendar code).
+static std::string localStamp(const fs::path& p, int aSeconds){
+    struct stat st;
+    if(stat(native(p).c_str(), &st) != 0) return "<no mtime>";
+    const time_t t = st.st_mtime + aSeconds;
+    const struct tm* lt = std::localtime(&t);
+    char b[64];
+    if(!lt || !std::strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", lt)) return "<bad mtime>";
+    return b;
+}
+
+static ImsExpectedMeta expectedMeta(uint64_t X, uint64_t Y, uint64_t Z){
+    ImsExpectedMeta e;
+    e.size[0] = X; e.size[1] = Y; e.size[2] = Z;
+    e.version = PIW_VERSION;
+    return e;
+}
+
+static void checkMeta(const fs::path& ims, const ImsExpectedMeta& e, const std::string& what){
+    std::vector<std::string> problems;
+    const bool ok = imsCheckDataSetInfo(ims, e, problems);
+    for(size_t i = 0; i < problems.size() && i < 20; ++i) std::printf("    %s\n", problems[i].c_str());
+    check(ok, what + ": every DataSetInfo attribute as expected");
+}
+
+static void metadataTests(const std::string& exe, const fs::path& work, const fs::path& mdir){
+    std::printf("[metadata: imsmeta.h helpers]\n");
+    {
+        unsigned jd = 0; unsigned long long ns = 0; int64_t ms = 0;
+        check(imsmeta::parseTime("2020-02-05 15:27:04", ms), "parseTime of a plain time");
+        imsmeta::julianTime(ms, jd, ns);
+        check(jd == 2458885u && ns == 55624ull * 1000000000ull, "julianTime: 2020-02-05 15:27:04 is Julian day 2458885, 55624 s");
+        check(imsmeta::timeString(ms) == "2020-02-05 15:27:04", "timeString without milliseconds");
+        const char* texts[] = {"2024-02-29 23:59:59.999", "1999-12-31 00:00:00.001", "2026-11-12 08:30:15.250", "1970-01-01 00:00:00", "1969-12-31 23:59:59.500"};
+        for(const char* t : texts) check(imsmeta::parseTime(t, ms) && imsmeta::timeString(ms) == t, std::string("parseTime/timeString round trip: ") + t);
+        check(imsmeta::parseTime("2026-03-04T05:06", ms) && imsmeta::timeString(ms) == "2026-03-04 05:06:00", "a 'T' separator and no seconds");
+        check(imsmeta::parseTime("2026-03-04", ms) && imsmeta::timeString(ms) == "2026-03-04 00:00:00", "a date alone");
+        check(imsmeta::parseTime("2026-03-04 05:06:07.1239", ms) && imsmeta::timeString(ms) == "2026-03-04 05:06:07.123", "a fraction beyond milliseconds");
+        for(const char* bad : {"2026-02-30 00:00:00", "2025-02-29", "2026-13-01", "2026-01-01 24:00:00", "26-01-01", "2026-01-01 1:00", "2026-01-01 10:00:00.", "2026-01-01x", ""})
+            check(!imsmeta::parseTime(bad, ms), std::string("parseTime refuses \"") + bad + "\"");
+        int64_t st = 0;
+        check(imsmeta::msecAbsStamp("/d/Scan_Iter_0001_CamA_ch0_0000123msec_0012345678msecAbs.zarr", st) && st == 12345678, "msecAbs stamp of a PetaKit5D name");
+        check(imsmeta::msecAbsStamp("d\\x_0000042msecAbs_decon.tif", st) && st == 42, "msecAbs stamp with a Windows separator and a suffix");
+        check(imsmeta::msecAbsStamp("/d/x_7msecAbs.zarr/", st) && st == 7, "msecAbs stamp of a folder with a trailing separator");
+        check(!imsmeta::msecAbsStamp("/d/123msecAbs/CamA_0000123msec.tif", st), "no msecAbs stamp (one in a folder name does not count)");
+        check(!imsmeta::msecAbsStamp("/d/CamA_msecAbs.tif", st), "no msecAbs stamp without digits");
+        piw::Color c;
+        check(imsmeta::parseColor("cyan", c) && c.red == 0 && c.green == 1 && c.blue == 1, "color by name");
+        check(imsmeta::parseColor("FF8000", c) && c.red == 1 && c.green == 128.f / 255.f && c.blue == 0, "color as RRGGBB");
+        check(imsmeta::parseColor("#0000ff", c) && c.blue == 1 && c.red == 0, "color as #rrggbb");
+        check(imsmeta::parseColor("0.25:0.5:0.75", c) && c.red == 0.25f && c.green == 0.5f && c.blue == 0.75f, "color as r:g:b");
+        check(!imsmeta::parseColor("purple", c) && !imsmeta::parseColor("FF80", c) && !imsmeta::parseColor("1:2", c), "bad colors refused");
+        check(imsmeta::wavelengthString(488.f) == "488" && imsmeta::wavelengthString(561.5f) == "561.5", "wavelength texts");
+    }
+
+    // 2 channels x 2 time points (the inputs of the multi cases), 149 x 129 x 101
+    const auto files = findFiles(mdir, {"CamA", "CamB"});
+    std::printf("[metadata: defaults]\n");
+    {
+        const fs::path out = work/"meta_default.ims";
+        Recorder rec;
+        const piw::Status s = piw::convert(optionsFor("zarr", files, out, ""), callbacksFor(rec));
+        check(s.ok(), "convert with the default metadata (" + s.message + ")");
+        ImsExpectedMeta e = expectedMeta(149, 129, 101);
+        e.names = {"Channel 0", "Channel 1"};
+        e.colors = {"1.000 0.000 0.000", "0.000 1.000 0.000"};
+        e.times = {localStamp(files[0][0], 0), localStamp(files[0][0], 1)};
+        std::printf("  first input's modification time: %s\n", e.times[0].c_str());
+        checkMeta(out, e, "defaults");
+    }
+    std::printf("[metadata: options]\n");
+    piw::ConvertOptions opt = optionsFor("zarr", files, work/"meta_options.ims", "");
+    opt.channelNames = {"GFP", "mCherry 2"};
+    opt.channelColors = {{0.f, 1.f, 1.f}, {0.25f, 0.5f, 0.75f}};
+    opt.emissionWavelengths = {525.f, 0.f};
+    opt.excitationWavelengths = {488.f, 561.5f};
+    opt.startTime = "2026-01-31 23:59:58.250";
+    opt.timeInterval = 2.5;
+    ImsExpectedMeta eo = expectedMeta(149, 129, 101);
+    eo.names = {"GFP", "mCherry 2"};
+    eo.colors = {"0.000 1.000 1.000", "0.250 0.500 0.750"};
+    eo.emission = {"525", ""};
+    eo.excitation = {"488", "561.5"};
+    eo.times = {"2026-01-31 23:59:58.250", "2026-02-01 00:00:00.750"};
+    {
+        Recorder rec;
+        const piw::Status s = piw::convert(opt, callbacksFor(rec));
+        check(s.ok(), "convert with names, colors, wavelengths, start time and interval (" + s.message + ")");
+        checkMeta(opt.outputFile, eo, "options");
+    }
+    std::printf("[metadata: the same options on the command line]\n");
+    {
+        const fs::path od = work/"meta_cli"; fs::create_directories(od);
+        const std::string args = "-P CamA,CamB -F \"" + native(mdir) + "\" -o \"" + native(od) + "\" -r zarr -v 1,1,1"
+            " --channel-names \"GFP,mCherry 2\" --colors cyan,0.25:0.5:0.75 --emission 525,0 --excitation=488,561.5"
+            " --start-time \"2026-01-31 23:59:58.250\" --time-interval 2.5";
+        const int rc = runExe(exe, args, work/"meta_cli.log");
+        check(rc == 0, "executable with the metadata flags (exit " + std::to_string(rc) + ")");
+        checkMeta(od/"output.ims", eo, "command line");
+        ImsCompareReport report;
+        ImsCompareOptions co; co.thumbnail = true;
+        const bool same = imsCompare(opt.outputFile, od/"output.ims", report, co);
+        imsPrintReport(report);
+        check(same, "command line and piw::convert write the same file (data and every attribute)");
+    }
+    std::printf("[metadata: msecAbs stamps]\n");
+    {
+        // PetaKit5D-style names; the second channel's stamps are used, the first channel has none
+        const fs::path sdir = work/"stamps"; fs::create_directories(sdir);
+        const char* a[] = {"CamA_t0000.zarr", "CamA_t0001.zarr", "CamA_t0002.zarr"};
+        const char* b[] = {"Scan_Iter_0000_CamB_ch0_0000000msec_0086399000msecAbs.zarr",
+                           "Scan_Iter_0001_CamB_ch0_0001250msec_0086400250msecAbs.zarr",
+                           "Scan_Iter_0002_CamB_ch0_0061000msec_0086460000msecAbs.zarr"};
+        for(int t = 0; t < 3; ++t){ writeZarr(sdir/a[t], 40, 30, 20, t); writeZarr(sdir/b[t], 40, 30, 20, 10 + t); }
+        const auto sf = findFiles(sdir, {"CamA", "CamB"});
+        piw::ConvertOptions o = optionsFor("zarr", sf, work/"meta_stamps.ims", "", {"CamA", "CamB"});
+        o.startTime = "2026-11-12 23:59:59";
+        Recorder rec;
+        piw::Status s = piw::convert(o, callbacksFor(rec));
+        check(s.ok(), "convert with stamps and a start time (" + s.message + ")");
+        ImsExpectedMeta e = expectedMeta(40, 30, 20);
+        e.names = {"CamA", "CamB"};
+        e.colors = {"1.000 0.000 0.000", "0.000 1.000 0.000"};
+        e.times = {"2026-11-12 23:59:59", "2026-11-13 00:00:00.250", "2026-11-13 00:01:00"};
+        checkMeta(o.outputFile, e, "msecAbs stamps from the start time");
+        // without a start time: from the first input's modification time; an interval overrides the stamps
+        o.startTime.clear();
+        o.outputFile = native(work/"meta_stamps_mtime.ims");
+        s = piw::convert(o, callbacksFor(rec));
+        e.times = {localStamp(sf[0][0], 0), localStamp(sf[0][0], 1) + ".250", localStamp(sf[0][0], 61)};
+        check(s.ok(), "convert with stamps, no start time (" + s.message + ")");
+        checkMeta(o.outputFile, e, "msecAbs stamps from the modification time");
+        o.timeInterval = 0.5;
+        o.outputFile = native(work/"meta_stamps_interval.ims");
+        s = piw::convert(o, callbacksFor(rec));
+        e.times = {localStamp(sf[0][0], 0), localStamp(sf[0][0], 0) + ".500", localStamp(sf[0][0], 1)};
+        check(s.ok(), "convert with stamps and an interval (" + s.message + ")");
+        checkMeta(o.outputFile, e, "an interval overrides the stamps");
+    }
+    std::printf("[metadata: bad options]\n");
+    {
+        struct Bad { std::string what; piw::ConvertOptions o; };
+        std::vector<Bad> bads;
+        piw::ConvertOptions base = optionsFor("zarr", files, work/"meta_bad.ims", "");
+        Bad k{"three names for two channels", base}; k.o.channelNames = {"a", "b", "c"}; bads.push_back(k);
+        k = Bad{"an empty name", base}; k.o.channelNames = {"a", ""}; bads.push_back(k);
+        k = Bad{"a color above 1", base}; k.o.channelColors = {{1.f, 0.f, 0.f}, {0.f, 1.5f, 0.f}}; bads.push_back(k);
+        k = Bad{"one wavelength for two channels", base}; k.o.emissionWavelengths = {500.f}; bads.push_back(k);
+        k = Bad{"a bad start time", base}; k.o.startTime = "2026-02-30 10:00:00"; bads.push_back(k);
+        k = Bad{"a negative interval", base}; k.o.timeInterval = -1; bads.push_back(k);
+        for(const Bad& b : bads){
+            Recorder rec;
+            const piw::Status s = piw::convert(b.o, callbacksFor(rec));
+            check(s.code == piw::Code::InvalidArgument && !fs::exists(work/"meta_bad.ims") && rec.text.empty(),
+                  b.what + ": InvalidArgument before any output (" + s.message + ")");
+        }
+        const fs::path od = work/"meta_cli_bad"; fs::create_directories(od);
+        const std::string common = "-P CamA,CamB -F \"" + native(mdir) + "\" -o \"" + native(od) + "\" -r zarr ";
+        for(const char* flags : {"--colors red,purple", "--start-time yesterday", "--time-interval 0", "--channel-names A", "--emission 500,x"}){
+            const int rc = runExe(exe, common + flags, work/"meta_cli_bad.log");
+            check(rc == 1 && !fs::exists(od/"output.ims"), std::string(flags) + ": exit 1, no output (exit " + std::to_string(rc) + ", " +
+                  readText(work/"meta_cli_bad.log").substr(0, 160) + ")");
+        }
+    }
+}
 
 int main(int argc, char** argv){
     if(argc < 2){ std::fprintf(stderr, "usage: %s <parallelimariswriter> [workdir]\n", argv[0]); return 2; }
@@ -305,7 +486,7 @@ int main(int argc, char** argv){
         Recorder rec;
         const auto files = findFiles(k.dir, k.patterns);
         const fs::path out = work/("api_" + k.name + ".ims");
-        const piw::Status s = piw::convert(optionsFor(k.reader, files, out, k.processBlock), callbacksFor(rec));
+        const piw::Status s = piw::convert(optionsFor(k.reader, files, out, k.processBlock, k.patterns), callbacksFor(rec));
         check(s.ok(), "piw::convert ok (" + s.message + ")");
         check(sameIms(exeIms(k), out), "same data chunks and channel info as the executable");
         check(progressOk(rec), "progress never decreases and ends at 1 (" + std::to_string(rec.progress.size()) + " calls)");
@@ -408,7 +589,7 @@ int main(int argc, char** argv){
     for(int i = 0; i < 2; ++i){
         Recorder rec;
         const fs::path out = work/("api_seq" + std::to_string(i) + ".ims");
-        const piw::Status s = piw::convert(optionsFor("zarr", findFiles(zdir, {"CamA"}), out, ""), callbacksFor(rec));
+        const piw::Status s = piw::convert(optionsFor("zarr", findFiles(zdir, {"CamA"}), out, "", {"CamA"}), callbacksFor(rec));
         check(s.ok() && sameIms(exeIms(zarrWhole), out), "conversion " + std::to_string(i + 1) + " in sequence");
     }
     {
@@ -416,8 +597,8 @@ int main(int argc, char** argv){
         Recorder r1, r2;
         const auto f1 = findFiles(tdir, {"CamA"}), f2 = findFiles(zdir, {"CamA"});
         const fs::path out1 = work/"api_thread1.ims", out2 = work/"api_thread2.ims";
-        std::thread t1([&]{ s1 = piw::convert(optionsFor("tiff", f1, out1, ""), callbacksFor(r1)); });
-        std::thread t2([&]{ s2 = piw::convert(optionsFor("zarr", f2, out2, "32,32,32"), callbacksFor(r2)); });
+        std::thread t1([&]{ s1 = piw::convert(optionsFor("tiff", f1, out1, "", {"CamA"}), callbacksFor(r1)); });
+        std::thread t2([&]{ s2 = piw::convert(optionsFor("zarr", f2, out2, "32,32,32", {"CamA"}), callbacksFor(r2)); });
         t1.join(); t2.join();
         check(s1.ok() && s2.ok() && sameIms(exeIms(tiffWhole), out1) && sameIms(exeIms(zarrC), out2),
               "two conversions at once from two threads");
@@ -425,7 +606,7 @@ int main(int argc, char** argv){
     {
         const int before = omp_get_max_threads();
         Recorder rec;
-        piw::ConvertOptions o = optionsFor("zarr", findFiles(zdir, {"CamA"}), work/"api_threads2.ims", "");
+        piw::ConvertOptions o = optionsFor("zarr", findFiles(zdir, {"CamA"}), work/"api_threads2.ims", "", {"CamA"});
         o.numThreads = 2;
         const piw::Status s = piw::convert(o, callbacksFor(rec));
         check(s.ok() && sameIms(exeIms(zarrWhole), work/"api_threads2.ims") && omp_get_max_threads() == before,
@@ -466,6 +647,8 @@ int main(int argc, char** argv){
                   readText(log).substr(0, 160) + ")");
         }
     }
+
+    metadataTests(exe, work, mdir);
 
     if(gFailures == 0){ std::printf("apitest PASSED\n"); return 0; }
     std::printf("apitest FAILED (%d checks)\n", gFailures);

@@ -19,8 +19,10 @@
 // table that turns its Status into output and an exit code is cliExitCode below.
 #include "helperfunctions.h"        // cpp-tiff's expandTilde(char*), used for the output folder as before
 #include "parallelimariswriter.h"
+#include "imsmeta.h"
 #include "parallel.h"
 #include "mono.h"
+#include <getopt.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -200,8 +202,27 @@ int convertToImaris(int argc, char **argv)
     const char* blockSizes = NULL;
     const char* blockProcessString = NULL;
     const char* boundingBoxString = NULL;
+    piw::ConvertOptions vOptions;
+    // The metadata options (--channel-names, --colors, ...; see imsmeta.h) are long options only.
+    const int kMetadataBase = 1000;
+    const std::vector<imsmeta::OptionInfo>& vMetadataOptions = imsmeta::metadataOptions();
+    std::vector<struct option> vLongOptions;
+    for(size_t i = 0; i < vMetadataOptions.size(); ++i){
+        struct option vOption = {vMetadataOptions[i].name, required_argument, NULL, kMetadataBase + (int)i};
+        vLongOptions.push_back(vOption);
+    }
+    struct option vEnd = {NULL, 0, NULL, 0};
+    vLongOptions.push_back(vEnd);
     resetGetopt();
-    while (( option_index = getopt(argc, argv, ":c:P:t:f:F:o:r:v:n:b:B:C:")) != -1){
+    while (( option_index = getopt_long(argc, argv, ":c:P:t:f:F:o:r:v:n:b:B:C:", vLongOptions.data(), NULL)) != -1){
+        if(option_index >= kMetadataBase && option_index < kMetadataBase + (int)vMetadataOptions.size()){
+            const std::string vError = imsmeta::parseMetadataOption(vMetadataOptions[option_index - kMetadataBase].name, optarg, vOptions);
+            if(!vError.empty()){
+                fprintf(stderr, "ERROR: %s\n", vError.c_str());
+                return 1;
+            }
+            continue;
+        }
         switch (option_index) {
         case 'c':
             channels = atoi(optarg);
@@ -272,7 +293,6 @@ int convertToImaris(int argc, char **argv)
         return 1;
     }
 
-    piw::ConvertOptions vOptions;
     if(vVoxelSizes && !parseFloats(vVoxelSizes, 3, vOptions.voxelSize)) return badValue('v', vVoxelSizes, 3);
     if(blockSizes){
         if(!parseFloatSizes(blockSizes, 3, vOptions.blockSize)) return badValue('b', blockSizes, 3);
@@ -372,6 +392,7 @@ int convertToImaris(int argc, char **argv)
 
     vOptions.reader = reader;
     vOptions.outputFile = outputFile;
+    if(vOptions.channelNames.empty()) vOptions.channelNames = patternList;   // the channels are named after their patterns
 
     bpCallbackData aCallbackUserData;
     aCallbackUserData.mImageIndex = 0;

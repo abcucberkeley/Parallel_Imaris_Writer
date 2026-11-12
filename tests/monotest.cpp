@@ -15,8 +15,9 @@
 //              "already finished".
 //   crop run : monoinit + 2 timepoints x 1 channel converted with -B, an image small enough that a single-node
 //              conversion of 2 timepoints chunks level 0 differently from the 1-timepoint parts: monofinish
-//              re-chunks it, and the file equals the cropped single-node conversion. Refused: a part of another
-//              geometry, a uint8 part, a file with two channels.
+//              re-chunks it, and the file equals the cropped single-node conversion (monoinit and the reference
+//              given the same metadata options). Refused: a part of another geometry, a uint8 part, a file with
+//              two channels, a monoinit with other metadata.
 //   usage: monoTest <parallelimariswriter> <workdir>
 // Exit 0 = pass, 1 = fail, 77 = skipped (Windows: the single-file path is not supported there).
 #ifdef _WIN32
@@ -260,14 +261,21 @@ int main(int argc, char** argv){
     writeZarr(work / "u8" / "U8_t0000.zarr", makeVolume<uint8_t>(cx, cy, cz, 0, 0, 200), cx, cy, cz, "|u1");
     fs::path ref2 = work / "ref2", parts2 = work / "parts2", wd2 = work / "wd2", out2 = work / "mono_crop.ims";
     fs::create_directories(ref2); fs::create_directories(parts2);
-    bool made = run(E + " -P Vol -F " + q(zdir2) + " -o " + q(ref2) + " -r zarr -v " + VOXEL + " -B " + BB) == 0;
+    // the metadata options of the reference (its channel is named after its pattern, Vol) and of monoinit
+    const std::string times = " --start-time 2024-05-06T07:08:09.250 --time-interval 2.5";
+    bool made = run(E + " -P Vol -F " + q(zdir2) + " -o " + q(ref2) + " -r zarr -v " + VOXEL + " -B " + BB + times) == 0;
     for(int t = 0; t < 2; t++) made = made && run(E + " -P Vol_t000" + std::to_string(t) + " -F " + q(zdir2) + " -o " + q(parts2) + " -n p" + std::to_string(t) +
                                                  " -r zarr -v " + VOXEL + " -B " + BB) == 0;
     made = made && run(E + " -P U8 -F " + q(work / "u8") + " -o " + q(parts2) + " -n u8 -r zarr -v " + VOXEL + " -B " + BB) == 0;
     CHECK(made, "crop conversions failed");
-    CHECK(run(E + " monoinit " + q(wd2) + " 2 1 " + VOXEL + " " + q(out2)) == 0, "monoinit");
+    CHECK(run(E + " monoinit " + q(wd2) + " 2 1 " + VOXEL + " " + q(out2) + " --channel-names Vol" + times) == 0, "monoinit");
     CHECK(run(E + " monoinit " + q(wd2) + " 2 1 " + VOXEL) == 0, "monoinit again with the same values");
+    CHECK(run(E + " monoinit " + q(wd2) + " 2 1 " + VOXEL + " --channel-names=Vol --time-interval 2.5") == 0,
+          "monoinit again with the same metadata (a start time from the clock matches any)");
     CHECK(run(E + " monoinit " + q(wd2) + " 3 1 " + VOXEL, &o, log) == 1, "monoinit over a different manifest");
+    CHECK(run(E + " monoinit " + q(wd2) + " 2 1 " + VOXEL + " --channel-names Other", &o, log) == 1, "monoinit with other metadata over a manifest");
+    CHECK(run(E + " monoinit " + q(work / "wd3") + " 2 1 " + VOXEL + " --colors nocolor", &o, log) == 1 && o.find("nocolor") != std::string::npos &&
+          !fs::exists(work / "wd3" / "manifest.json"), "monoinit with a bad metadata option");
     auto place2 = [&](int t, const fs::path& p){ return E + " monoplace " + q(wd2) + " " + std::to_string(t) + " 0 " + q(p); };
     CHECK(run(place2(0, parts2 / "p0.ims")) == 0, "monoplace crop t0");
     CHECK(run(place2(1, keep / "part_t0_c0.ims"), &o, log) == 1 && o.find("layout.json") != std::string::npos, "a part of another geometry was accepted");

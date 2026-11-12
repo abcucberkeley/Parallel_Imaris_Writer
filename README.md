@@ -46,6 +46,20 @@ The converter finds its inputs by matching a file-name pattern inside one or mor
 | `-b` | Imaris output block (chunk) size as `X,Y,Z` (default: the reader's native chunk size) |
 | `-B` | Bounding box to crop the input as `Xmin,Ymin,Zmin,Xmax,Ymax,Zmax` |
 | `-C` | Processing block size as `X,Y,Z` — the amount of a timepoint held in RAM at once. Zarr is blocked in all three axes; TIFF only in Z. Values larger than the image simply read the whole image. Omit to process a whole timepoint at once. |
+| `--channel-names` | Comma-separated channel names (default: the `-P` patterns, e.g. `CamA,CamB`) |
+| `--colors` | Comma-separated channel colors: `red`, `green`, `blue`, `cyan`, `magenta`, `yellow`, `white`, `gray`, a hex `RRGGBB`, or `r:g:b` with values from 0 to 1 (default: red, green, blue, red, ...) |
+| `--emission` | Comma-separated emission wavelengths in nm, written as `LSMEmissionWavelength` (`0` = none for that channel; default: none) |
+| `--excitation` | Comma-separated excitation wavelengths in nm, written as `LSMExcitationWavelength` (`0` = none; default: none) |
+| `--time-interval` | Seconds between timepoints |
+| `--start-time` | Time of the first timepoint, `"YYYY-MM-DD HH:MM:SS[.mmm]"` (local time) |
+
+#### Metadata
+The channels are named after their patterns and colored red, green, blue, red, ... unless `--channel-names` and `--colors` say otherwise; wavelengths are written only when given. The file's Creator is `parallelimariswriter` with its version. Timepoint `t` is placed at:
+1. `start + t × interval` when `--time-interval` is given; otherwise
+2. `start + (stamp[t] − stamp[0])` milliseconds when every file of a channel has a `<n>msecAbs` stamp in its name (as PetaKit5D names its files, e.g. `..._0000123msec_0012345678msecAbs.zarr`; the first such channel is used); otherwise
+3. `start + t` seconds.
+
+`start` is `--start-time`, or else the modification time (local time, whole seconds) of the first input file — of the first channel's first timepoint, a `.zarr` folder's own modification time for Zarr input. Imaris shows these times and uses their spacing as the frame interval.
 
 ### Examples
 
@@ -79,7 +93,7 @@ Why it needs structure: an `.ims` is a single HDF5 container with one shared chu
 
 When each individual `(timepoint, channel)` volume fits in one node's memory (stream it with `-C`), convert each one independently and then stitch the results together:
 
-1. **`setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz]`** — enumerates the `(channel, timepoint)` → `.zarr` mapping into `<workdir>/manifest.json`.
+1. **`setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--channel-names ... --start-time ...]`** — enumerates the `(channel, timepoint)` → `.zarr` mapping into `<workdir>/manifest.json`, with the metadata (channel names, colors, wavelengths, timepoint times) the converter would write for the same inputs and options. It takes the converter's metadata options (see [Metadata](#metadata)); `linkparts`, `monitor` and `link` write that metadata.
 2. For each `(timepoint, channel)`, run the **normal converter** on that single `.zarr` into `<parts>/part_t{t}_c{c}.ims` (add `-C` to bound memory). Every one is independent, so run them all at once.
 3. **`linkparts <workdir> <out.ims> <parts>`** — writes a tiny `.ims` of **HDF5 external links** into the parts; Imaris follows them and opens the whole set as one dataset.
 

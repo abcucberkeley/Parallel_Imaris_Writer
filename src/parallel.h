@@ -4,9 +4,12 @@
 // Cluster/distributed conversion subcommands. Many independent SLURM jobs read a zarr time series
 // and produce Imaris .ims output whose voxel data is byte-identical to a monolithic run. Every
 // subcommand prints its errors on stderr and exits non-zero on failure.
-//   parallelimariswriter setup      <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz]
+//   parallelimariswriter setup      <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--option value ...]
 //        writes <workdir>/manifest.json; cx,cy,cz = per-worker tile size (voxels); voxel size
-//        defaults to 0.108,0.108,0.108 (as the converter); env PIW_CHUNK_BYTES = chunk budget
+//        defaults to 0.108,0.108,0.108 (as the converter); env PIW_CHUNK_BYTES = chunk budget;
+//        the options are the converter's metadata options (--channel-names, --colors, --emission,
+//        --excitation, --time-interval, --start-time; imsmeta.h), resolved here into the manifest
+//        so every output of this workdir carries the converter's metadata
 //   parallelimariswriter worker     <workdir> <level> <index>
 //        one tile at one level -> chunks/L*.pack + h_L*.hist; run level 0's array first, then 1's, ...
 //   parallelimariswriter monitor    <workdir> [out.ims]

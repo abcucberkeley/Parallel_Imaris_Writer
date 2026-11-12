@@ -12,7 +12,7 @@
 // whose data and metadata equal the single-node converter's, except /Thumbnail (not written yet).
 //
 // Workdir:
-//   manifest.json              timepoints, channels, voxel size [, output path]: monoinit (or setup)
+//   manifest.json              timepoints, channels, voxel size [, output path], the metadata: monoinit (or setup)
 //   output.ims.partial         the file being built; monofinish renames it to the output (same filesystem)
 //   mono/layout.json           every level's geometry: written by the first placer, checked by every later one
 //   mono/claims/, owners/ ...  the claims journal of the raw region (monoclaim.h)
@@ -21,7 +21,10 @@
 //   mono/finished              the output path, once monofinish has renamed the file
 //
 // Commands (dispatched from src/cli.cpp; exit 0 ok, 1 error, 2 usage, 3 incomplete):
-//   monoinit   <workdir> <nT> <nC> <vx,vy,vz> [out.ims]     the manifest, for parts made from any input
+//   monoinit   <workdir> <nT> <nC> <vx,vy,vz> [out.ims] [--option value ...]
+//                                                           the manifest, for parts made from any input; the
+//                                                           options are the converter's metadata options
+//                                                           (--channel-names, --colors, ...; imsmeta.h)
 //   monoplace  <workdir> <t> <c> <part.ims> [--threads N]   place one part; re-runnable until the finish
 //   monofinish <workdir> [out.ims] [--verify] [--threads N] refuses (exit 3, naming them) while parts are missing
 //   monostatus <workdir>                                    placed / missing parts (exit 3 if any is missing)
@@ -44,9 +47,21 @@ struct MonoInitOptions {
     int timepoints = 0, channels = 0;
     float voxelSize[3] = {0.108f, 0.108f, 0.108f};   // X, Y, Z, as the converter's -v
     std::string outputFile;                          // optional: monofinish's default output
+    // The metadata monofinish writes: ConvertOptions's fields of the same names, with its defaults and checks.
+    // files = the parts' inputs, [channel][timepoint] (optional): with them the time stamps are those of a
+    // single-node conversion of these files (msecAbs stamps, or the first one's modification time); without
+    // them and without startTime, time point 0 is the time the manifest is written.
+    std::vector<std::vector<std::string>> files;
+    std::vector<std::string> channelNames;           // default "Channel 0", "Channel 1", ...
+    std::vector<Color> channelColors;
+    std::vector<float> emissionWavelengths, excitationWavelengths;
+    double timeInterval = 0;
+    std::string startTime;
 };
-// Writes <workdir>/manifest.json (creating the workdir). An existing manifest with the same timepoints,
-// channels and voxel size (e.g. setup's) is kept; one with other values is an error.
+// Writes <workdir>/manifest.json (creating the workdir), with the metadata resolved once. An existing manifest
+// with the same timepoints, channels and voxel size (e.g. setup's) is kept, metadata and all, when no metadata
+// field is set; with one set, its metadata must also be what these fields give (a start time taken from the
+// clock matches any). Other values are an error.
 Status monoInit(const MonoInitOptions& options) noexcept;
 
 struct MonoPlaceOptions {

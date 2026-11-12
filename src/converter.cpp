@@ -24,6 +24,7 @@
 #include "zarr.h"
 #include "parallelreadzarr.h"
 #include "parallelimariswriter.h"
+#include "imsmeta.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -284,7 +285,7 @@ public:
     ~ImsWriter();
 
     Status open(uint64_t aBits, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
-                const float aVoxelSize[3], const std::string& aOutputFile);
+                const float aVoxelSize[3], const imsmeta::Metadata& aMetadata, const std::string& aOutputFile);
     // Copies the Imaris blocks [aBlockBase, aBlockLimit) of (aC, aT) from one read-block: aSrc holds
     // the image region that starts at (aX0, aY0, aZ0) and is aXN x aYN wide (NULL: all zero padding).
     Status writeRegion(uint64_t aC, uint64_t aT, const uint64_t aBlockBase[3], const uint64_t aBlockLimit[3],
@@ -305,6 +306,7 @@ private:
     bpConverterTypesC_Size5D mImageSize;
     bpConverterTypesC_Size5D mBlockSize;
     float mVoxelSize[3];
+    imsmeta::Metadata mMetadata;
     std::string mOutputFile;
     void* mBuffer;
     bool mFinished;
@@ -336,13 +338,14 @@ Status ImsWriter::checkErrors(){
 }
 
 Status ImsWriter::open(uint64_t aBits, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
-                       const float aVoxelSize[3], const std::string& aOutputFile){
+                       const float aVoxelSize[3], const imsmeta::Metadata& aMetadata, const std::string& aOutputFile){
     mBits = aBits;
     mImageSize = aImageSize;
     mBlockSize = aBlockSize;
     mVoxelSize[0] = aVoxelSize[0];
     mVoxelSize[1] = aVoxelSize[1];
     mVoxelSize[2] = aVoxelSize[2];
+    mMetadata = aMetadata;
     mOutputFile = aOutputFile;
 
     bpConverterTypesC_DataType aDataType = aBits == 8 ? bpConverterTypesC_UInt8Type :
@@ -367,8 +370,8 @@ Status ImsWriter::open(uint64_t aBits, const bpConverterTypesC_Size5D& aImageSiz
     aOptions.mNumberOfThreads = omp_get_max_threads();
     aOptions.mCompressionAlgorithmType = eCompressionAlgorithmLShuffleLZ4;
 
-    bpConverterTypesC_String aApplicationName = "TestC";
-    bpConverterTypesC_String aApplicationVersion = "1.0.0";
+    bpConverterTypesC_String aApplicationName = imsmeta::creatorName();   // ImarisDataSet Creator, Version
+    bpConverterTypesC_String aApplicationVersion = PIW_VERSION;
     bpConverterTypesC_ProgressCallback aProgressCallback = mCallbacks.progress ? onProgress : NULL;
 
     mConverter = bpImageConverterC_Create(
@@ -427,8 +430,8 @@ Status ImsWriter::writeRegion(uint64_t aC, uint64_t aT, const uint64_t aBlockBas
     return Status();
 }
 
-// The placeholder metadata of ImarisWriter's example program (kept for byte parity with the
-// files written so far), then bpImageConverterC_Finish.
+// The metadata resolved by imsmeta::resolveMetadata (src/imscore.h's writeImsMeta writes the
+// same for the cluster path), then bpImageConverterC_Finish.
 void ImsWriter::writeMetadata(){
     bpConverterTypesC_ImageExtent aImageExtent = {
         0, 0, 0,
@@ -447,22 +450,30 @@ void ImsWriter::writeMetadata(){
     vImageSection->mValuesCount = 1;
     vImageSection->mValues = &vUnitParameter;
 
-    std::vector<std::string> vChannelNames(mImageSize.mValueC);
-    unsigned int vNumberOfParametersPerChannel = 3;
-    std::vector<bpConverterTypesC_Parameter> vChannelParameters(mImageSize.mValueC * vNumberOfParametersPerChannel);
+    // Name, and the wavelengths that were given (ImarisWriter adds Description and the colors).
+    std::vector<std::string> vSectionNames(mImageSize.mValueC);
+    std::vector<std::string> vTexts(2 * mImageSize.mValueC);
+    std::vector<bpConverterTypesC_Parameter> vChannelParameters(3 * mImageSize.mValueC);
     for (unsigned int vC = 0; vC < mImageSize.mValueC; ++vC) {
-        bpConverterTypesC_Parameter* vThisChannelParameters = &vChannelParameters[vNumberOfParametersPerChannel * vC];
-        vThisChannelParameters[0].mName = "Name";
-        vThisChannelParameters[0].mValue = vC == 0 ? "First channel" : vC == 1 ? "Second channel" : vC == 2 ? "Third channel" : "Other channel";
-        vThisChannelParameters[1].mName = "LSMEmissionWavelength";
-        vThisChannelParameters[1].mValue = "700";
-        vThisChannelParameters[2].mName = "OtherChannelParameter";
-        vThisChannelParameters[2].mValue = "OtherChannelValue";
+        bpConverterTypesC_Parameter* vThisChannelParameters = &vChannelParameters[3 * vC];
+        unsigned int vCount = 0;
+        vThisChannelParameters[vCount].mName = "Name";
+        vThisChannelParameters[vCount++].mValue = mMetadata.names[vC].c_str();
+        if (mMetadata.emission[vC] > 0) {
+            vTexts[2 * vC] = imsmeta::wavelengthString(mMetadata.emission[vC]);
+            vThisChannelParameters[vCount].mName = "LSMEmissionWavelength";
+            vThisChannelParameters[vCount++].mValue = vTexts[2 * vC].c_str();
+        }
+        if (mMetadata.excitation[vC] > 0) {
+            vTexts[2 * vC + 1] = imsmeta::wavelengthString(mMetadata.excitation[vC]);
+            vThisChannelParameters[vCount].mName = "LSMExcitationWavelength";
+            vThisChannelParameters[vCount++].mValue = vTexts[2 * vC + 1].c_str();
+        }
         bpConverterTypesC_ParameterSection* vChannelSection = &vParameterSections[vNumberOfOtherSections + vC];
-        vChannelNames[vC] = "Channel " + std::to_string(vC);
-        vChannelSection->mName = vChannelNames[vC].c_str();
+        vSectionNames[vC] = "Channel " + std::to_string(vC);
+        vChannelSection->mName = vSectionNames[vC].c_str();
         vChannelSection->mValues = vThisChannelParameters;
-        vChannelSection->mValuesCount = vNumberOfParametersPerChannel;
+        vChannelSection->mValuesCount = vCount;
     }
 
     bpConverterTypesC_Parameters aParameters;
@@ -471,9 +482,7 @@ void ImsWriter::writeMetadata(){
 
     std::vector<bpConverterTypesC_TimeInfo> vTimeInfos(mImageSize.mValueT);
     for (unsigned int vT = 0; vT < mImageSize.mValueT; ++vT) {
-        vTimeInfos[vT].mJulianDay = 2458885; // 5 feb 2020
-        unsigned long long vSeconds = vT + 4 + 60 * (27 + 60 * 15); // 3:27.04 PM + 1 sec per time point
-        vTimeInfos[vT].mNanosecondsOfDay = vSeconds * 1000000000;
+        imsmeta::julianTime(mMetadata.times[vT], vTimeInfos[vT].mJulianDay, vTimeInfos[vT].mNanosecondsOfDay);
     }
     bpConverterTypesC_TimeInfos aTimeInfoPerTimePoint;
     aTimeInfoPerTimePoint.mValuesCount = mImageSize.mValueT;
@@ -483,9 +492,9 @@ void ImsWriter::writeMetadata(){
     for (unsigned int vC = 0; vC < mImageSize.mValueC; ++vC) {
         bpConverterTypesC_ColorInfo* vColor = &vColorInfos[vC];
         vColor->mIsBaseColorMode = true;
-        vColor->mBaseColor.mRed = (vC % 3) == 0 ? 1 : 0;
-        vColor->mBaseColor.mGreen = (vC % 3) == 1 ? 1 : 0;
-        vColor->mBaseColor.mBlue = (vC % 3) == 2 ? 1 : 0;
+        vColor->mBaseColor.mRed = mMetadata.colors[vC].red;
+        vColor->mBaseColor.mGreen = mMetadata.colors[vC].green;
+        vColor->mBaseColor.mBlue = mMetadata.colors[vC].blue;
         vColor->mBaseColor.mAlpha = 1;
         vColor->mColorTable = NULL;
         vColor->mColorTableSize = 0;
@@ -521,6 +530,11 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     const bool vTiff = aOptions.reader == "tiff";
     const uint64_t channels = aOptions.files.size();
     const uint64_t timepoints = aOptions.files[0].size();
+
+    // The metadata first: a bad metadata option fails before any input is read.
+    imsmeta::Metadata vMetadata;
+    const std::string vMetadataError = imsmeta::resolveMetadata(aOptions, vMetadata);
+    if(!vMetadataError.empty()) return Status(Code::InvalidArgument, vMetadataError);
 
     uint64_t vShape[3] = {0, 0, 0};
     uint64_t vChunks[3] = {0, 0, 0};
@@ -582,7 +596,7 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     };
 
     ImsWriter vWriter(aCallbacks);
-    vStatus = vWriter.open(bits, aImageSize, aBlockSize, aOptions.voxelSize, aOptions.outputFile);
+    vStatus = vWriter.open(bits, aImageSize, aBlockSize, aOptions.voxelSize, vMetadata, aOptions.outputFile);
     if(!vStatus.ok()) return vStatus;
 
     const uint64_t vNBlocksX = numBlocks(aImageSize.mValueX, aBlockSize.mValueX);

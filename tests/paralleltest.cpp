@@ -15,6 +15,13 @@
 // per-channel DataSetInfo (color, auto-adjusted ColorRange, name). Same determinism argument as
 // blocktest.cpp; here the two producers are the parallel scatter/gather and the
 // monolithic writer.
+// Metadata (A-10): every /DataSetInfo attribute of both outputs is checked against the
+// expected values (channel names = the patterns, R/G colors, the first input's modification
+// time), and a second, smaller 2-channel x 2-timepoint run passes the metadata options
+// (names, colors, wavelengths, start time; times from "<n>msecAbs" stamps in the file
+// names) to both the converter and `setup`: monitor's output must equal the converter's in
+// data and every attribute, combineone's part carries its own timepoint's time, and
+// linkparts' link file the manifest's names, colors, wavelengths and times.
 //   usage: parallelTest <path-to-parallelimariswriter> [workdir]
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +31,8 @@
 #include <vector>
 #include <filesystem>
 #include <fstream>
+#include <ctime>
+#include <sys/stat.h>
 
 #include "zarr.h"                // cpp-zarr (also pulls in nlohmann::json)
 #include "parallelwritezarr.h"
@@ -57,8 +66,9 @@ static int runCmd(std::string cmd){
     return std::system(cmd.c_str());
 }
 
-static void writeZarr(const fs::path& path, const std::vector<uint16_t>& buf){
-    std::vector<uint64_t> shape={X,Y,Z}, chunks={32,32,32};
+static void writeZarr(const fs::path& path, const std::vector<uint16_t>& buf,
+                      const std::vector<uint64_t>& shape = {X,Y,Z}){
+    std::vector<uint64_t> chunks={32,32,32};
     zarr Zw;
     Zw.set_fileName(path.string());
     Zw.set_cname("zstd"); Zw.set_clevel(5); Zw.set_order("F");
@@ -177,6 +187,90 @@ static bool failureCases(const std::string& exe, const fs::path& work, const fs:
     return ok;
 }
 
+// --- metadata (A-10) ---
+static std::string localStamp(const fs::path& p){      // modification time, local, via strftime
+    struct stat st;
+    if(stat(fs::path(p).make_preferred().string().c_str(), &st) != 0) return "<no mtime>";
+    const time_t t = st.st_mtime;
+    const struct tm* lt = std::localtime(&t);
+    char b[64];
+    if(!lt || !std::strftime(b, sizeof b, "%Y-%m-%d %H:%M:%S", lt)) return "<bad mtime>";
+    return b;
+}
+static bool metaOk(const fs::path& ims, const ImsExpectedMeta& e, const char* what){
+    std::vector<std::string> problems;
+    bool ok = imsCheckDataSetInfo(ims, e, problems);
+    for(size_t i = 0; i < problems.size() && i < 20; ++i) std::printf("    %s\n", problems[i].c_str());
+    std::printf("  %s: %s\n", ok ? "ok" : "FAIL", what);
+    return ok;
+}
+static ImsExpectedMeta expectedMeta(uint64_t x, uint64_t y, uint64_t z){
+    ImsExpectedMeta e; e.size[0] = x; e.size[1] = y; e.size[2] = z; e.version = PIW_VERSION; return e;
+}
+static bool runAllWorkers(const std::string& exe, const fs::path& wd){
+    int nC = 0, nT = 0; std::vector<long> jobsPerLevel;
+    if(!readManifest(wd/"manifest.json", nC, nT, jobsPerLevel)) return false;
+    for(size_t r=0; r<jobsPerLevel.size(); ++r)
+        for(long i=0; i<jobsPerLevel[r]; ++i)
+            if(runCmd(q(exe)+" worker "+q(wd)+" "+std::to_string(r)+" "+std::to_string(i)) != 0){
+                std::printf("  FAIL: worker level %zu index %ld\n", r, i); return false; }
+    return true;
+}
+// 2 channels x 2 timepoints with the metadata options on both paths.
+static bool metadataCase(const std::string& exe, const fs::path& work){
+    std::printf("[metadata] converter and cluster path with the metadata options\n");
+    const std::vector<uint64_t> shape = {37, 29, 23};
+    fs::path zd = work/"meta_zarr"; fs::create_directories(zd);
+    const char* names[2][2] = {{"Scan_Iter_0000_CamA_ch0_0000000msec_0000100000msecAbs.zarr", "Scan_Iter_0001_CamA_ch0_0003500msec_0000103500msecAbs.zarr"},
+                               {"Scan_Iter_0000_CamB_ch1_0000010msec_0000100010msecAbs.zarr", "Scan_Iter_0001_CamB_ch1_0003510msec_0000103510msecAbs.zarr"}};
+    for(int c = 0; c < 2; ++c) for(int t = 0; t < 2; ++t){
+        std::vector<uint16_t> v(shape[0]*shape[1]*shape[2]);
+        for(size_t i = 0; i < v.size(); ++i) v[i] = (uint16_t)((i*31 + c*977 + t*313) % 3001 + 1);
+        writeZarr(zd/names[c][t], v, shape);
+    }
+    const std::string flags = " --channel-names GFP,RFP --colors cyan,FF8000 --emission 525,610 --excitation 488,0"
+                              " --start-time \"2026-12-31 23:59:58.500\"";
+    fs::path md = work/"meta_mono"; fs::create_directories(md);
+    if(runCmd(q(exe)+" -P CamA,CamB -F "+q(zd)+" -o "+q(md)+" -r zarr -v 0.5,0.5,2"+flags) != 0){ std::printf("  FAIL: converter\n"); return false; }
+    fs::path wd = work/"meta_par";
+    if(runCmd(q(exe)+" setup "+q(zd)+" CamA,CamB "+q(wd)+" 64,64,64 0.5,0.5,2"+flags) != 0){ std::printf("  FAIL: setup\n"); return false; }
+    if(!runAllWorkers(exe, wd)) return false;
+    const fs::path par = work/"meta_par.ims";
+    if(runCmd(q(exe)+" monitor "+q(wd)+" "+q(par)) != 0){ std::printf("  FAIL: monitor\n"); return false; }
+
+    ImsExpectedMeta e = expectedMeta(37, 29, 23);
+    e.voxel[0] = 0.5f; e.voxel[1] = 0.5f; e.voxel[2] = 2.f;
+    e.names = {"GFP", "RFP"};
+    e.colors = {"0.000 1.000 1.000", "1.000 0.502 0.000"};
+    e.emission = {"525", "610"}; e.excitation = {"488", ""};
+    e.times = {"2026-12-31 23:59:58.500", "2027-01-01 00:00:02"};   // CamA's stamps: +3.5 s
+    bool ok = metaOk(md/"output.ims", e, "converter: every DataSetInfo attribute");
+    ok &= metaOk(par, e, "monitor: every DataSetInfo attribute");
+    ImsCompareOptions opt; opt.thumbnail = false;
+    ImsCompareReport report;
+    const bool same = imsCompare(md/"output.ims", par, report, opt);
+    imsPrintReport(report);
+    std::printf("  %s: monitor's output equals the converter's (data and every attribute)\n", same ? "ok" : "FAIL");
+    ok &= same;
+
+    // combineone (t=1, c=1): one channel, one timepoint, with that timepoint's time
+    const fs::path one = work/"meta_one.ims";
+    if(runCmd(q(exe)+" combineone "+q(wd)+" 1 1 "+q(one)) != 0){ std::printf("  FAIL: combineone\n"); return false; }
+    ImsExpectedMeta e1 = e;
+    e1.names = {"RFP"}; e1.colors = {e.colors[1]}; e1.emission = {e.emission[1]}; e1.excitation = {e.excitation[1]}; e1.times = {e.times[1]};
+    ok &= metaOk(one, e1, "combineone: the channel's and the timepoint's metadata");
+
+    // linkparts over parts that are copies of the converter's output: the manifest's metadata
+    fs::path lp = work/"meta_link"; std::error_code ec; fs::create_directories(lp/"parts", ec);
+    for(int t = 0; t < 2; ++t) for(int c = 0; c < 2; ++c){
+        copyFile(md/"output.ims", lp/"parts"/("part_t"+std::to_string(t)+"_c"+std::to_string(c)+".ims"), ec);
+        if(!fsOk("copy a part", ec)) return false;
+    }
+    if(runCmd(q(exe)+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts") != 0){ std::printf("  FAIL: linkparts\n"); return false; }
+    ok &= metaOk(lp/"link.ims", e, "linkparts: every DataSetInfo attribute");
+    return ok;
+}
+
 int main(int argc, char** argv){
     std::setvbuf(stdout, nullptr, _IONBF, 0);   // nothing lost if the test dies
     if(argc < 2){ std::fprintf(stderr, "usage: %s <parallelimariswriter> [workdir]\n", argv[0]); return 2; }
@@ -226,8 +320,16 @@ int main(int argc, char** argv){
     ImsCompareReport report;
     bool same = imsCompare(monoDir/"output.ims", parIms, report, opt);
     imsPrintReport(report);
+    ImsExpectedMeta meta = expectedMeta(X, Y, Z);
+    meta.names = {"CamA", "CamB"};
+    meta.colors = {"1.000 0.000 0.000", "0.000 1.000 0.000"};
+    meta.times = {localStamp(zdir/"CamA_t0000.zarr")};
+    std::printf("[metadata] defaults (first input's modification time %s)\n", meta.times[0].c_str());
+    bool metaSame = metaOk(monoDir/"output.ims", meta, "converter: every DataSetInfo attribute");
+    metaSame &= metaOk(parIms, meta, "monitor: every DataSetInfo attribute");
+    metaSame &= metadataCase(exe, work);
     bool failOk = failureCases(exe, work, wd, monoDir/"output.ims");
-    if(same && failOk){
+    if(same && metaSame && failOk){
         std::printf("paralleltest PASSED (parallel scatter/gather == monolithic, %d channels)\n", nC); return 0; }
     std::printf("paralleltest FAILED\n"); return 1;
 }

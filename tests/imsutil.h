@@ -16,7 +16,9 @@
 //                                              map (t,c) of a to (t,c) of b
 //   imsDeepCheck(file, report[, threads])   -> true if every chunk decodes and every
 //                                              stored histogram matches the decoded data
-//   imsReadAttribute / imsReadHistogram / imsExists  -> small accessors for checks
+//   imsReadAttribute(s) / imsReadHistogram / imsExists  -> small accessors for checks
+//   imsCheckDataSetInfo(file, expected, problems) -> every /DataSetInfo attribute against
+//                                              the expected metadata
 //
 // Portable (Linux, macOS, Windows): std::thread and std::ifstream only, no pread or
 // OpenMP. Chunks are listed with one H5Dchunk_iter pass per dataset, never with
@@ -34,10 +36,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -455,6 +459,23 @@ inline std::optional<std::string> imsReadAttribute(const std::filesystem::path& 
     AttrValue v;
     if(!o.valid() || H5Aexists(o, name.c_str()) <= 0 || !readAttr(o, name, v)) return std::nullopt;
     return v.text();
+}
+
+// Every attribute of one object as text, by name (empty if the object is missing), e.g. the
+// whole of "/DataSetInfo/Channel 0".
+inline std::map<std::string, std::string> imsReadAttributes(const std::filesystem::path& file, const std::string& objectPath){
+    using namespace imsutil;
+    QuietErrors quiet;
+    std::map<std::string, std::string> all;
+    Hid f = openFile(file);
+    if(!f.valid() || !exists(f, objectPath)) return all;
+    Hid o(H5Oopen(f, objectPath.c_str(), H5P_DEFAULT), H5Oclose);
+    if(!o.valid()) return all;
+    for(const std::string& n : attrNames(o)){
+        AttrValue v;
+        all[n] = readAttr(o, n, v) ? v.text() : std::string("<unreadable>");
+    }
+    return all;
 }
 
 // A histogram dataset ("Histogram" or "Histogram1024") of one level/timepoint/channel.
@@ -959,4 +980,79 @@ inline void imsPrintReport(const ImsCompareReport& r, FILE* out = stdout, size_t
                           r.identical() ? "identical" : r.identicalExceptThumbnail() ? "identical except /Thumbnail" : "DIFFERENT";
     std::fprintf(out, "  %s: %d Data datasets, %llu chunks, %llu compressed bytes %s\n", verdict, r.datasets,
                  (unsigned long long)r.chunks, (unsigned long long)r.bytes, deep ? "decoded" : "compared");
+}
+
+// ------------------------------------------------------------------------------------
+// The metadata of a file
+// ------------------------------------------------------------------------------------
+
+// What /DataSetInfo should hold. Strings are the attribute texts; an empty wavelength means
+// the attribute must be absent.
+struct ImsExpectedMeta {
+    uint64_t size[3] = {0, 0, 0};                       // X, Y, Z
+    float voxel[3] = {1, 1, 1};
+    std::vector<std::string> names, colors, emission, excitation;   // per channel
+    std::vector<std::string> times;                     // per time point
+    std::string creator = "parallelimariswriter", version;
+};
+
+// Checks every attribute of the root and of every /DataSetInfo group: the set of names
+// exactly, and every value (ColorRange only for its "<min> <max>" form; it is computed
+// from the data). Appends one line per problem; true if there is none.
+inline bool imsCheckDataSetInfo(const std::filesystem::path& file, const ImsExpectedMeta& e, std::vector<std::string>& problems){
+    using namespace imsutil;
+    const size_t before = problems.size();
+    auto fixed = [](float v, int p){ std::ostringstream o; o.setf(std::ios::fixed); o << std::setprecision(p) << v; return o.str(); };
+    auto expect = [&](const std::string& group, const std::map<std::string, std::string>& want, const std::set<std::string>& anyValue){
+        const std::map<std::string, std::string> got = imsReadAttributes(file, group);
+        for(const auto& w : want){
+            auto g = got.find(w.first);
+            if(g == got.end()) problems.push_back(group + " " + w.first + ": missing (expected \"" + w.second + "\")");
+            else if(!anyValue.count(w.first) && g->second != w.second)
+                problems.push_back(group + " " + w.first + ": \"" + g->second + "\", expected \"" + w.second + "\"");
+        }
+        for(const auto& g : got) if(!want.count(g.first)) problems.push_back(group + " " + g.first + ": unexpected (\"" + g.second + "\")");
+    };
+    {
+        QuietErrors quiet;
+        Hid f = openFile(file);
+        if(!f.valid()){ problems.push_back("cannot open " + file.string()); return false; }
+        std::vector<std::string> groups = childNames(f, "/DataSetInfo"), want = {"Image", "ImarisDataSet", "Log", "TimeInfo"};
+        for(size_t c = 0; c < e.names.size(); ++c) want.push_back("Channel " + std::to_string(c));
+        std::sort(want.begin(), want.end());
+        if(groups != want){
+            std::string g; for(const std::string& n : groups) g += " [" + n + "]";
+            problems.push_back("/DataSetInfo groups:" + g);
+        }
+    }
+    expect("/", {{"ImarisDataSet", "ImarisDataSet"}, {"ImarisVersion", "5.5.0"}, {"DataSetInfoDirectoryName", "DataSetInfo"},
+                 {"ThumbnailDirectoryName", "Thumbnail"}, {"DataSetDirectoryName", "DataSet"}, {"NumberOfDataSets", ""}},
+           {"NumberOfDataSets"});
+    std::map<std::string, std::string> image = {{"Name", "(name not specified)"}, {"Description", "(description not specified)"}, {"Unit", "um"},
+        {"ResampleDimensionX", "true"}, {"ResampleDimensionY", "true"}, {"ResampleDimensionZ", "true"},
+        {"RecordingDate", e.times.empty() ? std::string() : e.times[0]}};
+    for(int a = 0; a < 3; ++a){
+        image["ExtMin" + std::to_string(a)] = fixed(0.f, 9);
+        image["ExtMax" + std::to_string(a)] = fixed((float)e.size[a] * e.voxel[a], 9);
+        image[std::string(1, (char)('X' + a))] = std::to_string(e.size[a]);
+    }
+    expect("/DataSetInfo/Image", image, {});
+    for(size_t c = 0; c < e.names.size(); ++c){
+        std::map<std::string, std::string> ch = {{"Name", e.names[c]}, {"Description", "(description not specified)"}, {"ColorMode", "BaseColor"},
+            {"Color", e.colors[c]}, {"ColorRange", ""}, {"ColorOpacity", "0.000"}, {"GammaCorrection", "1.000"}};
+        if(c < e.emission.size() && !e.emission[c].empty()) ch["LSMEmissionWavelength"] = e.emission[c];
+        if(c < e.excitation.size() && !e.excitation[c].empty()) ch["LSMExcitationWavelength"] = e.excitation[c];
+        const std::string g = "/DataSetInfo/Channel " + std::to_string(c);
+        expect(g, ch, {"ColorRange"});
+        const std::string range = imsReadAttribute(file, g, "ColorRange").value_or("");
+        float lo = 0, hi = 0; char rest = 0;
+        if(std::sscanf(range.c_str(), "%f %f%c", &lo, &hi, &rest) != 2 || !(lo <= hi))
+            problems.push_back(g + " ColorRange: \"" + range + "\" is not \"<min> <max>\"");
+    }
+    std::map<std::string, std::string> ti = {{"FileTimePoints", std::to_string(e.times.size())}, {"DatasetTimePoints", std::to_string(e.times.size())}};
+    for(size_t t = 0; t < e.times.size(); ++t) ti["TimePoint" + std::to_string(t + 1)] = e.times[t];
+    expect("/DataSetInfo/TimeInfo", ti, {});
+    expect("/DataSetInfo/ImarisDataSet", {{"NumberOfImages", "1"}, {"Creator", e.creator}, {"Version", e.version}}, {});
+    expect("/DataSetInfo/Log", {{"Entries", "0"}}, {});
+    return problems.size() == before;
 }

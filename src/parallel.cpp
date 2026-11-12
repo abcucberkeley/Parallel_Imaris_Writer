@@ -164,7 +164,7 @@ static int doCombine(const Manifest& m,const std::string& wd,const std::string& 
     std::string cd=wd+"/chunks"; int nT=m.nT, nC=m.nC, nR=(int)m.lev.size();
     hid_t out=imsCreate(outPath); if(out<0) return fail("cannot create "+outPath+" (HDF5 error above)");
     hid_t lcpl=H5Pcreate(H5P_LINK_CREATE); H5Pset_create_intermediate_group(lcpl,1);
-    Status s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT),nT);
+    Status s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT));
     hid_t dtype=imsDtype(m.elem);
     // parallel-read each (r,t,c)'s tile .pack files across threads; single writer does H5Dwrite_chunk
     for(int r=0;r<nR&&s.ok();r++) for(int t=0;t<nT&&s.ok();t++) for(int c=0;c<nC&&s.ok();c++) s=writeOneDataset(out,m,cd,lcpl,dtype,r,t,c,t,c);
@@ -183,7 +183,7 @@ static int combineOne(const std::string& wd,int T,int C,const std::string& outPa
     if(T<0||T>=m.nT||C<0||C>=m.nC){ fprintf(stderr,"(t=%d,c=%d) out of range (nT=%d,nC=%d)\n",T,C,m.nT,m.nC); return 1; }
     hid_t out=imsCreate(outPath); if(out<0){ fprintf(stderr,"cannot create %s\n",outPath.c_str()); return 1; }
     hid_t lcpl=H5Pcreate(H5P_LINK_CREATE); H5Pset_create_intermediate_group(lcpl,1);
-    s=writeImsMeta(out,m,cd,lcpl,std::vector<int>{C},std::vector<int>{T},1);
+    s=writeImsMeta(out,m,cd,lcpl,std::vector<int>{C},std::vector<int>{T});
     hid_t dtype=imsDtype(m.elem);
     for(int r=0;r<nR&&s.ok();r++) s=writeOneDataset(out,m,cd,lcpl,dtype,r,T,C,0,0);
     H5Tclose(dtype); H5Pclose(lcpl);
@@ -228,7 +228,7 @@ static int buildLink(const std::string& wd,const std::string& outPath,const std:
     s=checkParts(partDir,nT,nC,want); if(!s.ok()) return fail(s.message+" (run combineone for every (t,c) first)");
     hid_t out=imsCreate(outPath); if(out<0){ fprintf(stderr,"cannot create %s\n",outPath.c_str()); return 1; }
     hid_t lcpl=H5Pcreate(H5P_LINK_CREATE); H5Pset_create_intermediate_group(lcpl,1);
-    s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT),nT);
+    s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT));
     int made=0,failed=0;
     for(int r=0;r<nR&&s.ok();r++)for(int t=0;t<nT;t++)for(int c=0;c<nC;c++){
         std::string linkPath="/DataSet/ResolutionLevel "+std::to_string(r)+"/TimePoint "+std::to_string(t)+"/Channel "+std::to_string(c);
@@ -278,15 +278,14 @@ static int linkParts(const std::string& wd,const std::string& outPath,const std:
         if(H5Lexists(out,dst.c_str(),H5P_DEFAULT)>0) H5Ldelete(out,dst.c_str(),H5P_DEFAULT);
         if(H5Ocopy(out,"DataSetInfo/Channel 0",out,dst.c_str(),H5P_DEFAULT,lcpl)<0){ fprintf(stderr,"channel %d template copy failed\n",c); failed++; } }
     for(int c=0;ok&&c<nC;c++){ std::string gp="DataSetInfo/Channel "+std::to_string(c); if(H5Lexists(out,gp.c_str(),H5P_DEFAULT)<=0) continue;
-        hid_t g=H5Gopen2(out,gp.c_str(),H5P_DEFAULT);                        // per-channel color/name/range
-        ok&=setStrAttrOW(g,"Color",imsChannelColor(c)); ok&=setStrAttrOW(g,"Name",imsChannelName(c));
+        hid_t g=H5Gopen2(out,gp.c_str(),H5P_DEFAULT);                        // per-channel name/wavelengths/color/range
+        ok&=setChannelMeta(g,m.meta,c);
         std::string cr=partColorRange(partDir,c); if(!cr.empty()) ok&=setStrAttrOW(g,"ColorRange",cr);
         H5Gclose(g); }
     if(ok&&H5Lexists(out,"DataSetInfo/TimeInfo",H5P_DEFAULT)>0) ok&=H5Ldelete(out,"DataSetInfo/TimeInfo",H5P_DEFAULT)>=0;  // rebuild TimeInfo for nT (part had 1)
-    if(ok){ hid_t ti=H5Gcreate2(out,"DataSetInfo/TimeInfo",lcpl,H5P_DEFAULT,H5P_DEFAULT); ok&=ti>=0;
-      if(ti>=0){ ok&=setStrAttr(ti,"FileTimePoints",std::to_string(nT)); ok&=setStrAttr(ti,"DatasetTimePoints",std::to_string(nT));
-        for(int t=0;t<nT;t++) ok&=setStrAttr(ti,("TimePoint"+std::to_string(t+1)).c_str(),fmtTime(55624+t));
-        H5Gclose(ti); } }
+    if(ok) ok&=writeTimeInfo(out,m.meta,lcpl,iota0(nT));                   // the manifest's time stamps, as the converter writes them
+    if(ok&&h5PathExists(out,"/DataSetInfo/Image")){ hid_t g=H5Gopen2(out,"DataSetInfo/Image",H5P_DEFAULT);
+        ok&=g>=0&&setStrAttrOW(g,"RecordingDate",imsmeta::timeString(m.meta.times[0])); if(g>=0) H5Gclose(g); }
     if(ok){ hid_t g=H5Gcreate2(out,"DataSet",lcpl,H5P_DEFAULT,H5P_DEFAULT); ok&=g>=0; if(g>=0) H5Gclose(g); }
     int made=0;
     for(int r=0;ok&&r<nR;r++)for(int t=0;t<nT;t++)for(int c=0;c<nC;c++){
@@ -345,6 +344,15 @@ static std::vector<std::string> listZarrs(const std::string& folder,const std::s
 }
 static int doSetup(int argc,char** argv){
     std::string folder=argv[2],patterns=argv[3],wd=argv[4];
+    // [vx,vy,vz] then the converter's metadata options (--name value or --name=value)
+    int argi=6; const char* voxArg=NULL; if(argc>6&&strncmp(argv[6],"--",2)!=0){ voxArg=argv[6]; argi=7; }
+    piw::ConvertOptions mo;
+    for(;argi<argc;argi++){ std::string a=argv[argi], name, value;
+        if(a.compare(0,2,"--")!=0) return fail("unexpected argument '"+a+"' (setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--option value ...])");
+        size_t eq=a.find('='); name=a.substr(2,eq==std::string::npos?std::string::npos:eq-2);
+        if(!imsmeta::isMetadataOption(name)) return fail("unknown setup option --"+name);
+        if(eq!=std::string::npos) value=a.substr(eq+1); else if(argi+1<argc) value=argv[++argi]; else return fail("--"+name+" needs a value");
+        std::string e=imsmeta::parseMetadataOption(name,value,mo); if(!e.empty()) return fail(e); }
     if(wd.find_first_of("/"
 #ifdef _WIN32
         "\\:"
@@ -366,8 +374,11 @@ static int doSetup(int argc,char** argv){
     if(!m.X||!m.Y||!m.Z) return fail(zarrAt(m,0,0)+" has an empty shape");
     if(m.elem!=1&&m.elem!=2&&m.elem!=4) return fail(zarrAt(m,0,0)+" has "+std::to_string(m.elem)+"-byte voxels; only 8, 16 and 32-bit data are supported");
     m.vox[0]=m.vox[1]=m.vox[2]=0.108f;   // the single-node converter's default
-    if(argc>6&&(sscanf(argv[6],"%g,%g,%g",&m.vox[0],&m.vox[1],&m.vox[2])!=3||!(m.vox[0]>0&&m.vox[1]>0&&m.vox[2]>0&&std::isfinite(m.vox[0])&&std::isfinite(m.vox[1])&&std::isfinite(m.vox[2]))))
-        return fail(std::string("bad voxel size '")+argv[6]+"' (expected vx,vy,vz > 0)");
+    if(voxArg&&(sscanf(voxArg,"%g,%g,%g",&m.vox[0],&m.vox[1],&m.vox[2])!=3||!(m.vox[0]>0&&m.vox[1]>0&&m.vox[2]>0&&std::isfinite(m.vox[0])&&std::isfinite(m.vox[1])&&std::isfinite(m.vox[2]))))
+        return fail(std::string("bad voxel size '")+voxArg+"' (expected vx,vy,vz > 0)");
+    // the metadata, resolved as the single-node converter resolves it (channel names default to the patterns)
+    mo.files=perCh; if(mo.channelNames.empty()) mo.channelNames=pats;
+    { std::string e=imsmeta::resolveMetadata(mo,m.meta); if(!e.empty()) return fail(e); }
     bpSize chunkBytes=chunkBudgetBytes();   // only the BLOCK budget changes; the pyramid (level count) is unchanged
     m.lev=makeLevels(m.X,m.Y,m.Z,m.elem,cap,chunkBytes);
     Status s=makeDirs(wd+"/chunks"); if(!s.ok()) return fail(s);

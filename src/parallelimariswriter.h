@@ -39,6 +39,11 @@ struct Callbacks {
     void* user = nullptr;
 };
 
+// A channel's base color: red, green and blue from 0 to 1.
+struct Color {
+    float red, green, blue;
+};
+
 // X, Y, Z are the Imaris axes: (row, column, page) of a TIFF, dims (0, 1, 2) of a Zarr.
 struct ConvertOptions {
     std::string reader = "tiff";                        // "tiff" or "zarr"
@@ -50,8 +55,21 @@ struct ConvertOptions {
     bool hasBoundingBox = false;  uint64_t boundingBox[6] = {0, 0, 0, 0, 0, 0}; // -B: x0,y0,z0,x1,y1,z1; 0-based, end excluded
     bool hasProcessBlock = false; uint64_t processBlock[3] = {0, 0, 0};       // -C, voxels
     int numThreads = 0;                                 // 0: the calling thread's OpenMP default
-    // Metadata (channel names, colors, wavelengths, time stamps) is still the fixed placeholder
-    // set; its fields go here, with defaults that keep it.
+
+    // Metadata (/DataSetInfo). Each list is empty (the default) or has one entry per channel.
+    std::vector<std::string> channelNames;              // default "Channel 0", "Channel 1", ...; the command
+                                                        // line passes its -P patterns
+    std::vector<Color> channelColors;                   // default red, green, blue, red, green, ...
+    std::vector<float> emissionWavelengths;             // nm, LSMEmissionWavelength; a value <= 0: none written
+    std::vector<float> excitationWavelengths;           // nm, LSMExcitationWavelength; a value <= 0: none written
+    // Time stamps (local wall-clock time, millisecond resolution). Time point t is at
+    //   start + t * timeInterval                        when timeInterval > 0, else
+    //   start + (stamp[t] - stamp[0]) ms                when every file of a channel has a "<n>msecAbs"
+    //                                                   stamp in its name (the first such channel), else
+    //   start + t seconds.
+    // start = startTime, or else the modification time of files[0][0] (the first input).
+    double timeInterval = 0;                            // seconds between time points
+    std::string startTime;                              // "YYYY-MM-DD[ HH:MM[:SS[.mmm]]]" ('T' also separates)
 };
 
 // The command line's input selection: in every folder, in the given order, the entries whose

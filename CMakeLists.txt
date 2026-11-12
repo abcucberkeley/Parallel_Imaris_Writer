@@ -335,6 +335,7 @@ if(PIW_BUILD_TESTS)
         set(tgt ${name}Test)
         add_executable(${tgt} ${source})
         set_target_properties(${tgt} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+        target_compile_definitions(${tgt} PRIVATE PIW_VERSION="${PROJECT_VERSION}")   # the expected ImarisDataSet Version
         # cpp-tiff before cpp-zarr: both ship a helperfunctions.h (see the executable).
         target_include_directories(${tgt} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/tests

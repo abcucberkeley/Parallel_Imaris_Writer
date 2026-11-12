@@ -46,21 +46,44 @@ std::string finishedPath(const std::string& wd){ return monoDir(wd)+"/finished";
 double seconds(){ return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 int threadsOf(int n){ return n>0?n:std::max(1,piw::defaultThreads()); }
 
-// ---------------- manifest (timepoints, channels, voxel size, optional output) ----------------
-struct MonoManifest { int nT=0, nC=0; float vox[3]={0,0,0}; std::string output; };
+// ---------------- manifest (timepoints, channels, voxel size, optional output, metadata) ----------------
+struct MonoManifest { int nT=0, nC=0; float vox[3]={0,0,0}; std::string output; imsmeta::Metadata meta; };
+// The metadata of nC channels x nT timepoints for these options (imsmeta::resolveMetadata). Without input files
+// it resolves placeholders: names, colors and wavelengths as given or the defaults, time stamps 1 s apart (or
+// timeInterval) from startTime, else from the current time.
+std::string resolveMonoMetadata(piw::ConvertOptions o,int nT,int nC,imsmeta::Metadata& md){
+    if(o.files.empty()) o.files.assign((size_t)nC,std::vector<std::string>((size_t)nT));
+    bool fits=o.files.size()==(size_t)nC; for(size_t c=0;fits&&c<o.files.size();c++) fits=o.files[c].size()==(size_t)nT;
+    if(!fits) return "the input files are not "+std::to_string(nC)+" channels x "+std::to_string(nT)+" timepoints";
+    return imsmeta::resolveMetadata(o,md);
+}
 Status readMonoManifest(const std::string& wd,MonoManifest& m){
     std::string p=wd+"/manifest.json"; std::vector<uint8_t> b;
     if(!imscore::readFileBytes(p,b)) return Status(Code::NotFound,"cannot read "+p+" (run monoinit or setup first)");
+    bool hasMeta=false;
     try{
         nlohmann::json j=nlohmann::json::parse(b.begin(),b.end());
         m.nT=j.value("timepoints",0); m.nC=j.value("channels",0);
         if(!j.contains("voxel")||j["voxel"].size()!=3) return Status(Code::InvalidArgument,p+" has no voxel size");
         for(int a=0;a<3;a++) m.vox[a]=j["voxel"][a].get<float>();
         if(j.contains("output")) m.output=j["output"].get<std::string>();
+        if((hasMeta=j.contains("metadata"))){ imscore::Status ms=imscore::readMetadataJson(j["metadata"],m.nC,m.nT,m.meta);
+            if(!ms.ok()) return Status(Code::InvalidArgument,p+": "+ms.message); }
     }catch(const std::exception& e){ return Status(Code::InvalidArgument,"invalid "+p+": "+e.what()); }
     if(m.nT<1||m.nC<1) return Status(Code::InvalidArgument,p+" needs timepoints >= 1 and channels >= 1");
     for(int a=0;a<3;a++) if(!(m.vox[a]>0)||!std::isfinite(m.vox[a])) return Status(Code::InvalidArgument,p+" has a voxel size that is not > 0");
+    if(!hasMeta){ std::string e=resolveMonoMetadata(piw::ConvertOptions(),m.nT,m.nC,m.meta); if(!e.empty()) return Status(Code::InvalidArgument,p+": "+e); }
     return Status();
+}
+// Whether two resolved metadata are the same; clockStart: b's start time came from the clock (only the spacing
+// of the time stamps counts).
+bool sameMetadata(const imsmeta::Metadata& a,const imsmeta::Metadata& b,bool clockStart){
+    if(a.names!=b.names||a.emission!=b.emission||a.excitation!=b.excitation||a.colors.size()!=b.colors.size()||a.times.size()!=b.times.size()) return false;
+    for(size_t c=0;c<a.colors.size();c++)
+        if(a.colors[c].red!=b.colors[c].red||a.colors[c].green!=b.colors[c].green||a.colors[c].blue!=b.colors[c].blue) return false;
+    for(size_t t=0;t<a.times.size();t++)
+        if(clockStart?a.times[t]-a.times[0]!=b.times[t]-b.times[0]:a.times[t]!=b.times[t]) return false;
+    return true;
 }
 
 // ---------------- small POSIX helpers ----------------
@@ -385,12 +408,20 @@ Status monoInit(const MonoInitOptions& o) noexcept{
         if(o.workdir.empty()) return Status(Code::InvalidArgument,"monoinit needs a workdir");
         if(o.timepoints<1||o.channels<1) return Status(Code::InvalidArgument,"monoinit needs timepoints >= 1 and channels >= 1");
         for(int a=0;a<3;a++) if(!(o.voxelSize[a]>0)||!std::isfinite(o.voxelSize[a])) return Status(Code::InvalidArgument,"monoinit needs voxel sizes > 0");
+        // the metadata, resolved once here, as the converter resolves it (a bad option fails before anything is written)
+        piw::ConvertOptions mo; mo.files=o.files; mo.channelNames=o.channelNames; mo.channelColors=o.channelColors;
+        mo.emissionWavelengths=o.emissionWavelengths; mo.excitationWavelengths=o.excitationWavelengths; mo.timeInterval=o.timeInterval; mo.startTime=o.startTime;
+        imsmeta::Metadata md;
+        { std::string me=resolveMonoMetadata(mo,o.timepoints,o.channels,md); if(!me.empty()) return Status(Code::InvalidArgument,me); }
+        const bool metaGiven=!o.files.empty()||!o.channelNames.empty()||!o.channelColors.empty()||!o.emissionWavelengths.empty()||
+                             !o.excitationWavelengths.empty()||o.timeInterval!=0||!o.startTime.empty();
         const std::string wd=trimSlash(o.workdir), p=wd+"/manifest.json";
         imscore::Status ms=imscore::makeDirs(wd); if(!ms.ok()) return Status(Code::WriteFailed,ms.message);
         if(exists(p)){                             // keep a manifest that agrees (e.g. setup's, a superset)
             MonoManifest m; Status s=readMonoManifest(wd,m);
             bool same=s.ok()&&m.nT==o.timepoints&&m.nC==o.channels&&(o.outputFile.empty()||m.output==o.outputFile);
             for(int a=0;same&&a<3;a++) same=imscore::voxClean(m.vox[a])==imscore::voxClean(o.voxelSize[a]);
+            if(same&&metaGiven) same=sameMetadata(m.meta,md,o.files.empty()&&o.startTime.empty());
             if(same) return Status();
             return Status(Code::InvalidArgument,p+" already exists with other values"+(s.ok()?std::string():" ("+s.message+")")+"; use a new workdir");
         }
@@ -398,6 +429,7 @@ Status monoInit(const MonoInitOptions& o) noexcept{
         j["timepoints"]=o.timepoints; j["channels"]=o.channels;
         j["voxel"]={imscore::voxClean(o.voxelSize[0]),imscore::voxClean(o.voxelSize[1]),imscore::voxClean(o.voxelSize[2])};
         if(!o.outputFile.empty()) j["output"]=o.outputFile;
+        j["metadata"]=imscore::metadataJson(md);
         std::string s=j.dump(2)+"\n", e;      // a unique temporary name: tasks may all run monoinit at once
         return mono_write_atomic(p,s.data(),s.size(),&e)?Status():Status(Code::WriteFailed,e);
 #endif
@@ -674,6 +706,7 @@ Status monoFinish(const MonoFinishOptions& o,MonoFinishResult* result) noexcept{
           hid_t lcpl=H5Pcreate(H5P_LINK_CREATE); H5Pset_create_intermediate_group(lcpl,1);
           imscore::Manifest im; im.nC=nC; im.nT=nT; im.X=geo[0].size[0]; im.Y=geo[0].size[1]; im.Z=geo[0].size[2]; im.elem=2;
           for(int a=0;a<3;a++) im.vox[a]=m.vox[a];
+          im.meta=m.meta;
           std::vector<int> chs,tps; for(int c=0;c<nC;c++) chs.push_back(c); for(int t=0;t<nT;t++) tps.push_back(t);
           imscore::Status ws=imscore::writeImsRoot(f,lcpl);
           Status bs=ws.ok()?Status():Status(Code::WriteFailed,ws.message);
@@ -694,7 +727,7 @@ Status monoFinish(const MonoFinishOptions& o,MonoFinishResult* result) noexcept{
                 if(bs.ok()&&!ok) bs=Status(Code::WriteFailed,"cannot write "+gp+" (HDF5 error above)");
                 H5Gclose(g);
             } }
-          if(bs.ok()){ ws=imscore::writeImsDataSetInfo(f,im,lcpl,chs,tps,nT,histOf); if(!ws.ok()) bs=Status(Code::WriteFailed,ws.message); }
+          if(bs.ok()){ ws=imscore::writeImsDataSetInfo(f,im,lcpl,chs,tps,histOf); if(!ws.ok()) bs=Status(Code::WriteFailed,ws.message); }
           if(bs.ok()) bs=writeThumbnail(f);
           H5Pclose(lcpl);
           if(H5Fclose(f)<0&&bs.ok()) bs=Status(Code::WriteFailed,"cannot close "+partial+" (HDF5 error above)");
@@ -786,19 +819,27 @@ namespace {
 int fail(const piw::Status& s){ fprintf(stderr,"ERROR: %s\n",s.message.c_str()); return 1; }
 int usage(const char* cmd){
     fprintf(stderr,"usage: parallelimariswriter %s (see src/mono.h)\n"
-        "  monoinit   <workdir> <nT> <nC> <vx,vy,vz> [out.ims]\n"
+        "  monoinit   <workdir> <nT> <nC> <vx,vy,vz> [out.ims] [--option value ...]\n"
+        "             (the converter's metadata options: --channel-names, --colors, --emission, --excitation,\n"
+        "              --time-interval, --start-time)\n"
         "  monoplace  <workdir> <t> <c> <part.ims> [--threads N]\n"
         "  monofinish <workdir> [out.ims] [--verify] [--threads N]\n"
         "  monostatus <workdir>\n",cmd);
     return 2;
 }
 bool parseInt(const char* s,int& v){ char* e=NULL; errno=0; long r=strtol(s,&e,10); if(e==s||*e||errno||r<0||r>2147483647L) return false; v=(int)r; return true; }
-// Splits off --threads N and --verify; the rest are positional.
-bool options(int argc,char** argv,std::vector<std::string>& pos,int& threads,bool& verify,bool allowVerify){
+// Splits off --threads N, --verify and, with meta (monoinit), the metadata options (--name value or --name=value;
+// a bad value: metaError); the rest are positional.
+bool options(int argc,char** argv,std::vector<std::string>& pos,int& threads,bool& verify,bool allowVerify,
+             piw::ConvertOptions* meta,std::string& metaError){
     for(int i=2;i<argc;i++){ std::string a=argv[i];
         if(a=="--threads"){ if(i+1>=argc||!parseInt(argv[i+1],threads)||threads<1) return false; i++; }
         else if(a=="--verify"&&allowVerify) verify=true;
-        else if(a.size()>2&&a.compare(0,2,"--")==0) return false;
+        else if(a.size()>2&&a.compare(0,2,"--")==0){
+            size_t eq=a.find('='); std::string name=a.substr(2,eq==std::string::npos?std::string::npos:eq-2), value;
+            if(!meta||!imsmeta::isMetadataOption(name)) return false;
+            if(eq!=std::string::npos) value=a.substr(eq+1); else if(i+1<argc) value=argv[++i]; else return false;
+            if(metaError.empty()) metaError=imsmeta::parseMetadataOption(name,value,*meta); }
         else pos.push_back(a); }
     return true;
 }
@@ -809,10 +850,13 @@ bool isMonoCommand(const char* c){ return c&&(!strcmp(c,"monoinit")||!strcmp(c,"
 
 int runMono(int argc,char** argv){
     const std::string cmd=argc>=2?argv[1]:"";
-    std::vector<std::string> pos; int threads=0; bool verify=false;
-    if(!options(argc,argv,pos,threads,verify,cmd=="monofinish")) return usage(cmd.c_str());
+    std::vector<std::string> pos; int threads=0; bool verify=false; piw::ConvertOptions meta; std::string metaError;
+    if(!options(argc,argv,pos,threads,verify,cmd=="monofinish",cmd=="monoinit"?&meta:NULL,metaError)) return usage(cmd.c_str());
+    if(!metaError.empty()){ fprintf(stderr,"ERROR: %s\n",metaError.c_str()); return 1; }
     if(cmd=="monoinit"){
         piw::MonoInitOptions o;
+        o.channelNames=meta.channelNames; o.channelColors=meta.channelColors; o.emissionWavelengths=meta.emissionWavelengths;
+        o.excitationWavelengths=meta.excitationWavelengths; o.timeInterval=meta.timeInterval; o.startTime=meta.startTime;
         if(pos.size()<4||pos.size()>5||!parseInt(pos[1].c_str(),o.timepoints)||!parseInt(pos[2].c_str(),o.channels)) return usage("monoinit");
         char tail=0;
         if(sscanf(pos[3].c_str(),"%g,%g,%g%c",&o.voxelSize[0],&o.voxelSize[1],&o.voxelSize[2],&tail)!=3){
