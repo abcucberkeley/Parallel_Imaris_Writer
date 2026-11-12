@@ -1,34 +1,45 @@
-// Shared .ims helpers for the tests (header-only, C++17, HDF5 C library + lz4.h).
+// Shared .ims helpers for the tests and the imscompare tool (header-only, C++17, HDF5
+// C library + lz4.h).
 //
 // An Imaris 5.5 .ims file is HDF5: /DataSet/ResolutionLevel r/TimePoint t/Channel c
 // holds a chunked 3-D Data dataset (dims z,y,x) next to its Histogram datasets, and
 // /DataSetInfo holds the metadata as string attributes. ImarisWriter compresses every
 // chunk itself (byte shuffle for 2- and 4-byte integers, then LZ4 in the HDF5 lz4
 // filter format, id 32004) and writes it with H5Dwrite_chunk, so these helpers read
-// raw chunks with H5Dread_chunk and undo the filters here; no HDF5 filter plugin is
-// needed.
+// raw chunks and undo the filters here; no HDF5 filter plugin is needed.
 //
 //   imsReadVolume(file, level, t, c, info)  -> the voxels of one dataset, x fastest,
 //                                              cropped to ImageSizeX/Y/Z
 //   imsCompare(a, b, report[, options])     -> true if the two files hold the same
-//                                              chunks (compressed bytes), histograms
-//                                              and attributes
+//                                              chunks (compressed bytes), histograms,
+//                                              attributes and thumbnail; options can
+//                                              map (t,c) of a to (t,c) of b
+//   imsDeepCheck(file, report[, threads])   -> true if every chunk decodes and every
+//                                              stored histogram matches the decoded data
 //   imsReadAttribute / imsReadHistogram / imsExists  -> small accessors for checks
 //
-// Only portable calls (no pread, no OpenMP): it builds the same on Linux, macOS and
-// Windows. Chunks are listed with one H5Dchunk_iter pass per dataset, never with
+// Portable (Linux, macOS, Windows): std::thread and std::ifstream only, no pread or
+// OpenMP. Chunks are listed with one H5Dchunk_iter pass per dataset, never with
 // H5Dget_chunk_info by index (which walks the chunk index from the start each time).
+// HDF5 is called from one thread only; worker threads read chunk bytes straight from
+// the file at the addresses H5Dchunk_iter reports (absolute file offsets, user block
+// included) and compare or decode them, which needs no thread-safe HDF5 build.
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "hdf5.h"
@@ -225,14 +236,35 @@ inline bool lz4Decode(const std::vector<uint8_t>& in, std::vector<uint8_t>& out,
 inline void unshuffle(const std::vector<uint8_t>& in, std::vector<uint8_t>& out, size_t es){
     out.resize(in.size());
     size_t n = in.size() / es;
-    for(size_t b = 0; b < es; ++b)
-        for(size_t k = 0; k < n; ++k) out[k*es + b] = in[b*n + k];
+    if(es == 2){
+        const uint8_t* lo = in.data(); const uint8_t* hi = in.data() + n;
+        for(size_t k = 0; k < n; ++k){ out[2*k] = lo[k]; out[2*k + 1] = hi[k]; }
+    } else {
+        for(size_t b = 0; b < es; ++b)
+            for(size_t k = 0; k < n; ++k) out[k*es + b] = in[b*n + k];
+    }
     std::copy(in.begin() + (std::ptrdiff_t)(n*es), in.end(), out.begin() + (std::ptrdiff_t)(n*es));
 }
 
-struct Chunk { hsize_t off[3]; unsigned mask; hsize_t size; };
-inline int chunkCb(const hsize_t* off, unsigned mask, haddr_t, hsize_t size, void* ud){
-    Chunk c; c.off[0] = off[0]; c.off[1] = off[1]; c.off[2] = off[2]; c.mask = mask; c.size = size;
+// Undoes the filter pipeline fl of one raw chunk in place (a in, decoded bytes out;
+// tmp is scratch). Bit i of mask set means filter i was skipped when it was written.
+inline bool decodeChunk(std::vector<uint8_t>& a, std::vector<uint8_t>& tmp, const std::vector<Filter>& fl,
+                        unsigned mask, size_t shuffleBytes, std::string& err){
+    for(int i = (int)fl.size() - 1; i >= 0; --i){
+        if(mask & (1u << i)) continue;
+        if(fl[i].id == kFilterLZ4){
+            if(!lz4Decode(a, tmp, err)) return false;
+        } else if(fl[i].id == H5Z_FILTER_SHUFFLE){
+            if(shuffleBytes > 1) unshuffle(a, tmp, shuffleBytes); else tmp = a;
+        } else { err = "unsupported filter " + std::to_string((int)fl[i].id); return false; }
+        a.swap(tmp);
+    }
+    return true;
+}
+
+struct Chunk { hsize_t off[3]; unsigned mask; haddr_t addr; hsize_t size; };
+inline int chunkCb(const hsize_t* off, unsigned mask, haddr_t addr, hsize_t size, void* ud){
+    Chunk c; c.off[0] = off[0]; c.off[1] = off[1]; c.off[2] = off[2]; c.mask = mask; c.addr = addr; c.size = size;
     static_cast<std::vector<Chunk>*>(ud)->push_back(c);
     return 0;
 }
@@ -254,6 +286,61 @@ inline bool readRawChunk(hid_t d, const Chunk& c, std::vector<uint8_t>& buf){
 inline std::string offStr(const hsize_t* o){
     return "(z,y,x)=(" + std::to_string((unsigned long long)o[0]) + "," + std::to_string((unsigned long long)o[1]) +
            "," + std::to_string((unsigned long long)o[2]) + ")";
+}
+
+// The name of the file that holds an object (differs from the opened file when the
+// path runs through an external link, as in a link master + parts/ output).
+inline std::string fileOf(hid_t obj){
+    Hid f(H5Iget_file_id(obj), H5Fclose);
+    if(!f.valid()) return std::string();
+    ssize_t n = H5Fget_name(f, nullptr, 0);
+    if(n <= 0) return std::string();
+    std::vector<char> buf((size_t)n + 1, 0);
+    H5Fget_name(f, buf.data(), buf.size());
+    return std::string(buf.data());
+}
+
+// Reads byte ranges of files at absolute offsets; owned by one thread. Unbuffered
+// streams: chunks are large and each is read once.
+class RawReader {
+public:
+    bool read(const std::string& file, haddr_t offset, size_t n, std::vector<uint8_t>& buf){
+        buf.resize(n);
+        if(offset == HADDR_UNDEF) return false;
+        std::unique_ptr<std::ifstream>& s = files_[file];
+        if(!s){
+            s.reset(new std::ifstream());
+            s->rdbuf()->pubsetbuf(nullptr, 0);
+            s->open(std::filesystem::path(file), std::ios::binary);
+        }
+        if(!s->is_open()) return false;
+        s->clear();
+        s->seekg((std::streamoff)offset);
+        if(n) s->read(reinterpret_cast<char*>(buf.data()), (std::streamsize)n);
+        return !s->fail() && (size_t)s->gcount() == n;
+    }
+    void close(){ files_.clear(); }
+private:
+    std::map<std::string, std::unique_ptr<std::ifstream>> files_;
+};
+
+// Runs fn(i, reader, thread) for every i in [0, n) on up to readers.size() threads
+// (one reader each), handing out indices in small runs in increasing order.
+template<class Fn> inline void parallelFor(size_t n, std::vector<RawReader>& readers, Fn&& fn){
+    const size_t batch = 8;
+    size_t nt = std::max<size_t>(1, std::min(readers.size(), (n + batch - 1) / batch));
+    std::atomic<size_t> next(0);
+    auto work = [&](size_t t){
+        for(;;){
+            size_t b = next.fetch_add(batch);
+            if(b >= n) return;
+            for(size_t i = b; i < std::min(n, b + batch); ++i) fn(i, readers[t], t);
+        }
+    };
+    std::vector<std::thread> pool;
+    for(size_t t = 1; t < nt; ++t) pool.emplace_back(work, t);
+    work(0);
+    for(std::thread& th : pool) th.join();
 }
 
 inline uint64_t parseU64(const std::string& s){ return std::strtoull(s.c_str(), nullptr, 10); }
@@ -328,18 +415,9 @@ inline std::vector<uint8_t> imsReadVolume(const std::filesystem::path& file, int
     std::vector<uint8_t> raw, a, b;
     for(const Chunk& c : chunks){
         if(!readRawChunk(d, c, raw)){ info.error = gp + ": cannot read chunk " + offStr(c.off); vol.clear(); return vol; }
-        // Undo the pipeline in reverse; bit i of the mask set means filter i was skipped.
         a.swap(raw);
-        for(int i = (int)fl.size() - 1; i >= 0; --i){
-            if(c.mask & (1u << i)) continue;
-            std::string err;
-            if(fl[i].id == kFilterLZ4){
-                if(!lz4Decode(a, b, err)){ info.error = gp + " chunk " + offStr(c.off) + ": " + err; vol.clear(); return vol; }
-            } else {
-                if(shuffleBytes > 1) unshuffle(a, b, shuffleBytes); else b = a;
-            }
-            a.swap(b);
-        }
+        std::string err;
+        if(!decodeChunk(a, b, fl, c.mask, shuffleBytes, err)){ info.error = gp + " chunk " + offStr(c.off) + ": " + err; vol.clear(); return vol; }
         if(a.size() != chunkBytes){
             info.error = gp + " chunk " + offStr(c.off) + ": " + std::to_string(a.size()) + " bytes decoded, " +
                          std::to_string(chunkBytes) + " expected";
@@ -401,135 +479,224 @@ inline std::vector<uint64_t> imsReadHistogram(const std::filesystem::path& file,
 // Comparing two files
 // ------------------------------------------------------------------------------------
 
+// Compare /DataSet/ResolutionLevel r/TimePoint tA/Channel cA of file a with
+// /DataSet/ResolutionLevel r/TimePoint tB/Channel cB of file b, for every level r.
+struct ImsMapping { int tA = 0, cA = 0, tB = 0, cB = 0; };
+
 struct ImsCompareOptions {
     bool histograms = true;         // the datasets next to Data (Histogram, Histogram1024)
-    bool datasetAttributes = true;  // attributes of the /DataSet/.../Channel c groups (ImageSize, HistogramMin/Max)
-    bool dataSetInfo = true;        // root attributes and every /DataSetInfo group's attributes
-    bool thumbnail = true;          // /Thumbnail/Data present in both or in neither
+    bool datasetAttributes = true;  // attributes of the /DataSet groups (ImageSize, HistogramMin/Max) and of Data
+    bool dataSetInfo = true;        // the root's links and attributes and every /DataSetInfo group's attributes
+    bool thumbnail = true;          // /Thumbnail: presence, values and attributes (reported apart)
+    std::vector<ImsMapping> map;    // empty: every dataset with its namesake; else only these (see above),
+                                    // and the root, /DataSetInfo and /Thumbnail are not compared
+    int threads = 1;                // threads reading and comparing chunk bytes
 };
 
 struct ImsCompareReport {
     std::vector<std::string> differences;  // one line each, starting with the object's path
-    std::string error;                     // a file could not be opened
-    int datasets = 0;                      // Data datasets compared
-    uint64_t chunks = 0;                   // chunks compared
-    uint64_t bytes = 0;                    // compressed bytes compared
+    std::vector<std::string> thumbnail;    // /Thumbnail differences (often expected, so kept apart)
+    std::vector<std::string> notes;        // what was not compared or checked, for the summary
+    std::string error;                     // a file could not be opened or read
+    int datasets = 0;                      // Data datasets compared (or checked by imsDeepCheck)
+    uint64_t chunks = 0;                   // chunks compared (or decoded)
+    uint64_t bytes = 0;                    // compressed bytes compared per file (or decoded)
+    bool identicalExceptThumbnail() const { return error.empty() && differences.empty() && datasets > 0; }
+    bool identical() const { return identicalExceptThumbnail() && thumbnail.empty(); }
 };
 
 namespace imsutil {
 
-inline void compareAttrs(hid_t fa, hid_t fb, const std::string& path, ImsCompareReport& r){
-    Hid oa(H5Oopen(fa, path.c_str(), H5P_DEFAULT), H5Oclose), ob(H5Oopen(fb, path.c_str(), H5P_DEFAULT), H5Oclose);
-    if(!oa.valid() || !ob.valid()){ r.differences.push_back(path + ": cannot open"); return; }
+// "p" if both files use the same path, else "pa (b: pb)".
+inline std::string pairLabel(const std::string& pa, const std::string& pb){
+    return pa == pb ? pa : pa + " (b: " + pb + ")";
+}
+
+inline void compareAttrs(hid_t fa, const std::string& pa, hid_t fb, const std::string& pb,
+                         std::vector<std::string>& out){
+    const std::string lbl = pairLabel(pa, pb);
+    Hid oa(H5Oopen(fa, pa.c_str(), H5P_DEFAULT), H5Oclose), ob(H5Oopen(fb, pb.c_str(), H5P_DEFAULT), H5Oclose);
+    if(!oa.valid() || !ob.valid()){ out.push_back(lbl + ": cannot open"); return; }
     std::vector<std::string> na = attrNames(oa), nb = attrNames(ob);
     std::set<std::string> all(na.begin(), na.end());
     all.insert(nb.begin(), nb.end());
     for(const std::string& n : all){
         bool inA = std::binary_search(na.begin(), na.end(), n), inB = std::binary_search(nb.begin(), nb.end(), n);
-        if(!inA || !inB){ r.differences.push_back(path + " attribute " + n + ": only in " + (inA ? "a" : "b")); continue; }
+        if(!inA || !inB){ out.push_back(lbl + " attribute " + n + ": only in " + (inA ? "a" : "b")); continue; }
         AttrValue va, vb;
-        if(!readAttr(oa, n, va) || !readAttr(ob, n, vb)){ r.differences.push_back(path + " attribute " + n + ": unreadable"); continue; }
-        if(!(va == vb)) r.differences.push_back(path + " attribute " + n + ": a=\"" + va.text() + "\" b=\"" + vb.text() + "\"");
+        if(!readAttr(oa, n, va) || !readAttr(ob, n, vb)){ out.push_back(lbl + " attribute " + n + ": unreadable"); continue; }
+        if(!(va == vb)) out.push_back(lbl + " attribute " + n + ": a=\"" + va.text() + "\" b=\"" + vb.text() + "\"");
     }
 }
 
-inline void compareData(hid_t fa, hid_t fb, const std::string& path, ImsCompareReport& r){
-    Hid da(H5Dopen2(fa, path.c_str(), H5P_DEFAULT), H5Dclose), db(H5Dopen2(fb, path.c_str(), H5P_DEFAULT), H5Dclose);
-    if(!da.valid() || !db.valid()){ r.differences.push_back(path + ": cannot open"); return; }
+// Cross-checks the raw file read of one chunk against H5Dread_chunk, so a wrong
+// address or base offset cannot pass unnoticed.
+inline bool rawReadAgrees(hid_t d, const std::string& file, const Chunk& c, RawReader& rd){
+    std::vector<uint8_t> x, y;
+    return rd.read(file, c.addr, (size_t)c.size, x) && readRawChunk(d, c, y) && x == y;
+}
+
+inline void compareData(hid_t fa, const std::string& pa, hid_t fb, const std::string& pb,
+                        std::vector<RawReader>& readers, ImsCompareReport& r){
+    const std::string lbl = pairLabel(pa, pb);
+    Hid da(H5Dopen2(fa, pa.c_str(), H5P_DEFAULT), H5Dclose), db(H5Dopen2(fb, pb.c_str(), H5P_DEFAULT), H5Dclose);
+    if(!da.valid() || !db.valid()){ r.differences.push_back(lbl + ": cannot open"); return; }
     ++r.datasets;
     Hid ta(H5Dget_type(da), H5Tclose), tb(H5Dget_type(db), H5Tclose);
     Hid sa(H5Dget_space(da), H5Sclose), sb(H5Dget_space(db), H5Sclose);
-    Hid pa(H5Dget_create_plist(da), H5Pclose), pb(H5Dget_create_plist(db), H5Pclose);
-    if(H5Tequal(ta, tb) <= 0){ r.differences.push_back(path + ": element types differ"); return; }
-    if(H5Sget_simple_extent_ndims(sa) != 3 || H5Sget_simple_extent_ndims(sb) != 3){ r.differences.push_back(path + ": not 3-D"); return; }
+    Hid pla(H5Dget_create_plist(da), H5Pclose), plb(H5Dget_create_plist(db), H5Pclose);
+    if(H5Tequal(ta, tb) <= 0){ r.differences.push_back(lbl + ": element types differ"); return; }
+    if(H5Sget_simple_extent_ndims(sa) != 3 || H5Sget_simple_extent_ndims(sb) != 3){ r.differences.push_back(lbl + ": not 3-D"); return; }
     hsize_t dimA[3], dimB[3], cdA[3] = {0, 0, 0}, cdB[3] = {0, 0, 0};
     H5Sget_simple_extent_dims(sa, dimA, nullptr); H5Sget_simple_extent_dims(sb, dimB, nullptr);
-    if(!std::equal(dimA, dimA + 3, dimB)){ r.differences.push_back(path + ": dims a=" + offStr(dimA) + " b=" + offStr(dimB)); return; }
-    H5Pget_chunk(pa, 3, cdA); H5Pget_chunk(pb, 3, cdB);
-    if(!std::equal(cdA, cdA + 3, cdB)){ r.differences.push_back(path + ": chunk dims a=" + offStr(cdA) + " b=" + offStr(cdB)); return; }
-    std::vector<Filter> fla = filters(pa), flb = filters(pb);
+    if(!std::equal(dimA, dimA + 3, dimB)){ r.differences.push_back(lbl + ": dims a=" + offStr(dimA) + " b=" + offStr(dimB)); return; }
+    if(H5Pget_layout(pla) != H5D_CHUNKED || H5Pget_layout(plb) != H5D_CHUNKED){ r.differences.push_back(lbl + ": not chunked"); return; }
+    H5Pget_chunk(pla, 3, cdA); H5Pget_chunk(plb, 3, cdB);
+    if(!std::equal(cdA, cdA + 3, cdB)){ r.differences.push_back(lbl + ": chunk dims a=" + offStr(cdA) + " b=" + offStr(cdB)); return; }
+    std::vector<Filter> fla = filters(pla), flb = filters(plb);
     bool sameFilters = fla.size() == flb.size();
     for(size_t i = 0; sameFilters && i < fla.size(); ++i) sameFilters = fla[i].id == flb[i].id && fla[i].cd == flb[i].cd;
-    if(!sameFilters){ r.differences.push_back(path + ": filter pipelines differ"); return; }
+    if(!sameFilters){ r.differences.push_back(lbl + ": filter pipelines differ"); return; }
 
     std::vector<Chunk> ca, cb;
-    if(!listChunks(da, ca) || !listChunks(db, cb)){ r.differences.push_back(path + ": H5Dchunk_iter failed"); return; }
+    if(!listChunks(da, ca) || !listChunks(db, cb)){ r.differences.push_back(lbl + ": H5Dchunk_iter failed"); return; }
+    const std::string fileA = fileOf(da), fileB = fileOf(db);
+    if(!ca.empty() && !rawReadAgrees(da, fileA, ca[0], readers[0])){ r.error = pa + ": reading chunks at their file addresses failed"; return; }
+    if(!cb.empty() && !rawReadAgrees(db, fileB, cb[0], readers[0])){ r.error = pb + ": reading chunks at their file addresses failed"; return; }
+
+    // Walk both sorted lists together; pairs with the same size and mask get their bytes
+    // compared below. pos = position in the merged order, so "first" is by coordinate.
+    struct Pair { size_t i, j, pos; };
+    std::vector<Pair> pairs;
     uint64_t onlyA = 0, onlyB = 0, differ = 0;
-    std::string firstDiff;
-    std::vector<uint8_t> ba, bb;
-    size_t i = 0, j = 0;
-    while(i < ca.size() || j < cb.size()){
+    size_t firstPos = SIZE_MAX; std::string firstDiff;
+    auto note = [&](size_t pos, const std::string& what){ if(pos < firstPos){ firstPos = pos; firstDiff = what; } };
+    size_t i = 0, j = 0, pos = 0;
+    for(; i < ca.size() || j < cb.size(); ++pos){
         if(j == cb.size() || (i < ca.size() && chunkLess(ca[i], cb[j]))){
-            if(firstDiff.empty()) firstDiff = "chunk " + offStr(ca[i].off) + " only in a";
-            ++onlyA; ++i; continue;
+            note(pos, "chunk " + offStr(ca[i].off) + " only in a"); ++onlyA; ++i; continue;
         }
         if(i == ca.size() || chunkLess(cb[j], ca[i])){
-            if(firstDiff.empty()) firstDiff = "chunk " + offStr(cb[j].off) + " only in b";
-            ++onlyB; ++j; continue;
+            note(pos, "chunk " + offStr(cb[j].off) + " only in b"); ++onlyB; ++j; continue;
         }
-        const Chunk& x = ca[i++]; const Chunk& y = cb[j++];
-        ++r.chunks; r.bytes += x.size;
-        bool same = x.size == y.size && x.mask == y.mask && readRawChunk(da, x, ba) && readRawChunk(db, y, bb) && ba == bb;
-        if(!same){
+        const Chunk& x = ca[i]; const Chunk& y = cb[j];
+        if(x.size != y.size || x.mask != y.mask){
             ++differ;
-            if(firstDiff.empty()) firstDiff = "chunk " + offStr(x.off) + " differs (" + std::to_string((unsigned long long)x.size) +
-                                              " vs " + std::to_string((unsigned long long)y.size) + " bytes)";
-        }
+            note(pos, "chunk " + offStr(x.off) + " differs (" + std::to_string((unsigned long long)x.size) + " vs " +
+                      std::to_string((unsigned long long)y.size) + " bytes, filter mask " + std::to_string(x.mask) +
+                      " vs " + std::to_string(y.mask) + ")");
+        } else pairs.push_back(Pair{i, j, pos});
+        ++i; ++j;
     }
-    if(onlyA || onlyB || differ)
-        r.differences.push_back(path + ": " + std::to_string(ca.size()) + " vs " + std::to_string(cb.size()) + " chunks, " +
+
+    // 0 = same bytes, 1 = different bytes, 2 = a read failed.
+    std::vector<uint8_t> state(pairs.size(), 0);
+    std::vector<std::vector<uint8_t>> bufA(readers.size()), bufB(readers.size());
+    parallelFor(pairs.size(), readers, [&](size_t k, RawReader& rd, size_t t){
+        const Chunk& x = ca[pairs[k].i]; const Chunk& y = cb[pairs[k].j];
+        if(!rd.read(fileA, x.addr, (size_t)x.size, bufA[t]) || !rd.read(fileB, y.addr, (size_t)y.size, bufB[t])) state[k] = 2;
+        else if(bufA[t] != bufB[t]) state[k] = 1;
+    });
+    uint64_t unreadable = 0;
+    for(size_t k = 0; k < pairs.size(); ++k){
+        const Chunk& x = ca[pairs[k].i];
+        if(state[k] == 0){ ++r.chunks; r.bytes += x.size; continue; }
+        if(state[k] == 2){ ++unreadable; note(pairs[k].pos, "chunk " + offStr(x.off) + " could not be read"); continue; }
+        ++differ;
+        note(pairs[k].pos, "chunk " + offStr(x.off) + " differs (same size " + std::to_string((unsigned long long)x.size) +
+                           ", different bytes)");
+    }
+    if(onlyA || onlyB || differ || unreadable)
+        r.differences.push_back(lbl + ": " + std::to_string(ca.size()) + " vs " + std::to_string(cb.size()) + " chunks, " +
                                 std::to_string(differ) + " differ, " + std::to_string(onlyA) + " only in a, " +
-                                std::to_string(onlyB) + " only in b; first: " + firstDiff);
+                                std::to_string(onlyB) + " only in b" +
+                                (unreadable ? ", " + std::to_string(unreadable) + " unreadable" : std::string()) +
+                                "; first: " + firstDiff);
 }
 
-inline void compareSmallDataset(hid_t fa, hid_t fb, const std::string& path, ImsCompareReport& r){
-    Hid da(H5Dopen2(fa, path.c_str(), H5P_DEFAULT), H5Dclose), db(H5Dopen2(fb, path.c_str(), H5P_DEFAULT), H5Dclose);
+inline void compareSmallDataset(hid_t fa, const std::string& pa, hid_t fb, const std::string& pb,
+                                std::vector<std::string>& out){
+    const std::string lbl = pairLabel(pa, pb);
+    Hid da(H5Dopen2(fa, pa.c_str(), H5P_DEFAULT), H5Dclose), db(H5Dopen2(fb, pb.c_str(), H5P_DEFAULT), H5Dclose);
     std::vector<char> va, vb; size_t sa = 0, sb = 0;
     if(!da.valid() || !db.valid() || !readDatasetBytes(da, va, sa) || !readDatasetBytes(db, vb, sb)){
-        r.differences.push_back(path + ": unreadable"); return; }
-    if(sa != sb || va != vb) r.differences.push_back(path + ": values differ");
+        out.push_back(lbl + ": unreadable"); return; }
+    if(sa != sb || va.size() != vb.size()){ out.push_back(lbl + ": sizes differ (" + std::to_string(va.size() / std::max<size_t>(sa, 1)) +
+                                                          " vs " + std::to_string(vb.size() / std::max<size_t>(sb, 1)) + " values)"); return; }
+    if(va != vb){
+        size_t k = 0; while(va[k] == vb[k]) ++k;
+        out.push_back(lbl + ": values differ (first at value " + std::to_string(k / std::max<size_t>(sa, 1)) + ")");
+    }
 }
 
-// Compares the members of one /DataSet/.../Channel c group.
-inline void compareChannelGroup(hid_t fa, hid_t fb, const std::string& gp, const ImsCompareOptions& o, ImsCompareReport& r){
-    if(o.datasetAttributes) compareAttrs(fa, fb, gp, r);
-    std::vector<std::string> ma = childNames(fa, gp), mb = childNames(fb, gp);
+// Compares the members of one /DataSet/.../Channel c group of a with one of b.
+inline void compareChannelGroup(hid_t fa, const std::string& ga, hid_t fb, const std::string& gb,
+                                const ImsCompareOptions& o, std::vector<RawReader>& readers, ImsCompareReport& r){
+    if(o.datasetAttributes) compareAttrs(fa, ga, fb, gb, r.differences);
+    std::vector<std::string> ma = childNames(fa, ga), mb = childNames(fb, gb);
     std::set<std::string> all(ma.begin(), ma.end());
     all.insert(mb.begin(), mb.end());
     for(const std::string& m : all){
-        const std::string p = gp + "/" + m;
+        const std::string pa = ga + "/" + m, pb = gb + "/" + m;
         bool inA = std::binary_search(ma.begin(), ma.end(), m), inB = std::binary_search(mb.begin(), mb.end(), m);
         if(m == "Data"){
-            if(!inA || !inB) r.differences.push_back(p + ": only in " + std::string(inA ? "a" : "b"));
-            else compareData(fa, fb, p, r);
+            if(!inA || !inB){ r.differences.push_back(pairLabel(pa, pb) + ": only in " + std::string(inA ? "a" : "b")); continue; }
+            compareData(fa, pa, fb, pb, readers, r);
+            if(o.datasetAttributes) compareAttrs(fa, pa, fb, pb, r.differences);
         } else if(o.histograms){
-            if(!inA || !inB) r.differences.push_back(p + ": only in " + std::string(inA ? "a" : "b"));
-            else compareSmallDataset(fa, fb, p, r);
+            if(!inA || !inB) r.differences.push_back(pairLabel(pa, pb) + ": only in " + std::string(inA ? "a" : "b"));
+            else compareSmallDataset(fa, pa, fb, pb, r.differences);
         }
     }
 }
 
 // Walks /DataSet down to depth 3 (ResolutionLevel / TimePoint / Channel) in both files.
-inline void walkDataSet(hid_t fa, hid_t fb, const std::string& path, int depth, const ImsCompareOptions& o, ImsCompareReport& r){
-    if(depth == 3){ compareChannelGroup(fa, fb, path, o, r); return; }
+inline void walkDataSet(hid_t fa, hid_t fb, const std::string& path, int depth, const ImsCompareOptions& o,
+                        std::vector<RawReader>& readers, ImsCompareReport& r){
+    if(depth == 3){ compareChannelGroup(fa, path, fb, path, o, readers, r); return; }
+    if(o.datasetAttributes) compareAttrs(fa, path, fb, path, r.differences);
     std::vector<std::string> na = childNames(fa, path), nb = childNames(fb, path);
     std::set<std::string> all(na.begin(), na.end());
     all.insert(nb.begin(), nb.end());
     for(const std::string& n : all){
         bool inA = std::binary_search(na.begin(), na.end(), n), inB = std::binary_search(nb.begin(), nb.end(), n);
         if(!inA || !inB){ r.differences.push_back(path + "/" + n + ": only in " + (inA ? "a" : "b")); continue; }
-        walkDataSet(fa, fb, path + "/" + n, depth + 1, o, r);
+        walkDataSet(fa, fb, path + "/" + n, depth + 1, o, readers, r);
     }
+}
+
+// Every (t,c) pair of a mapping, at every resolution level either file has.
+inline void compareMapped(hid_t fa, hid_t fb, const ImsCompareOptions& o, std::vector<RawReader>& readers,
+                          ImsCompareReport& r){
+    std::vector<std::string> la = childNames(fa, "/DataSet"), lb = childNames(fb, "/DataSet");
+    std::set<std::string> levels(la.begin(), la.end());
+    levels.insert(lb.begin(), lb.end());
+    for(const ImsMapping& m : o.map){
+        bool any = false;
+        for(const std::string& lvl : levels){
+            const std::string ga = "/DataSet/" + lvl + "/TimePoint " + std::to_string(m.tA) + "/Channel " + std::to_string(m.cA);
+            const std::string gb = "/DataSet/" + lvl + "/TimePoint " + std::to_string(m.tB) + "/Channel " + std::to_string(m.cB);
+            bool ea = exists(fa, ga), eb = exists(fb, gb);
+            if(!ea && !eb) continue;
+            any = true;
+            if(ea != eb) r.differences.push_back(pairLabel(ga, gb) + ": only in " + (ea ? "a" : "b"));
+            else compareChannelGroup(fa, ga, fb, gb, o, readers, r);
+        }
+        if(!any) r.differences.push_back("timepoint " + std::to_string(m.tA) + " channel " + std::to_string(m.cA) + " of a / timepoint " +
+                                          std::to_string(m.tB) + " channel " + std::to_string(m.cB) + " of b: in neither file");
+    }
+    r.notes.push_back("only the mapped datasets were compared (not the root, /DataSetInfo or /Thumbnail)");
 }
 
 } // namespace imsutil
 
 // True if a and b hold the same data: for every /DataSet/ResolutionLevel r/TimePoint t/
-// Channel c the same chunk set with the same compressed bytes, the same Histogram /
-// Histogram1024 values and the same attributes; the same root and /DataSetInfo/*
-// attributes (Image, Channel N, TimeInfo, ImarisDataSet, ...); /Thumbnail/Data in both
-// or in neither. Options switch off the parts other than the chunks. The file layout
-// (chunk addresses, object order) is not compared. report lists every difference.
+// Channel c the same chunk set with the same compressed bytes (and sizes and filter
+// masks), the same Histogram / Histogram1024 values and the same attributes; the same
+// root links and attributes and /DataSetInfo/* attributes (Image, Channel N, TimeInfo,
+// ImarisDataSet, ...); the same /Thumbnail (its differences go to report.thumbnail).
+// Options switch off the parts other than the chunks, or map (t,c) pairs. The file
+// layout (chunk addresses, object order) is not compared. report lists every difference.
 inline bool imsCompare(const std::filesystem::path& a, const std::filesystem::path& b, ImsCompareReport& report,
                        const ImsCompareOptions& options = ImsCompareOptions()){
     using namespace imsutil;
@@ -538,33 +705,258 @@ inline bool imsCompare(const std::filesystem::path& a, const std::filesystem::pa
     Hid fa = openFile(a), fb = openFile(b);
     if(!fa.valid() || !fb.valid()){ report.error = "cannot open " + (fa.valid() ? b : a).string(); return false; }
     if(!exists(fa, "/DataSet") || !exists(fb, "/DataSet")){ report.error = "no /DataSet group"; return false; }
-    walkDataSet(fa, fb, "/DataSet", 0, options, report);
+    std::vector<RawReader> readers((size_t)std::max(1, options.threads));
+    if(!options.map.empty()){
+        compareMapped(fa, fb, options, readers, report);
+        return report.identical();
+    }
+    walkDataSet(fa, fb, "/DataSet", 0, options, readers, report);
     if(options.dataSetInfo){
-        compareAttrs(fa, fb, "/", report);
+        compareAttrs(fa, "/", fb, "/", report.differences);
+        std::vector<std::string> ra = childNames(fa, "/"), rb = childNames(fb, "/");   // /Thumbnail: see below
+        for(const std::string& n : ra) if(n != "Thumbnail" && !std::binary_search(rb.begin(), rb.end(), n)) report.differences.push_back("/" + n + ": only in a");
+        for(const std::string& n : rb) if(n != "Thumbnail" && !std::binary_search(ra.begin(), ra.end(), n)) report.differences.push_back("/" + n + ": only in b");
         std::vector<std::string> ga = childNames(fa, "/DataSetInfo"), gb = childNames(fb, "/DataSetInfo");
         std::set<std::string> all(ga.begin(), ga.end());
         all.insert(gb.begin(), gb.end());
         for(const std::string& g : all){
             bool inA = std::binary_search(ga.begin(), ga.end(), g), inB = std::binary_search(gb.begin(), gb.end(), g);
             if(!inA || !inB) report.differences.push_back("/DataSetInfo/" + g + ": only in " + (inA ? "a" : "b"));
-            else compareAttrs(fa, fb, "/DataSetInfo/" + g, report);
+            else compareAttrs(fa, "/DataSetInfo/" + g, fb, "/DataSetInfo/" + g, report.differences);
         }
-    }
+    } else report.notes.push_back("the root and /DataSetInfo were not compared");
     if(options.thumbnail){
         bool ta = exists(fa, "/Thumbnail/Data"), tb = exists(fb, "/Thumbnail/Data");
-        if(ta != tb) report.differences.push_back(std::string("/Thumbnail/Data: only in ") + (ta ? "a" : "b"));
+        if(ta != tb) report.thumbnail.push_back(std::string("/Thumbnail/Data: only in ") + (ta ? "a" : "b"));
+        else if(ta){
+            compareSmallDataset(fa, "/Thumbnail/Data", fb, "/Thumbnail/Data", report.thumbnail);
+            compareAttrs(fa, "/Thumbnail", fb, "/Thumbnail", report.thumbnail);
+            compareAttrs(fa, "/Thumbnail/Data", fb, "/Thumbnail/Data", report.thumbnail);
+        }
+    } else report.notes.push_back("/Thumbnail was not compared");
+    if(!options.histograms) report.notes.push_back("the Histogram datasets were not compared");
+    if(!options.datasetAttributes) report.notes.push_back("the /DataSet attributes (ImageSize, HistogramMin/Max) were not compared");
+    return report.identical();
+}
+
+// ------------------------------------------------------------------------------------
+// Checking one file without a reference
+// ------------------------------------------------------------------------------------
+
+namespace imsutil {
+
+inline std::string fmt3(double v){ char b[64]; std::snprintf(b, sizeof b, "%.3f", v); return b; }
+
+// The Histogram / Histogram1024 datasets and HistogramMin/Max attributes ImarisWriter
+// writes for exact integer bins (bin i = count of value i): uint8 keeps its 256 bins
+// over [0, 255]; uint16 (bpHistogramBuilder<bpUInt16>) trims trailing empty bins down to
+// a top of at least 256, resamples to at most 1024 bins (Histogram1024, written when that
+// is not 256 bins) and from that to 256 (Histogram); both start at 0.
+struct ExpectedHistogram { std::vector<uint64_t> h256, h1024; std::string min, max; };
+inline std::vector<uint64_t> resampleBins(const std::vector<uint64_t>& in, size_t n){
+    if(in.size() == n) return in;
+    std::vector<uint64_t> o(n, 0);
+    for(size_t i = 0; i < in.size(); ++i) o[(size_t)((uint64_t)i * n / in.size())] += in[i];
+    return o;
+}
+inline ExpectedHistogram expectedHistogram(const std::vector<uint64_t>& bins){
+    ExpectedHistogram e;
+    size_t top = bins.size() - 1;
+    if(bins.size() > 256) while(256 < top && bins[top] == 0) --top;
+    std::vector<uint64_t> trimmed(bins.begin(), bins.begin() + (std::ptrdiff_t)(top + 1));
+    std::vector<uint64_t> h = trimmed.size() > 1024 ? resampleBins(trimmed, 1024) : trimmed;
+    e.h256 = resampleBins(h, 256);
+    if(h.size() != 256) e.h1024 = h;
+    e.min = fmt3(0.0); e.max = fmt3((double)top);
+    return e;
+}
+
+inline void checkStoredHistogram(hid_t g, const std::string& gp, const char* name, const std::vector<uint64_t>& want,
+                                 std::vector<std::string>& out){
+    const std::string p = gp + "/" + name;
+    if(want.empty()){
+        if(H5Lexists(g, name, H5P_DEFAULT) > 0) out.push_back(p + ": present, but ImarisWriter writes none for these values");
+        return;
     }
+    if(H5Lexists(g, name, H5P_DEFAULT) <= 0){ out.push_back(p + ": missing"); return; }
+    Hid d(H5Dopen2(g, name, H5P_DEFAULT), H5Dclose);
+    Hid s(H5Dget_space(d), H5Sclose);
+    hssize_t n = d.valid() ? H5Sget_simple_extent_npoints(s) : -1;
+    std::vector<uint64_t> got(n > 0 ? (size_t)n : 0, 0);
+    if(n < 0 || (n > 0 && H5Dread(d, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, got.data()) < 0)){ out.push_back(p + ": unreadable"); return; }
+    if(got.size() != want.size()){ out.push_back(p + ": " + std::to_string(got.size()) + " bins, the decoded data gives " + std::to_string(want.size())); return; }
+    for(size_t k = 0; k < got.size(); ++k)
+        if(got[k] != want[k]){
+            out.push_back(p + ": bin " + std::to_string(k) + " holds " + std::to_string((unsigned long long)got[k]) +
+                          ", the decoded data gives " + std::to_string((unsigned long long)want[k]));
+            return;
+        }
+}
+
+inline void checkStoredAttr(hid_t g, const std::string& gp, const std::string& name, const std::string& want,
+                            std::vector<std::string>& out){
+    AttrValue v;
+    if(H5Aexists(g, name.c_str()) <= 0 || !readAttr(g, name, v)){ out.push_back(gp + " attribute " + name + ": missing"); return; }
+    if(v.text() != want) out.push_back(gp + " attribute " + name + ": \"" + v.text() + "\", the decoded data gives \"" + want + "\"");
+}
+
+// Decodes every chunk of one Data dataset, counts its voxels inside ImageSizeX/Y/Z and
+// checks them against the stored histograms.
+// countsOnly is set for types whose histograms can only be checked by their totals.
+inline void deepCheckDataset(hid_t f, const std::string& gp, std::vector<RawReader>& readers, ImsCompareReport& r,
+                             bool& countsOnly){
+    Hid g(H5Gopen2(f, gp.c_str(), H5P_DEFAULT), H5Gclose);
+    if(!g.valid() || H5Lexists(g, "Data", H5P_DEFAULT) <= 0){ r.differences.push_back(gp + "/Data: missing"); return; }
+    Hid d(H5Dopen2(g, "Data", H5P_DEFAULT), H5Dclose);
+    if(!d.valid()){ r.differences.push_back(gp + "/Data: cannot open"); return; }
+    ++r.datasets;
+    const std::string dp = gp + "/Data";
+    Hid t(H5Dget_type(d), H5Tclose), sp(H5Dget_space(d), H5Sclose), pl(H5Dget_create_plist(d), H5Pclose);
+    AttrValue ax, ay, az;
+    if(!readAttr(g, "ImageSizeX", ax) || !readAttr(g, "ImageSizeY", ay) || !readAttr(g, "ImageSizeZ", az)){
+        r.differences.push_back(gp + ": ImageSizeX/Y/Z missing"); return; }
+    const uint64_t sx = parseU64(ax.text()), sy = parseU64(ay.text()), sz = parseU64(az.text());
+    if(H5Sget_simple_extent_ndims(sp) != 3){ r.differences.push_back(dp + ": not 3-D"); return; }
+    hsize_t dims[3] = {0, 0, 0}, cd[3] = {0, 0, 0};
+    H5Sget_simple_extent_dims(sp, dims, nullptr);
+    if(H5Pget_layout(pl) != H5D_CHUNKED || H5Pget_chunk(pl, 3, cd) != 3 || !cd[0] || !cd[1] || !cd[2]){ r.differences.push_back(dp + ": not chunked"); return; }
+    if(sx > dims[2] || sy > dims[1] || sz > dims[0]){ r.differences.push_back(gp + ": ImageSize larger than the Data dims"); return; }
+    const H5T_class_t cls = H5Tget_class(t);
+    const size_t es = H5Tget_size(t);
+    const bool isU8 = cls == H5T_INTEGER && es == 1 && H5Tget_sign(t) == H5T_SGN_NONE;
+    const bool isU16 = cls == H5T_INTEGER && es == 2 && H5Tget_sign(t) == H5T_SGN_NONE;
+    const size_t nbins = isU8 ? 256 : isU16 ? 65536 : 0;   // 0: other types are only decoded and counted
+    if(!nbins) countsOnly = true;
+
+    const std::vector<Filter> fl = filters(pl);
+    size_t shuffleBytes = es;
+    for(const Filter& x : fl){
+        if(x.id == H5Z_FILTER_SHUFFLE){ if(!x.cd.empty() && x.cd[0]) shuffleBytes = x.cd[0]; }
+        else if(x.id != kFilterLZ4){ r.differences.push_back(dp + ": unsupported filter " + std::to_string((int)x.id) + ", not decoded"); return; }
+    }
+    std::vector<Chunk> chunks;
+    if(!listChunks(d, chunks)){ r.differences.push_back(dp + ": H5Dchunk_iter failed"); return; }
+    const uint64_t expected = ((sx + cd[2] - 1) / cd[2]) * ((sy + cd[1] - 1) / cd[1]) * ((sz + cd[0] - 1) / cd[0]);
+    uint64_t inside = 0;
+    for(const Chunk& c : chunks)
+        if(c.off[0] % cd[0] == 0 && c.off[1] % cd[1] == 0 && c.off[2] % cd[2] == 0 && c.off[0] < sz && c.off[1] < sy && c.off[2] < sx) ++inside;
+    if(inside != expected || chunks.size() != expected)
+        r.differences.push_back(dp + ": " + std::to_string(chunks.size()) + " chunks stored (" + std::to_string(inside) +
+                                " inside the image), " + std::to_string(expected) + " cover ImageSizeX/Y/Z");
+    const std::string file = fileOf(d);
+    if(!chunks.empty() && !rawReadAgrees(d, file, chunks[0], readers[0])){ r.error = dp + ": reading chunks at their file addresses failed"; return; }
+
+    const size_t nt = readers.size();
+    const size_t chunkBytes = (size_t)(cd[0] * cd[1] * cd[2]) * es;
+    std::vector<std::vector<uint64_t>> hist(nt, std::vector<uint64_t>(nbins, 0));
+    std::vector<uint64_t> voxels(nt, 0), bytes(nt, 0);
+    std::vector<std::string> err(chunks.size());
+    std::vector<std::vector<uint8_t>> bufA(nt), bufB(nt);
+    parallelFor(chunks.size(), readers, [&](size_t k, RawReader& rd, size_t th){
+        const Chunk& c = chunks[k];
+        std::vector<uint8_t>& a = bufA[th];
+        if(!rd.read(file, c.addr, (size_t)c.size, a)){ err[k] = "could not be read"; return; }
+        bytes[th] += c.size;
+        std::string e;
+        if(!decodeChunk(a, bufB[th], fl, c.mask, shuffleBytes, e)){ err[k] = e; return; }
+        if(a.size() != chunkBytes){ err[k] = std::to_string(a.size()) + " bytes decoded, " + std::to_string(chunkBytes) + " expected"; return; }
+        if(c.off[0] >= sz || c.off[1] >= sy || c.off[2] >= sx) return;
+        const size_t nx = (size_t)std::min<uint64_t>(cd[2], sx - c.off[2]);
+        const size_t ny = (size_t)std::min<uint64_t>(cd[1], sy - c.off[1]);
+        const size_t nz = (size_t)std::min<uint64_t>(cd[0], sz - c.off[0]);
+        voxels[th] += (uint64_t)nx * ny * nz;
+        if(!nbins) return;
+        uint64_t* h = hist[th].data();
+        for(size_t z = 0; z < nz; ++z)
+            for(size_t y = 0; y < ny; ++y){
+                const uint8_t* row = a.data() + (y * cd[2] + z * cd[2] * cd[1]) * es;
+                if(isU8) for(size_t x = 0; x < nx; ++x) ++h[row[x]];
+                else for(size_t x = 0; x < nx; ++x){ uint16_t v; std::memcpy(&v, row + 2*x, 2); ++h[v]; }
+            }
+    });
+    uint64_t bad = 0; std::string firstBad;
+    for(size_t k = 0; k < chunks.size(); ++k)
+        if(!err[k].empty()){ if(!bad) firstBad = "chunk " + offStr(chunks[k].off) + ": " + err[k]; ++bad; }
+    for(size_t th = 0; th < nt; ++th) r.bytes += bytes[th];
+    r.chunks += chunks.size() - bad;
+    if(bad){ r.differences.push_back(dp + ": " + std::to_string(bad) + " of " + std::to_string(chunks.size()) + " chunks do not decode; first: " + firstBad); return; }
+
+    uint64_t total = 0;
+    for(uint64_t v : voxels) total += v;
+    if(nbins){
+        std::vector<uint64_t> bins(nbins, 0);
+        for(const auto& h : hist) for(size_t k = 0; k < nbins; ++k) bins[k] += h[k];
+        // A dataset whose chunks are missing would count fewer voxels; that is reported above.
+        ExpectedHistogram e = expectedHistogram(bins);
+        checkStoredHistogram(g, gp, "Histogram", e.h256, r.differences);
+        checkStoredHistogram(g, gp, "Histogram1024", e.h1024, r.differences);
+        checkStoredAttr(g, gp, "HistogramMin", e.min, r.differences);
+        checkStoredAttr(g, gp, "HistogramMax", e.max, r.differences);
+        if(!e.h1024.empty()){
+            checkStoredAttr(g, gp, "HistogramMin1024", e.min, r.differences);
+            checkStoredAttr(g, gp, "HistogramMax1024", e.max, r.differences);
+        }
+    } else {
+        // Float histograms adapt their range to the order the values arrive in; only
+        // their totals can be checked.
+        for(const char* name : {"Histogram", "Histogram1024"}){
+            if(H5Lexists(g, name, H5P_DEFAULT) <= 0){
+                if(std::strcmp(name, "Histogram") == 0) r.differences.push_back(gp + "/Histogram: missing");
+                continue;
+            }
+            Hid hd(H5Dopen2(g, name, H5P_DEFAULT), H5Dclose);
+            Hid hs(H5Dget_space(hd), H5Sclose);
+            hssize_t n = hd.valid() ? H5Sget_simple_extent_npoints(hs) : -1;
+            std::vector<uint64_t> got(n > 0 ? (size_t)n : 0, 0);
+            if(n < 0 || (n > 0 && H5Dread(hd, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, got.data()) < 0)){
+                r.differences.push_back(gp + "/" + name + ": unreadable"); continue; }
+            uint64_t sum = 0;
+            for(uint64_t v : got) sum += v;
+            if(sum != total) r.differences.push_back(gp + "/" + name + ": counts " + std::to_string((unsigned long long)sum) +
+                                                     " voxels, the image has " + std::to_string((unsigned long long)total));
+        }
+    }
+}
+
+} // namespace imsutil
+
+// True if every /DataSet/ResolutionLevel r/TimePoint t/Channel c of file decodes (every
+// chunk that covers ImageSizeX/Y/Z is stored, passes LZ4 and has the full chunk size)
+// and its stored histograms equal the ones rebuilt from the decoded voxels: Histogram,
+// Histogram1024 and HistogramMin/Max exactly for uint8 and uint16, the totals only for
+// other types (noted in report.notes). End-to-end integrity without a reference file.
+// report.chunks/bytes count the chunks decoded and their compressed bytes.
+inline bool imsDeepCheck(const std::filesystem::path& file, ImsCompareReport& report, int threads = 1){
+    using namespace imsutil;
+    QuietErrors quiet;
+    report = ImsCompareReport();
+    Hid f = openFile(file);
+    if(!f.valid()){ report.error = "cannot open " + file.string(); return false; }
+    if(!exists(f, "/DataSet")){ report.error = "no /DataSet group"; return false; }
+    std::vector<RawReader> readers((size_t)std::max(1, threads));
+    bool countsOnly = false;
+    for(const std::string& l : childNames(f, "/DataSet"))
+        for(const std::string& t : childNames(f, "/DataSet/" + l))
+            for(const std::string& c : childNames(f, "/DataSet/" + l + "/" + t)){
+                const std::string gp = "/DataSet/" + l + "/" + t + "/" + c;
+                deepCheckDataset(f, gp, readers, report, countsOnly);
+                if(!report.error.empty()) return false;
+            }
+    if(countsOnly) report.notes.push_back("histograms of non-uint8/uint16 datasets: only their voxel totals were checked");
     return report.error.empty() && report.differences.empty() && report.datasets > 0;
 }
 
-// Prints the report: the differences (at most maxLines) and a one-line summary.
-inline void imsPrintReport(const ImsCompareReport& r, FILE* out = stdout, size_t maxLines = 40){
+// Prints the report: the differences and thumbnail differences (at most maxLines in
+// all), the notes, and a one-line summary (deep: worded for an imsDeepCheck report).
+inline void imsPrintReport(const ImsCompareReport& r, FILE* out = stdout, size_t maxLines = 40, bool deep = false){
     if(!r.error.empty()) std::fprintf(out, "  ERROR: %s\n", r.error.c_str());
-    for(size_t i = 0; i < r.differences.size() && i < maxLines; ++i)
-        std::fprintf(out, "  DIFFERS: %s\n", r.differences[i].c_str());
-    if(r.differences.size() > maxLines)
-        std::fprintf(out, "  ... and %zu more differences\n", r.differences.size() - maxLines);
-    std::fprintf(out, "  %s: %d Data datasets, %llu chunks, %llu compressed bytes compared\n",
-                 (r.error.empty() && r.differences.empty() && r.datasets > 0) ? "identical" : "DIFFERENT",
-                 r.datasets, (unsigned long long)r.chunks, (unsigned long long)r.bytes);
+    size_t shown = 0;
+    for(const std::string& d : r.differences) if(shown++ < maxLines) std::fprintf(out, "  DIFFERS: %s\n", d.c_str());
+    for(const std::string& d : r.thumbnail) if(shown++ < maxLines) std::fprintf(out, "  DIFFERS (thumbnail): %s\n", d.c_str());
+    if(shown > maxLines) std::fprintf(out, "  ... and %zu more differences\n", shown - maxLines);
+    for(const std::string& n : r.notes) std::fprintf(out, "  note: %s\n", n.c_str());
+    const char* verdict = deep ? (r.identical() ? "clean" : "PROBLEMS") :
+                          r.identical() ? "identical" : r.identicalExceptThumbnail() ? "identical except /Thumbnail" : "DIFFERENT";
+    std::fprintf(out, "  %s: %d Data datasets, %llu chunks, %llu compressed bytes %s\n", verdict, r.datasets,
+                 (unsigned long long)r.chunks, (unsigned long long)r.bytes, deep ? "decoded" : "compared");
 }

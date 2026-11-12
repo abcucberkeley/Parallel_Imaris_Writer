@@ -372,4 +372,18 @@ if(PIW_BUILD_TESTS)
     target_sources(apiEquivalenceTest PRIVATE $<TARGET_OBJECTS:piw_core>)
     target_include_directories(apiEquivalenceTest PRIVATE ${SRC_DIR} ${PIW_INCLUDE_DIRS})
     piw_link_like_executable(apiEquivalenceTest)
+
+    # imscompare: compares two .ims files chunk by chunk (--all: also the metadata),
+    # --map (t,c) pairs between files, or checks one (--deep). A test and validation
+    # tool (HDF5 + lz4 only): staged next to the test binaries, never released.
+    add_executable(imscompare tests/imscompare.cpp)
+    set_target_properties(imscompare PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(imscompare PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src ${LZ4_INCLUDE_DIR})
+    target_link_libraries(imscompare PRIVATE hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
+    add_dependencies(release imscompare)
+    set_property(TARGET piw_tests APPEND PROPERTY PIW_TEST_FILES "$<TARGET_FILE:imscompare>")
+    # The tool's exit codes and messages on synthetic files with known differences.
+    piw_add_test(imscompare tests/imscomparetest.cpp LIBS cppZarr_shared)
+    add_dependencies(imscompareTest imscompare)
 endif()
