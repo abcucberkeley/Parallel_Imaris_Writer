@@ -183,6 +183,9 @@ set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 file(GLOB PIW_CORE_SOURCES CONFIGURE_DEPENDS ${SRC_DIR}/*.cpp)
 list(REMOVE_ITEM PIW_CORE_SOURCES ${SRC_DIR}/main.cpp)
 add_library(piw_core OBJECT ${PIW_CORE_SOURCES})
+# mono*.cpp: the single-file cluster output core (placement VFD, claims, sidecars); part of
+# piw_core through the glob, and compiled on their own into the mono-core test.
+set(MONO_SRCS ${SRC_DIR}/monovfd.cpp ${SRC_DIR}/monoclaim.cpp ${SRC_DIR}/monoidx.cpp)
 
 # cpp-tiff's src dir is listed before cpp-zarr's on purpose: both ship a
 # helperfunctions.h and converter.cpp includes it unqualified -- cpp-tiff's must win,
@@ -386,4 +389,15 @@ if(PIW_BUILD_TESTS)
     # The tool's exit codes and messages on synthetic files with known differences.
     piw_add_test(imscompare tests/imscomparetest.cpp LIBS cppZarr_shared)
     add_dependencies(imscompareTest imscompare)
+
+    # Mono-core test: placement VFD, claim allocator and sidecars of the single-file
+    # cluster output, on synthetic data (HDF5 + lz4 only, no executable to stage).
+    # Reports "skipped" on Windows, where the single-file path is not supported.
+    add_executable(monoCoreTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/monocoretest.cpp ${MONO_SRCS})
+    set_target_properties(monoCoreTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    target_include_directories(monoCoreTest PRIVATE
+        ${SRC_DIR} ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src ${LZ4_INCLUDE_DIR})
+    target_link_libraries(monoCoreTest PRIVATE hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME monoCore COMMAND monoCoreTest "${CMAKE_CURRENT_BINARY_DIR}/monocore_work")
+    set_tests_properties(monoCore PROPERTIES SKIP_RETURN_CODE 77)
 endif()
