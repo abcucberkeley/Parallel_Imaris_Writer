@@ -102,6 +102,22 @@ static void setEnvVar(const char* k, const char* v){
     setenv(k, v, 1);
 #endif
 }
+// Plain stream copies: std::filesystem::copy_file / copy aborted this test on macOS (GCC 13).
+static void copyFile(const fs::path& from, const fs::path& to, std::error_code& ec){
+    ec.clear();
+    std::ifstream in(from, std::ios::binary); std::ofstream out(to, std::ios::binary | std::ios::trunc);
+    if(!in || !out){ ec = std::make_error_code(std::errc::io_error); return; }
+    std::vector<char> buf(1 << 20);
+    while(in){ in.read(buf.data(), (std::streamsize)buf.size()); out.write(buf.data(), in.gcount()); }
+    if(!out) ec = std::make_error_code(std::errc::io_error);
+}
+static void copyTree(const fs::path& from, const fs::path& to, std::error_code& ec){
+    fs::create_directories(to, ec); if(ec) return;
+    for(fs::recursive_directory_iterator it(from, ec), end; !ec && it != end; it.increment(ec)){
+        const fs::path dst = to / fs::relative(it->path(), from, ec); if(ec) return;
+        if(it->is_directory(ec)) fs::create_directories(dst, ec); else copyFile(it->path(), dst, ec);
+    }
+}
 // The std::filesystem calls in the failure cases use the error_code forms, so a failing call
 // is reported and fails the case instead of throwing (an exception aborted the test with no
 // message on macOS).
@@ -133,29 +149,29 @@ static bool failureCases(const std::string& exe, const fs::path& work, const fs:
 
     // chunks/ is a file, so no pack can be created (fails for any user on any platform)
     fs::path wdw = work/"fc_nowrite"; fs::create_directories(wdw, ec); ok &= fsOk("create fc_nowrite", ec);
-    fs::copy_file(wd/"manifest.json", wdw/"manifest.json", ec); ok &= fsOk("copy manifest.json", ec); { std::ofstream f((wdw/"chunks").string()); f << "x"; }
+    copyFile(wd/"manifest.json", wdw/"manifest.json", ec); ok &= fsOk("copy manifest.json", ec); { std::ofstream f((wdw/"chunks").string()); f << "x"; }
     ok &= expectFail("worker with an unwritable chunks directory", E+" worker "+q(wdw)+" 0 0");
 
     ok &= expectFail("monitor writing into a missing directory", E+" monitor "+q(wd)+" "+q(work/"fc_no"/"such"/"out.ims"));
 
-    fs::path wdt = work/"fc_trunc"; fs::copy(wd, wdt, fs::copy_options::recursive, ec); ok &= fsOk("copy workdir to fc_trunc", ec);
+    fs::path wdt = work/"fc_trunc"; copyTree(wd, wdt, ec); ok &= fsOk("copy workdir to fc_trunc", ec);
     fs::path pk = wdt/"chunks"/"L0_C0_T0_0.pack"; const auto pkSize = fs::file_size(pk, ec); ok &= fsOk("size of a pack", ec);
     if(!ec){ fs::resize_file(pk, pkSize - 100, ec); ok &= fsOk("truncate a pack", ec); }
     ok &= expectFail("monitor with a truncated pack", E+" monitor "+q(wdt)+" "+q(work/"fc_trunc.ims"), work/"fc_trunc.ims");
 
     // one pack missing plus one stale pack: the stale one must not count as the missing one
-    fs::path wds = work/"fc_stale"; fs::copy(wd, wds, fs::copy_options::recursive, ec); ok &= fsOk("copy workdir to fc_stale", ec);
+    fs::path wds = work/"fc_stale"; copyTree(wd, wds, ec); ok &= fsOk("copy workdir to fc_stale", ec);
     fs::remove(wds/"chunks"/"L0_C1_T0_0.pack", ec); ok &= fsOk("remove a pack", ec);
-    fs::copy_file(wds/"chunks"/"L0_C0_T0_0.pack", wds/"chunks"/"L0_C0_T0_999.pack", ec); ok &= fsOk("make a stale pack", ec);
+    copyFile(wds/"chunks"/"L0_C0_T0_0.pack", wds/"chunks"/"L0_C0_T0_999.pack", ec); ok &= fsOk("make a stale pack", ec);
     setEnvVar("PIW_MONITOR_TIMEOUT", "2");
     ok &= expectFail("monitor with one pack missing and a stale one (2 s timeout)", E+" monitor "+q(wds)+" "+q(work/"fc_stale.ims"), work/"fc_stale.ims");
     setEnvVar("PIW_MONITOR_TIMEOUT", "");
 
     // linkparts with a missing part, then with every part present (positive control)
     fs::path lp = work/"fc_link"; fs::create_directories(lp/"parts", ec); ok &= fsOk("create fc_link/parts", ec);
-    fs::copy_file(monoIms, lp/"parts"/"part_t0_c0.ims", ec); ok &= fsOk("copy part_t0_c0", ec);
+    copyFile(monoIms, lp/"parts"/"part_t0_c0.ims", ec); ok &= fsOk("copy part_t0_c0", ec);
     ok &= expectFail("linkparts with a missing part", E+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts", lp/"link.ims");
-    fs::copy_file(monoIms, lp/"parts"/"part_t0_c1.ims", ec); ok &= fsOk("copy part_t0_c1", ec);
+    copyFile(monoIms, lp/"parts"/"part_t0_c1.ims", ec); ok &= fsOk("copy part_t0_c1", ec);
     if(runCmd(E+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts") != 0 || !fs::exists(lp/"link.ims")){
         std::printf("  FAIL: linkparts with every part present\n"); ok = false; }
     return ok;
