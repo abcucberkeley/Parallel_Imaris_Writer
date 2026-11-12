@@ -12,16 +12,21 @@
 // + one `worker` process per (channel, timepoint, level, chunk-index) + `combine` --
 // and compares the two with imsCompare (tests/imsutil.h): the raw compressed Data
 // chunks of every channel, the histograms and the attributes, including the
-// per-channel DataSetInfo (color, auto-adjusted ColorRange, name). Same determinism argument as
-// blocktest.cpp; here the two producers are the parallel scatter/gather and the
-// monolithic writer.
+// per-channel DataSetInfo (color, auto-adjusted ColorRange, name) and /Thumbnail. Same
+// determinism argument as blocktest.cpp; here the two producers are the parallel
+// scatter/gather and the monolithic writer. The other pack-based outputs get the same
+// thumbnail: combineone (one channel: equal to a conversion of that channel alone) and
+// link (from the combineone parts: equal to the monolithic one); linkparts writes one too.
 // Metadata (A-10): every /DataSetInfo attribute of both outputs is checked against the
 // expected values (channel names = the patterns, R/G colors, the first input's modification
 // time), and a second, smaller 2-channel x 2-timepoint run passes the metadata options
 // (names, colors, wavelengths, start time; times from "<n>msecAbs" stamps in the file
 // names) to both the converter and `setup`: monitor's output must equal the converter's in
-// data and every attribute, combineone's part carries its own timepoint's time, and
-// linkparts' link file the manifest's names, colors, wavelengths and times.
+// data, every attribute and /Thumbnail (coloured with the given colors), combineone's part
+// carries its own timepoint's time and equals a conversion of that (timepoint, channel)
+// alone with the same options, the link file over every combineone part equals the
+// converter's output, and linkparts' link file carries the manifest's names, colors,
+// wavelengths and times.
 //   usage: parallelTest <path-to-parallelimariswriter> [workdir]
 #include <cstdint>
 #include <cstdio>
@@ -141,6 +146,16 @@ static bool expectFail(const char* what, const std::string& cmd, const fs::path&
     if(!noOutput.empty() && fs::exists(noOutput, ec)){ std::printf("  FAIL: %s left behind\n", noOutput.string().c_str()); return false; }
     std::printf("  ok (exit %d)\n", rc); return true;
 }
+// /Thumbnail/Data of b equals a's (shapeOnly: its shape only, e.g. for linkparts, whose parts here are copies of
+// one 2-channel file).
+static bool sameThumbnail(const fs::path& a, const fs::path& b, const char* what, bool shapeOnly = false){
+    uint64_t ra = 0, ca = 0, rb = 0, cb = 0; std::vector<uint8_t> ta, tb;
+    bool ga = imsReadThumbnail(a, ra, ca, ta), gb = imsReadThumbnail(b, rb, cb, tb);
+    bool ok = ga && gb && ra == rb && ca == cb && (shapeOnly || ta == tb);
+    std::printf("  /Thumbnail of %s: %s (%llu x %llu bytes vs %llu x %llu)\n", what, ok ? (shapeOnly ? "same shape" : "identical") : "DIFFERENT",
+                (unsigned long long)rb, (unsigned long long)cb, (unsigned long long)ra, (unsigned long long)ca);
+    return ok;
+}
 // wd = the finished parallel workdir (manifest + all packs), monoIms = the monolithic 2-channel output.
 static bool failureCases(const std::string& exe, const fs::path& work, const fs::path& wd, const fs::path& monoIms){
     const std::string E = q(exe); bool ok = true; std::error_code ec;
@@ -184,6 +199,7 @@ static bool failureCases(const std::string& exe, const fs::path& work, const fs:
     copyFile(monoIms, lp/"parts"/"part_t0_c1.ims", ec); ok &= fsOk("copy part_t0_c1", ec);
     if(runCmd(E+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts") != 0 || !fs::exists(lp/"link.ims")){
         std::printf("  FAIL: linkparts with every part present\n"); ok = false; }
+    else ok &= sameThumbnail(monoIms, lp/"link.ims", "linkparts", true);
     return ok;
 }
 
@@ -203,6 +219,14 @@ static bool metaOk(const fs::path& ims, const ImsExpectedMeta& e, const char* wh
     for(size_t i = 0; i < problems.size() && i < 20; ++i) std::printf("    %s\n", problems[i].c_str());
     std::printf("  %s: %s\n", ok ? "ok" : "FAIL", what);
     return ok;
+}
+// b equals a in data, every attribute and /Thumbnail (imscompare --all).
+static bool sameFile(const fs::path& a, const fs::path& b, const char* what){
+    ImsCompareOptions opt; ImsCompareReport report;
+    const bool same = imsCompare(a, b, report, opt);
+    imsPrintReport(report);
+    std::printf("  %s: %s\n", same ? "ok" : "FAIL", what);
+    return same;
 }
 static ImsExpectedMeta expectedMeta(uint64_t x, uint64_t y, uint64_t z){
     ImsExpectedMeta e; e.size[0] = x; e.size[1] = y; e.size[2] = z; e.version = PIW_VERSION; return e;
@@ -246,12 +270,7 @@ static bool metadataCase(const std::string& exe, const fs::path& work){
     e.times = {"2026-12-31 23:59:58.500", "2027-01-01 00:00:02"};   // CamA's stamps: +3.5 s
     bool ok = metaOk(md/"output.ims", e, "converter: every DataSetInfo attribute");
     ok &= metaOk(par, e, "monitor: every DataSetInfo attribute");
-    ImsCompareOptions opt; opt.thumbnail = false;
-    ImsCompareReport report;
-    const bool same = imsCompare(md/"output.ims", par, report, opt);
-    imsPrintReport(report);
-    std::printf("  %s: monitor's output equals the converter's (data and every attribute)\n", same ? "ok" : "FAIL");
-    ok &= same;
+    ok &= sameFile(md/"output.ims", par, "monitor's output equals the converter's (data, every attribute, /Thumbnail)");
 
     // combineone (t=1, c=1): one channel, one timepoint, with that timepoint's time
     const fs::path one = work/"meta_one.ims";
@@ -259,6 +278,19 @@ static bool metadataCase(const std::string& exe, const fs::path& work){
     ImsExpectedMeta e1 = e;
     e1.names = {"RFP"}; e1.colors = {e.colors[1]}; e1.emission = {e.emission[1]}; e1.excitation = {e.excitation[1]}; e1.times = {e.times[1]};
     ok &= metaOk(one, e1, "combineone: the channel's and the timepoint's metadata");
+    fs::path od = work/"meta_one_ref"; fs::create_directories(od);
+    if(runCmd(q(exe)+" -P Scan_Iter_0001_CamB -F "+q(zd)+" -o "+q(od)+" -r zarr -v 0.5,0.5,2"
+              " --channel-names RFP --colors FF8000 --emission 610 --start-time \"2027-01-01 00:00:02\"") != 0){
+        std::printf("  FAIL: converter of (t=1, c=1) alone\n"); return false; }
+    ok &= sameFile(od/"output.ims", one, "combineone's part equals a conversion of that (timepoint, channel) alone with the same options");
+
+    // link over the combineone part of every (t, c): equals the converter's output, /Thumbnail included
+    fs::path lk = work/"meta_lk"; { std::error_code ec; fs::create_directories(lk/"parts", ec); }
+    for(int t = 0; t < 2; ++t) for(int c = 0; c < 2; ++c)
+        if(runCmd(q(exe)+" combineone "+q(wd)+" "+std::to_string(t)+" "+std::to_string(c)+" "+
+                  q(lk/"parts"/("part_t"+std::to_string(t)+"_c"+std::to_string(c)+".ims"))) != 0){ std::printf("  FAIL: combineone\n"); return false; }
+    if(runCmd(q(exe)+" link "+q(wd)+" "+q(lk/"link.ims")+" parts") != 0){ std::printf("  FAIL: link\n"); return false; }
+    ok &= sameFile(md/"output.ims", lk/"link.ims", "link over the combineone parts equals the converter's output");
 
     // linkparts over parts that are copies of the converter's output: the manifest's metadata
     fs::path lp = work/"meta_link"; std::error_code ec; fs::create_directories(lp/"parts", ec);
@@ -313,13 +345,25 @@ int main(int argc, char** argv){
     if(runCmd(q(exe)+" monitor "+q(wd)+" "+q(parIms)) != 0 || !fs::exists(parIms)){
         std::printf("paralleltest FAILED: monitor produced no .ims\n"); return 1; }
 
-    // --- compare voxel data (all channels), histograms and attributes; the cluster
-    // output has no /Thumbnail yet, so its presence is not compared ---
+    // --- compare voxel data (all channels), histograms, attributes and the thumbnail ---
     std::printf("[compare] monolithic vs parallel:\n");
-    ImsCompareOptions opt; opt.thumbnail = false;
+    ImsCompareOptions opt;
     ImsCompareReport report;
     bool same = imsCompare(monoDir/"output.ims", parIms, report, opt);
     imsPrintReport(report);
+
+    // --- the thumbnails of combineone (vs a conversion of CamA alone) and link (vs the monolithic output) ---
+    std::printf("[thumbnails] combineone, link\n");
+    fs::path lk = work/"lk", camA = work/"camA"; fs::create_directories(lk/"parts"); fs::create_directories(camA);
+    bool thumbs = runCmd(q(exe)+" -P CamA -F "+q(zdir)+" -o "+q(camA)+" -r zarr -v 1,1,1") == 0;
+    for(int c = 0; thumbs && c < nC; c++)
+        thumbs = runCmd(q(exe)+" combineone "+q(wd)+" 0 "+std::to_string(c)+" "+q(lk/"parts"/("part_t0_c"+std::to_string(c)+".ims"))) == 0;
+    thumbs = thumbs && runCmd(q(exe)+" link "+q(wd)+" "+q(lk/"link.ims")+" parts") == 0;
+    if(!thumbs) std::printf("  FAIL: a conversion, combineone or link failed\n");
+    else {
+        thumbs &= sameThumbnail(camA/"output.ims", lk/"parts"/"part_t0_c0.ims", "combineone t0 c0 (vs CamA alone)");
+        thumbs &= sameThumbnail(monoDir/"output.ims", lk/"link.ims", "link (vs monolithic)");
+    }
     ImsExpectedMeta meta = expectedMeta(X, Y, Z);
     meta.names = {"CamA", "CamB"};
     meta.colors = {"1.000 0.000 0.000", "0.000 1.000 0.000"};
@@ -329,7 +373,7 @@ int main(int argc, char** argv){
     metaSame &= metaOk(parIms, meta, "monitor: every DataSetInfo attribute");
     metaSame &= metadataCase(exe, work);
     bool failOk = failureCases(exe, work, wd, monoDir/"output.ims");
-    if(same && metaSame && failOk){
+    if(same && thumbs && metaSame && failOk){
         std::printf("paralleltest PASSED (parallel scatter/gather == monolithic, %d channels)\n", nC); return 0; }
     std::printf("paralleltest FAILED\n"); return 1;
 }

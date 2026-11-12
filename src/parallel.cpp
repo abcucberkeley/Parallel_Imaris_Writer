@@ -7,6 +7,7 @@
 // parallel.h; the shared .ims building blocks are in imscore.h. Every failure prints a message on
 // stderr and gives a non-zero exit code.
 #include "imscore.h"
+#include "imsthumb.h"
 #include "zarr.h"
 #include "parallelreadzarr.h"
 #include <atomic>
@@ -153,6 +154,35 @@ static Status writeOneDataset(hid_t out,const Manifest& m,const std::string& cd,
     if(!err.empty()) return Status::fail(err);
     return ok?Status():Status::fail("cannot write "+dp+" (HDF5 error above)");
 }
+// /Thumbnail (imsthumb.h) of source timepoint tSrc, channels srcCh, from the packs of the thumbnail level; display =
+// the channel settings writeImsMeta wrote for srcCh.
+static Status writePackThumbnail(hid_t out,const Manifest& m,const std::string& cd,const std::vector<int>& srcCh,int tSrc,
+                                 const std::vector<ChannelDisplay>& display){
+    std::vector<Vec3> sizes; for(const Lev& L:m.lev) sizes.push_back(L.size);
+    const int r=(int)imsthumb::thumbnailLevel(sizes); const Lev& L=m.lev[r];
+    const size_t rawBytes=(size_t)L.block[0]*L.block[1]*L.block[2]*sizeof(uint16_t);
+    std::vector<std::vector<uint16_t> > vol(srcCh.size());
+    for(size_t oc=0;oc<srcCh.size();oc++){
+        vol[oc].assign((size_t)L.size[0]*L.size[1]*L.size[2],0);
+        long perCT=tilesPerCT(L); std::atomic<bool> failed(false); std::string err;
+        #pragma omp parallel for schedule(dynamic)
+        for(long tile=0;tile<perCT;tile++){
+            if(failed.load()) continue;
+            std::vector<uint8_t> vox;
+            Status ts=forEachPackedChunk(packName(cd,r,srcCh[oc],tSrc,tile),[&](bpSize cz,bpSize cy,bpSize cx,const uint8_t* by,size_t sz)->Status{
+                Status ds=decodeChunk(by,sz,vox,rawBytes); if(!ds.ok()) return ds;
+                chunkToVolume((const uint16_t*)vox.data(),L.block.data(),cx,cy,cz,L.size.data(),vol[oc].data()); return Status();
+            },&L,tile);
+            if(!ts.ok()){
+                #pragma omp critical(piw_err)
+                { if(!failed.load()){ err=ts.message; failed=true; } }
+            }
+        }
+        if(failed) return Status::fail("thumbnail: "+err);
+    }
+    float ext[3]; imsExtentMax(m.X,m.Y,m.Z,m.vox,ext);
+    return imsthumb::writeThumbnail(out,sizes,vol,display,ext);
+}
 // close the file; on any failure remove the half-written output
 static int finishOutput(hid_t out,const std::string& outPath,Status s){
     if(H5Fclose(out)<0&&s.ok()) s=Status::fail("cannot close "+outPath+" (HDF5 error above)");
@@ -164,13 +194,15 @@ static int doCombine(const Manifest& m,const std::string& wd,const std::string& 
     std::string cd=wd+"/chunks"; int nT=m.nT, nC=m.nC, nR=(int)m.lev.size();
     hid_t out=imsCreate(outPath); if(out<0) return fail("cannot create "+outPath+" (HDF5 error above)");
     hid_t lcpl=H5Pcreate(H5P_LINK_CREATE); H5Pset_create_intermediate_group(lcpl,1);
-    Status s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT));
+    std::vector<ChannelDisplay> display;
+    Status s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT),&display);
     hid_t dtype=imsDtype(m.elem);
     // parallel-read each (r,t,c)'s tile .pack files across threads; single writer does H5Dwrite_chunk
     for(int r=0;r<nR&&s.ok();r++) for(int t=0;t<nT&&s.ok();t++) for(int c=0;c<nC&&s.ok();c++) s=writeOneDataset(out,m,cd,lcpl,dtype,r,t,c,t,c);
+    if(s.ok()) s=writePackThumbnail(out,m,cd,iota0(nC),0,display);
     H5Tclose(dtype); H5Pclose(lcpl);
     if(finishOutput(out,outPath,s)) return 1;
-    printf("merged %d channels x %d timepoints x %d levels -> %s (thumbnail TODO)\n",nC,nT,nR,outPath.c_str()); return 0;
+    printf("merged %d channels x %d timepoints x %d levels -> %s\n",nC,nT,nR,outPath.c_str()); return 0;
 }
 
 // one (timepoint, channel) -> a single-tp/channel .ims (renumbered to TimePoint 0 / Channel 0). Independent
@@ -183,9 +215,11 @@ static int combineOne(const std::string& wd,int T,int C,const std::string& outPa
     if(T<0||T>=m.nT||C<0||C>=m.nC){ fprintf(stderr,"(t=%d,c=%d) out of range (nT=%d,nC=%d)\n",T,C,m.nT,m.nC); return 1; }
     hid_t out=imsCreate(outPath); if(out<0){ fprintf(stderr,"cannot create %s\n",outPath.c_str()); return 1; }
     hid_t lcpl=H5Pcreate(H5P_LINK_CREATE); H5Pset_create_intermediate_group(lcpl,1);
-    s=writeImsMeta(out,m,cd,lcpl,std::vector<int>{C},std::vector<int>{T});
+    std::vector<ChannelDisplay> display;
+    s=writeImsMeta(out,m,cd,lcpl,std::vector<int>{C},std::vector<int>{T},&display);
     hid_t dtype=imsDtype(m.elem);
     for(int r=0;r<nR&&s.ok();r++) s=writeOneDataset(out,m,cd,lcpl,dtype,r,T,C,0,0);
+    if(s.ok()) s=writePackThumbnail(out,m,cd,std::vector<int>{C},T,display);
     H5Tclose(dtype); H5Pclose(lcpl);
     if(finishOutput(out,outPath,s)) return 1;
     printf("combined (t=%d,c=%d) x %d levels -> %s\n",T,C,nR,outPath.c_str()); return 0;
@@ -217,6 +251,50 @@ static Status checkParts(const std::string& partDir,int nT,int nC,const std::vec
     if(bad) return Status::fail(std::to_string(bad)+" of "+std::to_string(nT*nC)+" parts missing or inconsistent (first: "+first+")");
     return Status();
 }
+// Level r of TimePoint 0/Channel 0 of part p (uint16), decoded from its raw chunks (the LZ4 filter is registered
+// for writing only, so H5Dread cannot decode them) into a dense S[0]*S[1]*S[2] volume. False (no error) for another
+// voxel type.
+static Status readPartLevel(const std::string& p,size_t r,const Vec3& S,std::vector<uint16_t>& vol,bool& u16){
+    const std::string dp="/DataSet/ResolutionLevel "+std::to_string(r)+"/TimePoint 0/Channel 0/Data";
+    const Status bad=Status::fail("thumbnail: cannot read "+p+":"+dp+" (HDF5 error above)");
+    hid_t f=H5Fopen(p.c_str(),H5F_ACC_RDONLY,H5P_DEFAULT); if(f<0) return Status::fail("thumbnail: cannot open part "+p);
+    hid_t d=H5Dopen2(f,dp.c_str(),H5P_DEFAULT), ty=d<0?-1:H5Dget_type(d), pl=d<0?-1:H5Dget_create_plist(d);
+    u16=ty>=0&&H5Tget_class(ty)==H5T_INTEGER&&H5Tget_size(ty)==2;
+    hsize_t ck[3]={0,0,0}; Status s=(d<0||ty<0||pl<0)?bad:Status();
+    if(s.ok()&&u16&&H5Pget_chunk(pl,3,ck)!=3) s=bad;
+    if(s.ok()&&u16){
+        const bpSize b[3]={ck[2],ck[1],ck[0]}, size[3]={S[0],S[1],S[2]}; const size_t raw=(size_t)(b[0]*b[1]*b[2]*2);
+        vol.assign((size_t)(S[0]*S[1]*S[2]),0);
+        std::vector<uint8_t> cbuf,vox;
+        for(bpSize cz=0;s.ok()&&cz*b[2]<S[2];cz++) for(bpSize cy=0;s.ok()&&cy*b[1]<S[1];cy++) for(bpSize cx=0;s.ok()&&cx*b[0]<S[0];cx++){
+            hsize_t off[3]={cz*b[2],cy*b[1],cx*b[0]}, n=0; uint32_t fm=0;
+            if(H5Dget_chunk_storage_size(d,off,&n)<0||n==0){ s=bad; break; }
+            cbuf.resize((size_t)n);
+            if(H5Dread_chunk(d,H5P_DEFAULT,off,&fm,cbuf.data())<0){ s=bad; break; }
+            Status ds=decodeChunk(cbuf.data(),cbuf.size(),vox,raw);
+            if(!ds.ok()) s=Status::fail("thumbnail: "+p+":"+dp+": "+ds.message);
+            else chunkToVolume((const uint16_t*)vox.data(),b,cx,cy,cz,size,vol.data());
+        }
+    }
+    if(pl>=0){ H5Pclose(pl); }
+    if(ty>=0){ H5Tclose(ty); }
+    if(d>=0){ H5Dclose(d); }
+    H5Fclose(f);
+    return s;
+}
+// /Thumbnail of a link file from its parts: channel c from TimePoint 0/Channel 0 of part_t0_c{c}.ims (the thumbnail
+// level of `sizes`, every part's level sizes). display = the link file's channel settings. Parts that are not
+// uint16 give no thumbnail.
+static Status writePartsThumbnail(hid_t out,const std::string& partDir,const std::vector<Vec3>& sizes,const float ext[3],
+                                  const std::vector<ChannelDisplay>& display){
+    const size_t r=imsthumb::thumbnailLevel(sizes);
+    std::vector<std::vector<uint16_t> > vol(display.size());
+    for(size_t c=0;c<display.size();c++){ bool u16=false;
+        Status s=readPartLevel(partDir+"/"+partName(0,(int)c),r,sizes[r],vol[c],u16);
+        if(!s.ok()) return s;
+        if(!u16) return Status(); }
+    return imsthumb::writeThumbnail(out,sizes,vol,display,ext);
+}
 // link .ims: a tiny file of external links into the per-(tp,channel) parts. Imaris follows the links and
 // presents them as one dataset. `partRel` is the parts' folder relative to this file (they must live together).
 static int buildLink(const std::string& wd,const std::string& outPath,const std::string& partRel){
@@ -228,7 +306,9 @@ static int buildLink(const std::string& wd,const std::string& outPath,const std:
     s=checkParts(partDir,nT,nC,want); if(!s.ok()) return fail(s.message+" (run combineone for every (t,c) first)");
     hid_t out=imsCreate(outPath); if(out<0){ fprintf(stderr,"cannot create %s\n",outPath.c_str()); return 1; }
     hid_t lcpl=H5Pcreate(H5P_LINK_CREATE); H5Pset_create_intermediate_group(lcpl,1);
-    s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT));
+    std::vector<ChannelDisplay> display;
+    s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT),&display);
+    if(s.ok()){ float ext[3]; imsExtentMax(m.X,m.Y,m.Z,m.vox,ext); s=writePartsThumbnail(out,partDir,want,ext,display); }
     int made=0,failed=0;
     for(int r=0;r<nR&&s.ok();r++)for(int t=0;t<nT;t++)for(int c=0;c<nC;c++){
         std::string linkPath="/DataSet/ResolutionLevel "+std::to_string(r)+"/TimePoint "+std::to_string(t)+"/Channel "+std::to_string(c);
@@ -277,10 +357,13 @@ static int linkParts(const std::string& wd,const std::string& outPath,const std:
     for(int c=1;ok&&c<nC;c++){ std::string dst="DataSetInfo/Channel "+std::to_string(c);   // duplicate the Channel-0 template for the other channels
         if(H5Lexists(out,dst.c_str(),H5P_DEFAULT)>0) H5Ldelete(out,dst.c_str(),H5P_DEFAULT);
         if(H5Ocopy(out,"DataSetInfo/Channel 0",out,dst.c_str(),H5P_DEFAULT,lcpl)<0){ fprintf(stderr,"channel %d template copy failed\n",c); failed++; } }
-    for(int c=0;ok&&c<nC;c++){ std::string gp="DataSetInfo/Channel "+std::to_string(c); if(H5Lexists(out,gp.c_str(),H5P_DEFAULT)<=0) continue;
+    std::vector<ChannelDisplay> display;   // for the thumbnail: each channel's color and its part's ColorRange
+    for(int c=0;ok&&c<nC;c++){ display.push_back(imsChannelDisplay(m.meta,c));
+        std::string gp="DataSetInfo/Channel "+std::to_string(c); if(H5Lexists(out,gp.c_str(),H5P_DEFAULT)<=0) continue;
         hid_t g=H5Gopen2(out,gp.c_str(),H5P_DEFAULT);                        // per-channel name/wavelengths/color/range
         ok&=setChannelMeta(g,m.meta,c);
         std::string cr=partColorRange(partDir,c); if(!cr.empty()) ok&=setStrAttrOW(g,"ColorRange",cr);
+        if(!cr.empty()) sscanf(cr.c_str(),"%f %f",&display.back().rangeMin,&display.back().rangeMax);
         H5Gclose(g); }
     if(ok&&H5Lexists(out,"DataSetInfo/TimeInfo",H5P_DEFAULT)>0) ok&=H5Ldelete(out,"DataSetInfo/TimeInfo",H5P_DEFAULT)>=0;  // rebuild TimeInfo for nT (part had 1)
     if(ok) ok&=writeTimeInfo(out,m.meta,lcpl,iota0(nT));                   // the manifest's time stamps, as the converter writes them
@@ -293,6 +376,13 @@ static int linkParts(const std::string& wd,const std::string& outPath,const std:
         std::string target="/DataSet/ResolutionLevel "+std::to_string(r)+"/TimePoint 0/Channel 0";
         std::string pf=(partRel.empty()?std::string():partRel+"/")+partName(t,c);
         if(H5Lcreate_external(pf.c_str(),target.c_str(),out,linkPath.c_str(),lcpl,H5P_DEFAULT)<0) failed++; else made++; }
+    if(ok&&!failed){   // the thumbnail, from the parts' voxels; the extent from the copied /DataSetInfo/Image
+        float ext[3]={0,0,0}; hid_t ig=H5Lexists(out,"DataSetInfo/Image",H5P_DEFAULT)>0?H5Gopen2(out,"DataSetInfo/Image",H5P_DEFAULT):-1;
+        if(ig>=0){ for(int a=0;a<3;a++){ const std::string k=std::to_string(a);
+                ext[a]=strtof(readStrAttr(ig,("ExtMax"+k).c_str()).c_str(),NULL)-strtof(readStrAttr(ig,("ExtMin"+k).c_str()).c_str(),NULL); }
+            H5Gclose(ig); }
+        s=writePartsThumbnail(out,partDir,sizes,ext,display);
+    }
     H5Pclose(lcpl);
     if(!ok) s=Status::fail("cannot write the link file's metadata (HDF5 error above)");
     else if(failed) s=Status::fail(std::to_string(failed)+" channel copies or external links failed (HDF5 error above)");

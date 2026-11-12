@@ -411,7 +411,7 @@ if(PIW_BUILD_TESTS)
     set_tests_properties(monoCore PROPERTIES SKIP_RETURN_CODE 77)
 
     # Single-file cluster output of the time-series path (setup/monoinit, monoplace, monostatus,
-    # monofinish): equal to a single-node conversion of the same volumes except /Thumbnail, in the
+    # monofinish): equal to a single-node conversion of the same volumes, /Thumbnail included, in the
     # same storage order; restart and failure cases. Reports "skipped" on Windows.
     piw_add_test(mono tests/monotest.cpp LIBS cppZarr_shared)
     set_tests_properties(mono PROPERTIES SKIP_RETURN_CODE 77)

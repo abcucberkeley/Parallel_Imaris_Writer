@@ -9,7 +9,7 @@
 // builds the HDF5 structure over the placed chunks through the placement driver (monovfd.h) and writes the
 // metadata of a single-node conversion of all the volumes (imscore.h's shared writers, ColorRange from the
 // exact level-0 histograms of every timepoint). The result is one self-contained .ims (no links, no parts)
-// whose data and metadata equal the single-node converter's, except /Thumbnail (not written yet).
+// whose data, metadata and /Thumbnail (imsthumb.h) equal the single-node converter's.
 //
 // Workdir:
 //   manifest.json              timepoints, channels, voxel size [, output path], the metadata: monoinit (or setup)
@@ -116,7 +116,7 @@ struct MonoFinishResult {
     std::string note;                   // set when no level could be re-chunked
     uint64_t rawEnd = 0;                // end of the raw region (= the sealed journal's end)
     uint64_t fileBytes = 0;
-    double readSeconds = 0;             // sidecars, journal, seal
+    double readSeconds = 0;             // sidecars, journal, seal, the thumbnail's voxels
     double indexSeconds = 0;            // HDF5 structure through the placement driver
     double checkSeconds = 0;            // stock-driver check of every chunk index
     double verifySeconds = 0;

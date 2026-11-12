@@ -16,7 +16,7 @@
 //                                              map (t,c) of a to (t,c) of b
 //   imsDeepCheck(file, report[, threads])   -> true if every chunk decodes and every
 //                                              stored histogram matches the decoded data
-//   imsReadAttribute(s) / imsReadHistogram / imsExists  -> small accessors for checks
+//   imsReadAttribute(s) / imsReadHistogram / imsReadThumbnail / imsExists  -> small accessors for checks
 //   imsCheckDataSetInfo(file, expected, problems) -> every /DataSetInfo attribute against
 //                                              the expected metadata
 //
@@ -494,6 +494,22 @@ inline std::vector<uint64_t> imsReadHistogram(const std::filesystem::path& file,
     h.assign((size_t)n, 0);
     if(H5Dread(d, H5T_NATIVE_UINT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, h.data()) < 0) h.clear();
     return h;
+}
+
+// /Thumbnail/Data: its shape (rows, bytes per row = 4 * pixels per row) and its RGBA bytes; false if absent.
+inline bool imsReadThumbnail(const std::filesystem::path& file, uint64_t& rows, uint64_t& rowBytes, std::vector<uint8_t>& rgba){
+    using namespace imsutil;
+    QuietErrors quiet;
+    rows = rowBytes = 0; rgba.clear();
+    Hid f = openFile(file);
+    if(!f.valid() || !exists(f, "/Thumbnail/Data")) return false;
+    Hid d(H5Dopen2(f, "/Thumbnail/Data", H5P_DEFAULT), H5Dclose);
+    Hid s(H5Dget_space(d), H5Sclose);
+    hsize_t dims[2] = {0, 0};
+    if(!s.valid() || H5Sget_simple_extent_ndims(s) != 2 || H5Sget_simple_extent_dims(s, dims, nullptr) != 2) return false;
+    rows = dims[0]; rowBytes = dims[1];
+    rgba.assign((size_t)(rows * rowBytes), 0);
+    return rgba.empty() || H5Dread(d, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, rgba.data()) >= 0;
 }
 
 // ------------------------------------------------------------------------------------

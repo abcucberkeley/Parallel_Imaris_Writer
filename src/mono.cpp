@@ -3,6 +3,7 @@
 // sidecars run outside it.
 #include "mono.h"
 #include "imscore.h"
+#include "imsthumb.h"
 #include "monoclaim.h"
 #include "monoidx.h"
 #include "monovfd.h"
@@ -331,12 +332,11 @@ bool singleNodeLayout(const std::vector<MonoIdxLevel>& geo,int nT,std::vector<Mo
 // bytes ImarisWriter writes), creates <g>/Data with to's geometry and writes them with H5Dwrite_chunk; HDF5
 // puts them after the raw region (the placement driver passes un-armed writes through). out: the chunks
 // written, with their file addresses.
-Status rechunkLevel(int fd,hid_t g,const MonoIdxLevel& from,const MonoIdxLevel& to,const MonoChunk* chunks,size_t n,int T,
-                    std::vector<MonoChunk>& out){
-    out.clear();
-    const uint64_t X=from.size[0],Y=from.size[1],Z=from.size[2];
-    std::vector<uint16_t> vol((size_t)(X*Y*Z),0);
-    const size_t rawFrom=(size_t)from.chunk[0]*from.chunk[1]*from.chunk[2]*2;
+// Decodes the placed chunks of one level of one part (fd: the file being built) into its dense X*Y*Z volume.
+Status decodeLevel(int fd,const MonoIdxLevel& from,const MonoChunk* chunks,size_t n,int T,std::vector<uint16_t>& vol){
+    const imscore::bpSize size[3]={from.size[0],from.size[1],from.size[2]}, b[3]={from.chunk[0],from.chunk[1],from.chunk[2]};
+    vol.assign((size_t)(size[0]*size[1]*size[2]),0);
+    const size_t rawFrom=(size_t)b[0]*b[1]*b[2]*2;
     std::atomic<size_t> next(0); FirstError fe;
     std::string x=runThreads(T,[&](int){
         std::vector<uint8_t> cb,vox;
@@ -344,12 +344,18 @@ Status rechunkLevel(int fd,hid_t g,const MonoIdxLevel& from,const MonoIdxLevel& 
             cb.resize(ch.size); int re=preadAll(fd,cb.data(),ch.size,ch.offset);
             imscore::Status ds=re?imscore::Status::fail(strerror(re)):imscore::decodeChunk(cb.data(),ch.size,vox,rawFrom);
             if(!ds.ok()){ fe.put("level "+u64s(from.level)+" chunk ("+u64s(ch.cx)+","+u64s(ch.cy)+","+u64s(ch.cz)+") at "+u64s(ch.offset)+": "+ds.message); break; }
-            const uint64_t bx=from.chunk[0],by=from.chunk[1],bz=from.chunk[2],x0=ch.cx*bx,y0=ch.cy*by,z0=ch.cz*bz;
-            const uint64_t xv=std::min(bx,X-x0),yv=std::min(by,Y-y0),zv=std::min(bz,Z-z0);
-            const uint16_t* v=(const uint16_t*)vox.data();
-            for(uint64_t z=0;z<zv;z++) for(uint64_t y=0;y<yv;y++) memcpy(&vol[(size_t)(x0+(y0+y)*X+(z0+z)*X*Y)],v+(size_t)(y+z*by)*bx,(size_t)xv*2);
+            imscore::chunkToVolume((const uint16_t*)vox.data(),b,ch.cx,ch.cy,ch.cz,size,vol.data());
         } });
     if(!fe.msg.empty()||!x.empty()) return Status(Code::ReadFailed,!fe.msg.empty()?fe.msg:x);
+    return Status();
+}
+Status rechunkLevel(int fd,hid_t g,const MonoIdxLevel& from,const MonoIdxLevel& to,const MonoChunk* chunks,size_t n,int T,
+                    std::vector<MonoChunk>& out){
+    out.clear();
+    const uint64_t X=from.size[0],Y=from.size[1],Z=from.size[2];
+    std::vector<uint16_t> vol;
+    Status ls=decodeLevel(fd,from,chunks,n,T,vol); if(!ls.ok()) return ls;
+    std::string x;
     const uint64_t bx=to.chunk[0],by=to.chunk[1],bz=to.chunk[2],gx=to.grid[0],gy=to.grid[1];
     const size_t nn=(size_t)to.nChunks;
     std::vector<std::vector<uint8_t> > enc(nn);
@@ -575,9 +581,31 @@ Status monoStatus(const std::string& workdir,MonoProgress& p) noexcept{
 
 #ifndef _WIN32
 namespace {
-// /Thumbnail: not written yet (B-8 builds it from every channel). Called where ImarisWriter writes it, after
-// the metadata, so the finisher's order stays fixed when it is added.
-Status writeThumbnail(hid_t){ return Status(); }
+// The thumbnail's voxels (imsthumb.h): level thumbnailLevel of timepoint 0, every channel, decoded from the placed
+// chunks (a re-chunked level's placed chunks stay valid in the raw region). Read before the HDF5 work, without the
+// library mutex.
+Status readThumbnailVolumes(const std::string& partial,const std::vector<MonoIdxLevel>& geo,const std::vector<MonoIdx>& idx,
+                            const std::vector<std::vector<size_t> >& first,int nC,int T,std::vector<std::vector<uint16_t> >& vol){
+    std::vector<imscore::Vec3> sizes;
+    for(const MonoIdxLevel& g:geo){ imscore::Vec3 v={{g.size[0],g.size[1],g.size[2]}}; sizes.push_back(v); }
+    const size_t r=imsthumb::thumbnailLevel(sizes);
+    FdGuard fd(open(partial.c_str(),O_RDONLY));
+    if(fd.fd<0) return Status(Code::ReadFailed,"cannot open "+partial+": "+strerror(errno));
+    vol.assign((size_t)nC,std::vector<uint16_t>());
+    for(int c=0;c<nC;c++){ const size_t k=(size_t)c;   // timepoint 0
+        Status s=decodeLevel(fd.fd,geo[r],idx[k].chunks.data()+first[k][r],first[k][r+1]-first[k][r],T,vol[(size_t)c]);
+        if(!s.ok()) return Status(s.code,"thumbnail of "+idx[k].owner+": "+s.message); }
+    return Status();
+}
+// /Thumbnail, where ImarisWriter writes it: after /DataSetInfo, coloured as its channels.
+Status writeThumbnail(hid_t f,const std::vector<MonoIdxLevel>& geo,const imscore::Manifest& im,
+                      const std::vector<std::vector<uint16_t> >& vol,const std::vector<imscore::ChannelDisplay>& display){
+    std::vector<imscore::Vec3> sizes;
+    for(const MonoIdxLevel& g:geo){ imscore::Vec3 v={{g.size[0],g.size[1],g.size[2]}}; sizes.push_back(v); }
+    float ext[3]; imscore::imsExtentMax(im.X,im.Y,im.Z,im.vox,ext);
+    imscore::Status s=imsthumb::writeThumbnail(f,sizes,vol,display,ext);
+    return s.ok()?Status():Status(Code::WriteFailed,s.message);
+}
 
 // The sidecar's chunks of each level (sorted by level, then z, y, x): [first[r], first[r+1]).
 std::vector<size_t> levelRanges(MonoIdx& x){
@@ -673,6 +701,8 @@ Status monoFinish(const MonoFinishOptions& o,MonoFinishResult* result) noexcept{
                   bad="the chunks of "+ix.owner+" are not in "+partial+" at "+u64s(ch.offset)+" (its blob was not written: place that part again)"; } }
           close(fd);
           if(!bad.empty()) return Status(Code::ReadFailed,bad); }
+        std::vector<std::vector<uint16_t> > thumbVol;
+        s=readThumbnailVolumes(partial,geo,idx,first,nC,T,thumbVol); if(!s.ok()) return s;
         res.readSeconds=seconds()-t0;
 
         // 3. the HDF5 structure over the placed chunks, in ImarisWriter's order (imscore.h): root attributes and
@@ -723,8 +753,9 @@ Status monoFinish(const MonoFinishOptions& o,MonoFinishResult* result) noexcept{
                 if(bs.ok()&&!ok) bs=Status(Code::WriteFailed,"cannot write "+gp+" (HDF5 error above)");
                 H5Gclose(g);
             } }
-          if(bs.ok()){ ws=imscore::writeImsDataSetInfo(f,im,lcpl,chs,tps,histOf); if(!ws.ok()) bs=Status(Code::WriteFailed,ws.message); }
-          if(bs.ok()) bs=writeThumbnail(f);
+          std::vector<imscore::ChannelDisplay> display;
+          if(bs.ok()){ ws=imscore::writeImsDataSetInfo(f,im,lcpl,chs,tps,histOf,&display); if(!ws.ok()) bs=Status(Code::WriteFailed,ws.message); }
+          if(bs.ok()) bs=writeThumbnail(f,geo,im,thumbVol,display);
           H5Pclose(lcpl);
           if(H5Fclose(f)<0&&bs.ok()) bs=Status(Code::WriteFailed,"cannot close "+partial+" (HDF5 error above)");
           if(bs.ok()&&!mono_vfd_ok(vfd,&why)) bs=Status(Code::WriteFailed,"the placement driver refused a write: "+why);

@@ -115,7 +115,7 @@ When even one `(timepoint, channel)` is too large for a node, tile it spatially.
 
 - **Parallelize at the (timepoint, channel) level, not within one array.** A single self-contained `.ims` (`monitor`) is written by one HDF5 stream — the throughput ceiling for that path. Splitting one array across processes with MPI-IO does **not** help (HDF5's collective compressed-write coordination is worse than a single writer). External links (`link` / `linkparts`) instead give many independent writers with no shared index, so the merge parallelizes across the cluster and is then limited only by aggregate storage bandwidth — turning a multi-hour single-writer combine into a parallel step of minutes on a large multi-timepoint dataset.
 - **Chunk size.** For the single-writer (`monitor`) path, fewer/bigger chunks cut per-chunk overhead — `PIW_CHUNK_BYTES=8388608` (8 MiB) noticeably speeds the combine, at some cost to Imaris interactive-read speed. The per-(timepoint,channel) approaches use the converter's default chunking.
-- **Scope & output.** The `/Thumbnail` preview image is not generated (Imaris does not need it to open the file). External-link output is a directory that must stay together (the link `.ims` plus its `parts/`). The normal single-process converter (above) handles all supported readers and bit depths.
+- **Scope & output.** The cluster outputs carry the same `/Thumbnail` preview image as the single-node converter (for uint16 `linkparts` output, built from the parts with their timepoint-0 color ranges). External-link output is a directory that must stay together (the link `.ims` plus its `parts/`). The normal single-process converter (above) handles all supported readers and bit depths.
 
 ## Reference
 

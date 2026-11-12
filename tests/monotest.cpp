@@ -8,8 +8,8 @@
 //              duplicate task). A truncated part fails; monostatus and monofinish then exit 3 and name the
 //              missing part; the journal stays open and the part is placed. Placing a part again leaves the
 //              file size and its sidecar unchanged. The parts are deleted, then monofinish --verify. Checks:
-//              the file equals the reference (imsCompare: every chunk, histogram, attribute and DataSetInfo
-//              group; only /Thumbnail is missing), every link is a hard link, the links and attributes of
+//              the file equals the reference (imsCompare: every chunk, histogram, attribute, DataSetInfo
+//              group and /Thumbnail), every link is a hard link, the links and attributes of
 //              every object are stored in the reference's order (native-order listings match; see nativeOrder
 //              for the one exception), a placement after the finish fails, and finishing again reports
 //              "already finished".
@@ -18,6 +18,10 @@
 //              re-chunks it, and the file equals the cropped single-node conversion (monoinit and the reference
 //              given the same metadata options). Refused: a part of another geometry, a uint8 part, a file with
 //              two channels, a monoinit with other metadata.
+//   thumbnail run: 1 timepoint x 2 channels, big enough that the thumbnail comes from level 1, with bright
+//              blocks off the middle slice (constant): ImarisWriter keeps the maximum projection. Non-default
+//              channel names and colors (given to the reference conversion and to monoinit alike): the file
+//              equals the single-node conversion, /DataSetInfo and /Thumbnail included.
 //   usage: monoTest <parallelimariswriter> <workdir>
 // Exit 0 = pass, 1 = fail, 77 = skipped (Windows: the single-file path is not supported there).
 #ifdef _WIN32
@@ -132,7 +136,6 @@ static void walkNative(hid_t f, const std::string& path, Listing& w){
     H5Literate2(o, H5_INDEX_NAME, H5_ITER_NATIVE, nullptr, linkCb, &l);
     std::vector<std::string> names;
     for(size_t i = 0; i < l.names.size(); i++){
-        if(path == "/" && l.names[i] == "Thumbnail") continue;   // not written by the cluster path yet (B-8)
         names.push_back(l.names[i]);
         const std::string child = (path == "/" ? "/" : path + "/") + l.names[i];
         if(l.types[i] != H5L_TYPE_HARD) w.notHard.push_back(child); else walkNative(f, child, w);
@@ -163,7 +166,7 @@ static bool compareFiles(const fs::path& ref, const fs::path& mono, const char* 
     ImsCompareOptions opt; ImsCompareReport report;
     imsCompare(ref, mono, report, opt);
     imsPrintReport(report);
-    bool ok = report.identicalExceptThumbnail();
+    bool ok = report.identical();
     CHECK(ok, "%s: the single file differs from the single-node conversion", what);
     return ok;
 }
@@ -287,6 +290,42 @@ int main(int argc, char** argv){
     if(fs::exists(out2)){
         compareFiles(ref2 / "output.ims", out2, "cropped, 2 timepoints x 1 channel");
         CHECK(nativeOrder(ref2 / "output.ims", out2), "crop run: storage order differs");
+    }
+
+    // ---------------- thumbnail run: level 1, the maximum projection ----------------
+    std::printf("[thumbnail] 1 timepoint x 2 channels, thumbnail from level 1\n");
+    const uint64_t tx = 530, ty = 520, tz = 12;   // levels 530x520x12, 265x260x12, 132x130x12
+    fs::path zdir3 = work / "zarr3", ref3 = work / "ref3", parts3 = work / "parts3", wd3 = work / "wd_thumb", out3 = work / "mono_thumb.ims";
+    fs::create_directories(zdir3); fs::create_directories(ref3); fs::create_directories(parts3);
+    for(int c = 0; c < 2; c++){
+        std::vector<uint16_t> v(tx * ty * tz);
+        for(uint64_t z = 0; z < tz; z++) for(uint64_t y = 0; y < ty; y++) for(uint64_t x = 0; x < tx; x++){
+            uint16_t val = z == tz / 2 ? 50 : (uint16_t)(50 + (x + y + z) % 10);   // the middle slice is constant
+            if(z == 2 && (x / 24 + y / 24 + (uint64_t)c) % 3 == 0) val = 3000;      // each channel's bright blocks
+            v[x + y * tx + z * tx * ty] = val;
+        }
+        char n[64]; std::snprintf(n, sizeof n, "%s_t0000.zarr", cam[c]);
+        writeZarr(zdir3 / n, v, tx, ty, tz, "<u2");
+    }
+    // the thumbnail is coloured with the resolved colors, as /DataSetInfo (a named color and a hex one whose
+    // components are neither 0 nor 1)
+    const std::string meta3 = " --channel-names Membrane,Nuclei --colors magenta,40C0A0 --start-time \"2025-02-03 04:05:06\"";
+    made = run(E + " -P CamA,CamB -F " + q(zdir3) + " -o " + q(ref3) + " -r zarr -v " + VOXEL + meta3) == 0;
+    for(int c = 0; c < 2; c++) made = made && run(E + " -P " + cam[c] + " -F " + q(zdir3) + " -o " + q(parts3) + " -n p" + std::to_string(c) +
+                                                 " -r zarr -v " + VOXEL) == 0;
+    made = made && run(E + " monoinit " + q(wd3) + " 1 2 " + VOXEL + meta3) == 0;
+    for(int c = 0; c < 2; c++) made = made && run(E + " monoplace " + q(wd3) + " 0 " + std::to_string(c) + " " + q(parts3 / ("p" + std::to_string(c) + ".ims"))) == 0;
+    made = made && run(E + " monofinish " + q(wd3) + " " + q(out3)) == 0;
+    CHECK(made, "thumbnail run: a conversion or a mono step failed");
+    if(made){
+        compareFiles(ref3 / "output.ims", out3, "thumbnail from level 1");
+        uint64_t rows = 0, rowBytes = 0; std::vector<uint8_t> rgba; std::set<uint32_t> colours;
+        CHECK(imsReadThumbnail(out3, rows, rowBytes, rgba), "thumbnail run: no /Thumbnail/Data");
+        for(size_t i = 0; i + 3 < rgba.size(); i += 4) colours.insert((uint32_t)rgba[i] | (uint32_t)rgba[i + 1] << 8 | (uint32_t)rgba[i + 2] << 16);
+        std::printf("  thumbnail %llu x %llu pixels, %zu colours\n", (unsigned long long)(rowBytes / 4), (unsigned long long)rows, colours.size());
+        CHECK(colours.size() >= 3, "thumbnail run: the thumbnail is not the maximum projection (the middle slice is one colour)");
+        bool blue = false; for(size_t i = 0; i + 3 < rgba.size() && !blue; i += 4) blue = rgba[i + 2] > 0;
+        CHECK(blue, "thumbnail run: no blue in the thumbnail (both colors have blue, the default red and green have none)");
     }
 
     if(gFail){ std::printf("monotest FAILED (%d checks)\n", gFail); return 1; }

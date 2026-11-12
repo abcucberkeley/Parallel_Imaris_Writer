@@ -121,6 +121,15 @@ inline Status decodeChunk(const uint8_t* c,size_t cs,std::vector<uint8_t>& vox,s
     vox.resize(expectRaw); unshuffle2(sh.data(),expectRaw,vox.data());
     return Status();
 }
+// Copies the in-image part of a decoded chunk (block dims b, chunk index cx,cy,cz; x fastest) into a dense
+// volume of size[0]*size[1]*size[2] voxels.
+inline void chunkToVolume(const uint16_t* v,const bpSize b[3],bpSize cx,bpSize cy,bpSize cz,const bpSize size[3],uint16_t* vol){
+    const bpSize x0=cx*b[0],y0=cy*b[1],z0=cz*b[2];
+    if(x0>=size[0]||y0>=size[1]||z0>=size[2]) return;
+    const bpSize xv=std::min(b[0],size[0]-x0),yv=std::min(b[1],size[1]-y0),zv=std::min(b[2],size[2]-z0);
+    for(bpSize z=0;z<zv;z++) for(bpSize y=0;y<yv;y++)
+        memcpy(vol+(size_t)(x0+(y0+y)*size[0]+(z0+z)*size[0]*size[1]),v+(size_t)(y+z*b[1])*b[0],(size_t)xv*2);
+}
 // Box-average one pyramid step; dims/strides [x,y,z] (x fastest), di a multiple of st.
 inline void boxDown(const std::vector<uint16_t>& in,const bpSize di[3],const bpSize st[3],std::vector<uint16_t>& out,bpSize dOut[3]){
     for(int a=0;a<3;a++) dOut[a]=di[a]/st[a];
@@ -408,6 +417,15 @@ inline hid_t imsCreate(const std::string& path){ hid_t fapl=H5Pcreate(H5P_FILE_A
 inline hid_t imsDtype(bpSize elem){ return elem==2?H5Tcopy(H5T_STD_U16LE):(elem==1?H5Tcopy(H5T_STD_U8LE):H5Tcopy(H5T_IEEE_F32LE)); }
 // DataSetInfo/Channel Color as ImarisWriter writes it (bpConvColorToString)
 inline std::string imsColorString(const piw::Color& k){ return fstr(k.red,3)+" "+fstr(k.green,3)+" "+fstr(k.blue,3); }
+// A channel's display settings as the single-node converter hands them to ImarisWriter's Finish (base-colour mode,
+// the channel's resolved color from imsmeta; after the auto-adjust, rangeMin/rangeMax are the ColorRange).
+// /DataSetInfo/Channel c is written from them and /Thumbnail is coloured with them, so both always agree.
+struct ChannelDisplay { float color[4]; float rangeMin, rangeMax, opacity, gamma; };
+inline ChannelDisplay imsChannelDisplay(const imsmeta::Metadata& md,int c){
+    const piw::Color& k=md.colors[c]; ChannelDisplay d={{k.red,k.green,k.blue,1.f},0.f,255.f,0.f,1.f}; return d; }
+inline std::string imsColorString(const ChannelDisplay& d){ piw::Color k={d.color[0],d.color[1],d.color[2]}; return imsColorString(k); }
+// The image extent (/DataSetInfo/Image ExtMax0..2; the minimum is 0) as the converter computes it: size * voxel size.
+inline void imsExtentMax(bpSize X,bpSize Y,bpSize Z,const float vox[3],float ext[3]){ ext[0]=(float)X*vox[0]; ext[1]=(float)Y*vox[1]; ext[2]=(float)Z*vox[2]; }
 // The per-channel attributes of imsmeta's metadata (Name, the wavelengths that were given, Color) on a
 // DataSetInfo/Channel group, for source channel c; an attribute already there is replaced, and a
 // wavelength attribute without a value is removed (linkparts edits a copied channel group with this).
@@ -497,29 +515,33 @@ inline Status writeImsRoot(hid_t out,hid_t lcpl){
 // and wavelengths from the SOURCE index); srcTps = source timepoints, aggregated for each channel's ColorRange (from
 // their level-0 histograms, hist(0,c,t)) and written as TimeInfo TimePoint1,2,... (no value is longer than the 1024
 // characters above which ImarisWriter writes a string as a dataset: imsmeta's names are at most that long).
+// display (optional) receives each written channel's settings (its color and ColorRange), for the thumbnail.
 inline Status writeImsDataSetInfo(hid_t out,const Manifest& m,hid_t lcpl,const std::vector<int>& srcCh,
-                                  const std::vector<int>& srcTps,const LevelHistFn& hist){
+                                  const std::vector<int>& srcTps,const LevelHistFn& hist,
+                                  std::vector<ChannelDisplay>* display=NULL){
     const Status bad=Status::fail("cannot write the Imaris metadata (HDF5 error above)");
     bool ok=true;
     std::map<std::string,std::map<std::string,std::string> > sec;   // section -> attribute -> value
-    bpSize X=m.X,Y=m.Y,Z=m.Z;
+    bpSize X=m.X,Y=m.Y,Z=m.Z; float ext[3]; imsExtentMax(X,Y,Z,m.vox,ext);
+    if(display) display->clear();
     std::map<std::string,std::string>& img=sec["Image"];
     img["Name"]="(name not specified)"; img["Description"]="(description not specified)";
     img["ExtMin0"]=fstr(0.f,9); img["ExtMin1"]=fstr(0.f,9); img["ExtMin2"]=fstr(0.f,9);
-    img["ExtMax0"]=fstr((float)X*m.vox[0],9); img["ExtMax1"]=fstr((float)Y*m.vox[1],9); img["ExtMax2"]=fstr((float)Z*m.vox[2],9);
+    img["ExtMax0"]=fstr(ext[0],9); img["ExtMax1"]=fstr(ext[1],9); img["ExtMax2"]=fstr(ext[2],9);
     img["X"]=std::to_string(X); img["Y"]=std::to_string(Y); img["Z"]=std::to_string(Z); img["Unit"]="um";
     img["ResampleDimensionX"]="true"; img["ResampleDimensionY"]="true"; img["ResampleDimensionZ"]="true";
     img["RecordingDate"]=srcTps.empty()?std::string():imsmeta::timeString(m.meta.times[srcTps[0]]);
     for(size_t oc=0;oc<srcCh.size();oc++){ int c=srcCh[oc];
         std::vector<std::vector<uint64_t>> perTp;
         for(int t:srcTps){ perTp.emplace_back(); Status s=hist(0,c,t,perTp.back()); if(!s.ok()) return s; }
-        float rMin=0,rMax=0; adjustColorRange(channelColorHistMulti(perTp),rMin,rMax);
+        ChannelDisplay d=imsChannelDisplay(m.meta,c); adjustColorRange(channelColorHistMulti(perTp),d.rangeMin,d.rangeMax);
+        if(display) display->push_back(d);
         std::map<std::string,std::string>& ch=sec["Channel "+std::to_string(oc)];
         ch["Name"]=m.meta.names[c]; ch["Description"]="(description not specified)";
         if(m.meta.emission[c]>0) ch["LSMEmissionWavelength"]=imsmeta::wavelengthString(m.meta.emission[c]);
         if(m.meta.excitation[c]>0) ch["LSMExcitationWavelength"]=imsmeta::wavelengthString(m.meta.excitation[c]);
-        ch["ColorMode"]="BaseColor"; ch["Color"]=imsColorString(m.meta.colors[c]);
-        ch["ColorRange"]=fstr(rMin,3)+" "+fstr(rMax,3); ch["ColorOpacity"]="0.000"; ch["GammaCorrection"]="1.000";
+        ch["ColorMode"]="BaseColor"; ch["Color"]=imsColorString(d);
+        ch["ColorRange"]=fstr(d.rangeMin,3)+" "+fstr(d.rangeMax,3); ch["ColorOpacity"]=fstr(d.opacity,3); ch["GammaCorrection"]=fstr(d.gamma,3);
     }
     sec["TimeInfo"]=timeInfoAttrs(m.meta,srcTps);
     std::map<std::string,std::string>& ids=sec["ImarisDataSet"];
@@ -536,9 +558,10 @@ inline Status writeImsDataSetInfo(hid_t out,const Manifest& m,hid_t lcpl,const s
 // Root attributes, /DataSet and /DataSetInfo at once, with the histograms summed from the per-tile partial
 // histograms in cd (the tile path).
 inline Status writeImsMeta(hid_t out,const Manifest& m,const std::string& cd,hid_t lcpl,
-                           const std::vector<int>& srcCh,const std::vector<int>& srcTps){
+                           const std::vector<int>& srcCh,const std::vector<int>& srcTps,
+                           std::vector<ChannelDisplay>* display=NULL){
     Status s=writeImsRoot(out,lcpl); if(!s.ok()) return s;
-    return writeImsDataSetInfo(out,m,lcpl,srcCh,srcTps,[&](int r,int c,int t,std::vector<uint64_t>& bins){ return sumPartialHists(m,cd,r,c,t,bins); });
+    return writeImsDataSetInfo(out,m,lcpl,srcCh,srcTps,[&](int r,int c,int t,std::vector<uint64_t>& bins){ return sumPartialHists(m,cd,r,c,t,bins); },display);
 }
 
 } // namespace imscore
