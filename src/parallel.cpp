@@ -450,7 +450,7 @@ static std::string partColorRange(const std::string& partDir,int c){          //
 static int linkParts(const std::string& wd,const std::string& outPath,const std::string& partRel){
     Manifest m=readManifest(wd); int nT=m.nT,nC=m.nC;
     if(nT<1||nC<1){ fprintf(stderr,"bad manifest (run setup?)\n"); return 1; }
-    std::string outDir="."; { size_t s=outPath.rfind('/'); if(s!=std::string::npos) outDir=outPath.substr(0,s); }
+    std::string outDir="."; { size_t s=outPath.find_last_of("/\\"); if(s!=std::string::npos) outDir=outPath.substr(0,s); }
     std::string partDir=partRel.empty()?outDir:outDir+"/"+partRel;
     std::string p00=partDir+"/"+partName(0,0);
     hid_t ref=H5Fopen(p00.c_str(),H5F_ACC_RDONLY,H5P_DEFAULT);
@@ -517,7 +517,7 @@ int runParallel(int argc,char** argv){
     if(cmd=="layout"&&argc>=5){ Vec3 img{(bpSize)atoll(argv[2]),(bpSize)atoll(argv[3]),(bpSize)atoll(argv[4])}; bpSize e=argc>5?atoll(argv[5]):2; bpSize cb=chunkBudgetBytes(); auto ls=GetOptimalImagePyramid((1024*1024)/e,img,true),bs=GetOptimalBlockSizes(cb/e,ls,1); printf("chunk budget %llu bytes\n",(unsigned long long)cb); printf("%zu levels\n",ls.size()); for(size_t i=0;i<ls.size();++i) printf("  L%zu size=%llu,%llu,%llu block=%llu,%llu,%llu\n",i,(unsigned long long)ls[i][0],(unsigned long long)ls[i][1],(unsigned long long)ls[i][2],(unsigned long long)bs[i][0],(unsigned long long)bs[i][1],(unsigned long long)bs[i][2]); return 0; }
     if(cmd=="setup"&&argc>=6){
         std::string folder=argv[2],patterns=argv[3],wd=argv[4];
-        if(wd.find('/')==std::string::npos){ std::string f=folder; while(f.size()>1&&f.back()=='/')f.pop_back(); wd=f+"/"+wd; }
+        if(wd.find_first_of("/\\")==std::string::npos){ std::string f=folder; while(f.size()>1&&(f.back()=='/'||f.back()=='\\'))f.pop_back(); wd=f+"/"+wd; }
         bpSize cap[3]={0,0,0}; sscanf(argv[5],"%llu,%llu,%llu",(unsigned long long*)&cap[0],(unsigned long long*)&cap[1],(unsigned long long*)&cap[2]);
         if(!cap[0]||!cap[1]||!cap[2]){ fprintf(stderr,"bad tile size '%s' (expected X,Y,Z voxels)\n",argv[5]); return 1; }
         std::vector<std::string> pats; { std::stringstream ss(patterns); std::string p; while(std::getline(ss,p,',')) if(!p.empty()) pats.push_back(p); }
