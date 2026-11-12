@@ -56,9 +56,11 @@ jobs:
 
       # The release target assembles the shipped folder (executable, libcppTiff,
       # libcppZarr and, on Linux and macOS, libgomp) that the tests run from.
+      # PIW_BUILD_PYTHON_LIB also builds libparallelImarisWriter, the Python
+      # package's library, so that it links on every system.
       - name: Build
         run: |
-          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release -DPIW_BUILD_TESTS=ON
+          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release -DPIW_BUILD_TESTS=ON -DPIW_BUILD_PYTHON_LIB=ON
           cmake --build build --parallel 4
           cmake --build build --target release
 

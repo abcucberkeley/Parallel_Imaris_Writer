@@ -1,0 +1,6 @@
+# Python package build output (setup.py's CMake build, wheels)
+build/
+dist/
+wheelhouse/
+*.egg-info/
+__pycache__/

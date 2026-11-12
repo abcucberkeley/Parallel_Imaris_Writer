@@ -114,6 +114,15 @@ FetchContent_MakeAvailable(hdf5)
 # "zlibstatic" targets collide with the zlib we (and cpp-tiff) fetched above.
 # Point blosc2 at the shared zlib via find_package(ZLIB) instead.
 set(PREFER_EXTERNAL_ZLIB ON CACHE BOOL "" FORCE)
+# PIW_PRIVATE_RUNTIME (the Python wheel): the reader libraries keep their static C++ runtime
+# private (on Linux their exports then hold only their own API), as the cpp-tiff and cpp-zarr
+# wheels' do. Exported, programs that load another C++ runtime after them (Python with PyTorch)
+# bound some of its symbols to these copies. Off by default: the executable takes its C++
+# runtime, LZ4 and zlib from the libraries' exports (v1.7.3 defaults).
+option(PIW_PRIVATE_RUNTIME "Keep the reader libraries' static C++ runtime private (Python wheel)" OFF)
+if(PIW_PRIVATE_RUNTIME)
+  set(CPPZARR_PRIVATE_RUNTIME ON CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(cpptiff
     GIT_REPOSITORY https://github.com/abcucberkeley/cpp-tiff.git
     GIT_TAG        v1.7.3
@@ -123,6 +132,10 @@ FetchContent_Declare(cppzarr
     GIT_TAG        v1.7.3
 )
 FetchContent_MakeAvailable(cpptiff cppzarr)
+if(PIW_PRIVATE_RUNTIME AND UNIX AND NOT APPLE)
+  # cpp-tiff has no switch of its own for this (cpp-zarr's is CPPZARR_PRIVATE_RUNTIME above).
+  target_link_options(cppTiff_shared PRIVATE -Wl,--exclude-libs,ALL)
+endif()
 
 # ---------------------------------------------------------------------------
 # ImarisWriter -- fetched but NOT configured with its own CMakeLists (which does
@@ -219,6 +232,12 @@ set(PIW_LINK_LIBRARIES
 target_include_directories(piw_core PRIVATE ${PIW_INCLUDE_DIRS})
 target_compile_definitions(piw_core PRIVATE PIW_VERSION="${PROJECT_VERSION}")
 target_link_libraries(piw_core PRIVATE ${PIW_LINK_LIBRARIES})   # usage requirements only (object library)
+if(NOT WIN32)
+    # The shared library (PIW_BUILD_PYTHON_LIB) then exports only the PIW_API functions of
+    # parallelimariswriter.h (MinGW DLLs export everything). The executable works as before; it
+    # only exports fewer symbols (the readers, linked -Bsymbolic, never bound to them).
+    target_compile_options(piw_core PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+endif()
 
 add_executable(parallelimariswriter ${SRC_DIR}/main.cpp $<TARGET_OBJECTS:piw_core>)
 target_include_directories(parallelimariswriter PRIVATE ${PIW_INCLUDE_DIRS})
@@ -230,7 +249,14 @@ target_link_libraries(parallelimariswriter PRIVATE ${PIW_LINK_LIBRARIES})
 # macOS with Homebrew gcc, as before). Also used for the test that links piw_core.
 function(piw_link_like_executable target)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_link_options(${target} PRIVATE -static-libstdc++ -static-libgcc)
+        if(PIW_PRIVATE_RUNTIME AND NOT APPLE AND NOT WIN32)
+            # The libraries then keep their runtime to themselves: the program brings its own
+            # static libstdc++ but unwinds with the shared libgcc_s (measured: a caller with a
+            # static libgcc aborted when it caught a reader's exception).
+            target_link_options(${target} PRIVATE -static-libstdc++)
+        else()
+            target_link_options(${target} PRIVATE -static-libstdc++ -static-libgcc)
+        endif()
         if(NOT APPLE AND NOT WIN32)
             # Emit DT_RPATH (searched before LD_LIBRARY_PATH) instead of DT_RUNPATH, so the
             # bundled libgomp/libcppTiff/libcppZarr always take precedence -- matching the
@@ -309,6 +335,56 @@ add_custom_target(release ${RELEASE_CMDS}
     DEPENDS parallelimariswriter
     COMMENT "Assembling self-contained release in ${RELEASE_DIR}"
     VERBATIM)
+
+# ---------------------------------------------------------------------------
+# libparallelImarisWriter: the converter core as a shared library, for the Python package
+# (python/setup.py configures with -DPIW_BUILD_PYTHON_LIB=ON -DPIW_PRIVATE_RUNTIME=ON). Its API
+# is src/parallelimariswriter.h. Same objects as the executable; the default build is unchanged.
+#     cmake --build <build> --target parallelImarisWriter_shared
+#     cmake --install <build> --component python     (lib/: the three libraries; include/: the header)
+# ---------------------------------------------------------------------------
+option(PIW_BUILD_PYTHON_LIB "Build libparallelImarisWriter, the shared library of the Python package" OFF)
+if(PIW_BUILD_PYTHON_LIB)
+    add_library(parallelImarisWriter_shared SHARED $<TARGET_OBJECTS:piw_core>)
+    set_target_properties(parallelImarisWriter_shared PROPERTIES OUTPUT_NAME parallelImarisWriter)
+    target_link_libraries(parallelImarisWriter_shared PRIVATE ${PIW_LINK_LIBRARIES})
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        # Its own static C++ runtime, kept private, like the readers' in the Python wheel.
+        target_link_options(parallelImarisWriter_shared PRIVATE -static-libstdc++)
+        if(APPLE OR WIN32)
+            target_link_options(parallelImarisWriter_shared PRIVATE -static-libgcc)
+        else()
+            # Static HDF5, LZ4, zlib, ImarisWriter and C++ runtime hidden, and only the piw::
+            # functions exported (the template instantiations of namespace std keep default
+            # visibility despite -fvisibility=hidden). The unwinder is the shared libgcc_s (never
+            # -static-libgcc on Linux: see piw_link_like_executable).
+            set(PIW_VERSION_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/parallelImarisWriter.map")
+            file(WRITE "${PIW_VERSION_SCRIPT}" "{\n  global:\n    extern \"C++\" { piw::*; };\n  local: *;\n};\n")
+            target_link_options(parallelImarisWriter_shared PRIVATE
+                -Wl,--exclude-libs,ALL "-Wl,--version-script=${PIW_VERSION_SCRIPT}")
+            set_property(TARGET parallelImarisWriter_shared APPEND PROPERTY LINK_DEPENDS "${PIW_VERSION_SCRIPT}")
+        endif()
+        if(WIN32)
+            # As the executable (libgcc's unwind symbols re-exported by the readers' DLLs). And
+            # ImarisWriter's dllexport declarations would turn off MinGW's export of everything,
+            # leaving the piw:: functions unexported.
+            target_link_options(parallelImarisWriter_shared PRIVATE
+                -Wl,--allow-multiple-definition -Wl,--export-all-symbols)
+        endif()
+    endif()
+    install(TARGETS parallelImarisWriter_shared COMPONENT python
+            LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+    if(WIN32)
+        set(PIW_READERS_DESTINATION ${CMAKE_INSTALL_BINDIR})
+    else()
+        set(PIW_READERS_DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    endif()
+    install(FILES $<TARGET_FILE:cppTiff_shared> $<TARGET_FILE:cppZarr_shared> COMPONENT python
+            DESTINATION ${PIW_READERS_DESTINATION} PERMISSIONS ${RUNTIME_PERMS})
+    install(FILES ${SRC_DIR}/parallelimariswriter.h COMPONENT python DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+endif()
 
 # ---------------------------------------------------------------------------
 # Tests (CTest). Each test program generates its inputs on the fly (no committed
