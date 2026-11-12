@@ -18,6 +18,8 @@
 //   parallelimariswriter layout     <X> <Y> <Z> [elemSize]          -- debug: print the pyramid
 // partsDir is relative to out.ims and holds part_t<t>_c<c>.ims. The tile path (worker, monitor,
 // combineone, link) takes uint16 data only; linkparts takes whatever the converter wrote.
+// One self-contained .ims from per-(t,c) converter outputs, without links or parts: monoinit, monoplace,
+// monofinish, monostatus (src/mono.h).
 
 // True if argv[1] selects a parallel subcommand (vs the default monolithic conversion).
 bool isParallelCommand(const char* cmd);

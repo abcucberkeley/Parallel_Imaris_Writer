@@ -183,8 +183,9 @@ set(SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 file(GLOB PIW_CORE_SOURCES CONFIGURE_DEPENDS ${SRC_DIR}/*.cpp)
 list(REMOVE_ITEM PIW_CORE_SOURCES ${SRC_DIR}/main.cpp)
 add_library(piw_core OBJECT ${PIW_CORE_SOURCES})
-# mono*.cpp: the single-file cluster output core (placement VFD, claims, sidecars); part of
-# piw_core through the glob, and compiled on their own into the mono-core test.
+# mono*.cpp: the single-file cluster output core (placement VFD, claims, sidecars), compiled on
+# their own into the mono-core test, and mono.cpp, the steps built on it (monoplace, monofinish, ...);
+# all part of piw_core through the glob.
 set(MONO_SRCS ${SRC_DIR}/monovfd.cpp ${SRC_DIR}/monoclaim.cpp ${SRC_DIR}/monoidx.cpp)
 
 # cpp-tiff's src dir is listed before cpp-zarr's on purpose: both ship a
@@ -400,4 +401,10 @@ if(PIW_BUILD_TESTS)
     target_link_libraries(monoCoreTest PRIVATE hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
     add_test(NAME monoCore COMMAND monoCoreTest "${CMAKE_CURRENT_BINARY_DIR}/monocore_work")
     set_tests_properties(monoCore PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Single-file cluster output of the time-series path (setup/monoinit, monoplace, monostatus,
+    # monofinish): equal to a single-node conversion of the same volumes except /Thumbnail, in the
+    # same storage order; restart and failure cases. Reports "skipped" on Windows.
+    piw_add_test(mono tests/monotest.cpp LIBS cppZarr_shared)
+    set_tests_properties(mono PROPERTIES SKIP_RETURN_CODE 77)
 endif()

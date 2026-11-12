@@ -49,6 +49,13 @@ namespace detail {
 // The one Unsupported case the command line still reports on stdout with exit code 0.
 extern const char* const kNo64BitData;
 const char* const kNo64BitData = "64 bit data is not yet supported by the Imaris Converter";
+
+// HDF5 in this build is not thread-safe, and every Imaris writer has its own HDF5-calling thread:
+// one conversion at a time per process. The single-file cluster steps (src/mono.cpp) take it too.
+std::mutex& libraryMutex(){
+    static std::mutex vMutex;
+    return vMutex;
+}
 }
 
 namespace {
@@ -106,13 +113,6 @@ static void fillBlock(T* buf, const T* src,
     for(int i = 0; i < nThreads - 1; ++i) threads.emplace_back(worker);
     worker();
     for(auto& t : threads) t.join();
-}
-
-// HDF5 in this build is not thread-safe, and every Imaris writer has its own HDF5-calling thread:
-// one conversion at a time per process.
-std::mutex& libraryMutex(){
-    static std::mutex vMutex;
-    return vMutex;
 }
 
 // OpenMP's thread count of the calling thread for the duration of a call (numThreads > 0).
@@ -740,7 +740,7 @@ Status convert(const ConvertOptions& options, const Callbacks& callbacks) noexce
     try{
         Status vStatus = validate(options);
         if(!vStatus.ok()) return vStatus;
-        std::lock_guard<std::mutex> vLock(libraryMutex());
+        std::lock_guard<std::mutex> vLock(detail::libraryMutex());
         ThreadCount vThreads(options.numThreads);
         return convertValidated(options, callbacks);
     }

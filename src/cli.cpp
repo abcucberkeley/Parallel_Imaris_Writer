@@ -20,6 +20,7 @@
 #include "helperfunctions.h"        // cpp-tiff's expandTilde(char*), used for the output folder as before
 #include "parallelimariswriter.h"
 #include "parallel.h"
+#include "mono.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -391,8 +392,9 @@ int runCli(int argc, char** argv) noexcept
 {
     int vExitCode = 1;
     try{
-        // Cluster subcommands (setup/worker/monitor/...); otherwise the single-node conversion.
+        // Cluster subcommands (setup/worker/monitor/..., monoinit/monoplace/...); otherwise the single-node conversion.
         if(argc >= 2 && isParallelCommand(argv[1])) vExitCode = runParallel(argc, argv);
+        else if(argc >= 2 && isMonoCommand(argv[1])) vExitCode = runMono(argc, argv);
         else vExitCode = convertToImaris(argc, argv);
     }
     catch(const std::string& vError){ fprintf(stderr, "ERROR: %s\n", vError.c_str()); vExitCode = 1; }

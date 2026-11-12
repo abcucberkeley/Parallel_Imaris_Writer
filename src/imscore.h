@@ -24,6 +24,7 @@
 #include <sstream>
 #include <iomanip>
 #include <functional>
+#include <map>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
@@ -100,16 +101,22 @@ inline bool encodeChunk(const uint8_t* vox,size_t nb,std::vector<uint8_t>& out){
     wbe(out.data(),nb,8); wbe(out.data()+8,nb,4); wbe(out.data()+12,(uint64_t)c,4); out.resize(16+c);
     return true;
 }
-// Decode one chunk written by encodeChunk; expectRaw = the chunk's voxel bytes (the header must agree).
-inline Status decodeChunk(const uint8_t* c,size_t cs,std::vector<uint8_t>& vox,size_t expectRaw){
+// The LZ4 stage of decodeChunk: the chunk's still shuffled bytes into sh (expectRaw bytes, the header must agree).
+inline Status decodeChunkShuffled(const uint8_t* c,size_t cs,uint8_t* sh,size_t expectRaw){
     if(cs<16) return Status::fail("chunk of "+std::to_string(cs)+" bytes is shorter than its 16-byte header");
     uint64_t t=rbe(c,8), comp=rbe(c+12,4);
     if(t!=expectRaw) return Status::fail("chunk header says "+std::to_string(t)+" raw bytes, expected "+std::to_string(expectRaw));
     if(comp!=cs-16) return Status::fail("chunk header says "+std::to_string(comp)+" compressed bytes, chunk has "+std::to_string(cs-16));
-    std::vector<uint8_t> sh(t);
-    int d=LZ4_decompress_safe((const char*)c+16,(char*)sh.data(),(int)(cs-16),(int)t);
+    if(t>(uint64_t)LZ4_MAX_INPUT_SIZE) return Status::fail("chunk header says "+std::to_string(t)+" raw bytes, more than one LZ4 block holds");
+    int d=LZ4_decompress_safe((const char*)c+16,(char*)sh,(int)(cs-16),(int)t);
     if(d<0||(uint64_t)d!=t) return Status::fail("LZ4 could not decode a chunk (corrupt data)");
-    vox.resize(t); unshuffle2(sh.data(),t,vox.data());
+    return Status();
+}
+// Decode one chunk written by encodeChunk; expectRaw = the chunk's voxel bytes (the header must agree).
+inline Status decodeChunk(const uint8_t* c,size_t cs,std::vector<uint8_t>& vox,size_t expectRaw){
+    std::vector<uint8_t> sh(expectRaw);
+    Status s=decodeChunkShuffled(c,cs,sh.data(),expectRaw); if(!s.ok()) return s;
+    vox.resize(expectRaw); unshuffle2(sh.data(),expectRaw,vox.data());
     return Status();
 }
 // Box-average one pyramid step; dims/strides [x,y,z] (x fastest), di a multiple of st.
@@ -368,14 +375,16 @@ inline const char* imsChannelName(int c){ static const char* N[3]={"First channe
 inline std::string imsChannelColor(int c){ return fstr(c%3==0?1.f:0.f,3)+" "+fstr(c%3==1?1.f:0.f,3)+" "+fstr(c%3==2?1.f:0.f,3); }
 
 // ===================== histograms + color range =====================
-// trim a 65536-bin histogram like bpHistogramBuilder<uint16>::GetHistogram (min 0, keep >=257 span)
+// trim a 65536-bin histogram like bpHistogramBuilder<uint16>::GetHistogram (min 0, keep >=257 span). Written in
+// bpWriterHDF5::WriteHistogramImpl's order (Min, Max, then the dataset; 256 bins, then 1024): the group's object
+// header then stores its links and attributes in the same order as a single-node file.
 inline bool writeHistogramFromBins(hid_t g,const std::vector<uint64_t>& bins){
     bool any=false; for(uint64_t v:bins){ if(v){any=true;break;} } if(!any)return true;
     uint64_t vMax=65535; while(256<vMax&&bins[vMax]==0)--vMax; uint64_t nb=vMax+1; std::vector<uint64_t> tr(bins.begin(),bins.begin()+nb);
     auto rs=[](const std::vector<uint64_t>& in,uint64_t nN){ std::vector<uint64_t> o(nN,0); uint64_t on=in.size(); for(uint64_t i=0;i<on;i++) o[i*nN/on]+=in[i]; return o; };
     std::vector<uint64_t> h1024=nb>1024?rs(tr,1024):tr, h256=rs(h1024,256); std::string mn="0.000",mx=fstr((float)vMax,3);
-    bool ok=writeU64(g,"Histogram",h256); ok&=setStrAttr(g,"HistogramMin",mn); ok&=setStrAttr(g,"HistogramMax",mx);
-    if(h1024.size()!=256){ ok&=writeU64(g,"Histogram1024",h1024); ok&=setStrAttr(g,"HistogramMin1024",mn); ok&=setStrAttr(g,"HistogramMax1024",mx); }
+    bool ok=setStrAttr(g,"HistogramMin",mn); ok&=setStrAttr(g,"HistogramMax",mx); ok&=writeU64(g,"Histogram",h256);
+    if(h1024.size()!=256){ ok&=setStrAttr(g,"HistogramMin1024",mn); ok&=setStrAttr(g,"HistogramMax1024",mx); ok&=writeU64(g,"Histogram1024",h1024); }
     return ok;
 }
 // per-channel auto ColorRange from the (exact, summed) level-0 histogram
@@ -410,45 +419,67 @@ inline ColorHist channelColorHistMulti(const std::vector<std::vector<uint64_t>>&
 }
 
 // ===================== Imaris metadata =====================
-// root attrs + full DataSetInfo (Image, Channels w/ ColorRange, TimeInfo, ImarisDataSet, Log) + empty DataSet group.
-// srcCh = source channel indices written as Channel 0,1,... (color/name from the SOURCE index); colorTps = source
-// timepoints aggregated for each channel's ColorRange (from the level-0 partial histograms in cd); nTime = number
-// of TimeInfo entries.
-inline Status writeImsMeta(hid_t out,const Manifest& m,const std::string& cd,hid_t lcpl,
-                           const std::vector<int>& srcCh,const std::vector<int>& colorTps,int nTime){
+// The full 65536-bin histogram of (level r, source channel c, source timepoint t), wherever a writer keeps it.
+typedef std::function<Status(int r,int c,int t,std::vector<uint64_t>& bins)> LevelHistFn;
+// The metadata is written in ImarisWriter's order, so that even listings in native (storage) order match a
+// single-node file: writeImsRoot (bpWriterHDF5's constructor, then /DataSet with the first data block), the
+// /DataSet tree (each level's groups in increasing t, then c), then writeImsDataSetInfo (WriteMetadata, after
+// the data), then the thumbnail. writeImsMeta writes both parts at once, before the data.
+// Root attributes + the empty /DataSet group.
+inline Status writeImsRoot(hid_t out,hid_t lcpl){
     const Status bad=Status::fail("cannot write the Imaris metadata (HDF5 error above)");
     bool ok=setStrAttr(out,"ImarisDataSet","ImarisDataSet"); ok&=setStrAttr(out,"ImarisVersion","5.5.0"); ok&=setStrAttr(out,"DataSetInfoDirectoryName","DataSetInfo"); ok&=setStrAttr(out,"ThumbnailDirectoryName","Thumbnail"); ok&=setStrAttr(out,"DataSetDirectoryName","DataSet");
     { uint32_t one=1; hsize_t d=1; hid_t sp=H5Screate_simple(1,&d,NULL); hid_t a=sp<0?-1:H5Acreate2(out,"NumberOfDataSets",H5T_STD_U32LE,sp,H5P_DEFAULT,H5P_DEFAULT); ok&=a>=0&&H5Awrite(a,H5T_NATIVE_UINT32,&one)>=0; if(a>=0)H5Aclose(a); if(sp>=0)H5Sclose(sp); }
     if(!ok) return bad;
+    { hid_t g=H5Gcreate2(out,"DataSet",lcpl,H5P_DEFAULT,H5P_DEFAULT); if(g<0) return bad; H5Gclose(g); }
+    return Status();
+}
+// The full DataSetInfo (Channels w/ ColorRange, Image, ImarisDataSet, Log, TimeInfo): its sections and each
+// section's attributes sorted by name, as bpWriterHDF5::WriteMetadata walks its std::maps. srcCh = source channel
+// indices written as Channel 0,1,... (color/name from the SOURCE index); colorTps = source timepoints aggregated
+// for each channel's ColorRange (from their level-0 histograms, hist(0,c,t)); nTime = number of TimeInfo entries.
+inline Status writeImsDataSetInfo(hid_t out,const Manifest& m,hid_t lcpl,const std::vector<int>& srcCh,
+                                  const std::vector<int>& colorTps,int nTime,const LevelHistFn& hist){
+    const Status bad=Status::fail("cannot write the Imaris metadata (HDF5 error above)");
+    bool ok=true;
+    std::map<std::string,std::map<std::string,std::string> > sec;   // section -> attribute -> value
     bpSize X=m.X,Y=m.Y,Z=m.Z;
-    hid_t img=H5Gcreate2(out,"DataSetInfo/Image",lcpl,H5P_DEFAULT,H5P_DEFAULT); if(img<0) return bad;
-    ok&=setStrAttr(img,"Name","(name not specified)"); ok&=setStrAttr(img,"Description","(description not specified)");
-    ok&=setStrAttr(img,"ExtMin0",fstr(0.f,9)); ok&=setStrAttr(img,"ExtMin1",fstr(0.f,9)); ok&=setStrAttr(img,"ExtMin2",fstr(0.f,9));
-    ok&=setStrAttr(img,"ExtMax0",fstr((float)X*m.vox[0],9)); ok&=setStrAttr(img,"ExtMax1",fstr((float)Y*m.vox[1],9)); ok&=setStrAttr(img,"ExtMax2",fstr((float)Z*m.vox[2],9));
-    ok&=setStrAttr(img,"X",std::to_string(X)); ok&=setStrAttr(img,"Y",std::to_string(Y)); ok&=setStrAttr(img,"Z",std::to_string(Z)); ok&=setStrAttr(img,"Unit","um");
-    ok&=setStrAttr(img,"ResampleDimensionX","true"); ok&=setStrAttr(img,"ResampleDimensionY","true"); ok&=setStrAttr(img,"ResampleDimensionZ","true"); ok&=setStrAttr(img,"RecordingDate",fmtTime(55624)); H5Gclose(img);
-    if(!ok) return bad;
+    std::map<std::string,std::string>& img=sec["Image"];
+    img["Name"]="(name not specified)"; img["Description"]="(description not specified)";
+    img["ExtMin0"]=fstr(0.f,9); img["ExtMin1"]=fstr(0.f,9); img["ExtMin2"]=fstr(0.f,9);
+    img["ExtMax0"]=fstr((float)X*m.vox[0],9); img["ExtMax1"]=fstr((float)Y*m.vox[1],9); img["ExtMax2"]=fstr((float)Z*m.vox[2],9);
+    img["X"]=std::to_string(X); img["Y"]=std::to_string(Y); img["Z"]=std::to_string(Z); img["Unit"]="um";
+    img["ResampleDimensionX"]="true"; img["ResampleDimensionY"]="true"; img["ResampleDimensionZ"]="true"; img["RecordingDate"]=fmtTime(55624);
     for(size_t oc=0;oc<srcCh.size();oc++){ int c=srcCh[oc];
         std::vector<std::vector<uint64_t>> perTp;
-        for(int t:colorTps){ perTp.emplace_back(); Status s=sumPartialHists(m,cd,0,c,t,perTp.back()); if(!s.ok()) return s; }
+        for(int t:colorTps){ perTp.emplace_back(); Status s=hist(0,c,t,perTp.back()); if(!s.ok()) return s; }
         float rMin=0,rMax=0; adjustColorRange(channelColorHistMulti(perTp),rMin,rMax);
-        hid_t ch=H5Gcreate2(out,("DataSetInfo/Channel "+std::to_string(oc)).c_str(),lcpl,H5P_DEFAULT,H5P_DEFAULT); if(ch<0) return bad;
-        ok&=setStrAttr(ch,"Name",imsChannelName(c)); ok&=setStrAttr(ch,"Description","(description not specified)");
-        ok&=setStrAttr(ch,"LSMEmissionWavelength","700"); ok&=setStrAttr(ch,"OtherChannelParameter","OtherChannelValue");
-        ok&=setStrAttr(ch,"ColorMode","BaseColor"); ok&=setStrAttr(ch,"Color",imsChannelColor(c));
-        ok&=setStrAttr(ch,"ColorRange",fstr(rMin,3)+" "+fstr(rMax,3)); ok&=setStrAttr(ch,"ColorOpacity","0.000"); ok&=setStrAttr(ch,"GammaCorrection","1.000"); H5Gclose(ch);
+        std::map<std::string,std::string>& ch=sec["Channel "+std::to_string(oc)];
+        ch["Name"]=imsChannelName(c); ch["Description"]="(description not specified)";
+        ch["LSMEmissionWavelength"]="700"; ch["OtherChannelParameter"]="OtherChannelValue";
+        ch["ColorMode"]="BaseColor"; ch["Color"]=imsChannelColor(c);
+        ch["ColorRange"]=fstr(rMin,3)+" "+fstr(rMax,3); ch["ColorOpacity"]="0.000"; ch["GammaCorrection"]="1.000";
+    }
+    std::map<std::string,std::string>& ti=sec["TimeInfo"];
+    ti["FileTimePoints"]=std::to_string(nTime); ti["DatasetTimePoints"]=std::to_string(nTime);
+    for(int t=0;t<nTime;t++) ti["TimePoint"+std::to_string(t+1)]=fmtTime(55624+t);
+    std::map<std::string,std::string>& ids=sec["ImarisDataSet"];
+    ids["NumberOfImages"]="1"; ids["Creator"]="TestC"; ids["Version"]="1.0.0";
+    sec["Log"]["Entries"]="0";
+    for(const auto& s:sec){
+        hid_t g=H5Gcreate2(out,("DataSetInfo/"+s.first).c_str(),lcpl,H5P_DEFAULT,H5P_DEFAULT); if(g<0) return bad;
+        for(const auto& a:s.second) ok&=setStrAttr(g,a.first.c_str(),a.second);
+        H5Gclose(g);
         if(!ok) return bad;
     }
-    hid_t ti=H5Gcreate2(out,"DataSetInfo/TimeInfo",lcpl,H5P_DEFAULT,H5P_DEFAULT); if(ti<0) return bad;
-    ok&=setStrAttr(ti,"FileTimePoints",std::to_string(nTime)); ok&=setStrAttr(ti,"DatasetTimePoints",std::to_string(nTime));
-    for(int t=0;t<nTime;t++) ok&=setStrAttr(ti,("TimePoint"+std::to_string(t+1)).c_str(), fmtTime(55624+t));
-    H5Gclose(ti);
-    hid_t ids=H5Gcreate2(out,"DataSetInfo/ImarisDataSet",lcpl,H5P_DEFAULT,H5P_DEFAULT); if(ids<0) return bad;
-    ok&=setStrAttr(ids,"NumberOfImages","1"); ok&=setStrAttr(ids,"Creator","TestC"); ok&=setStrAttr(ids,"Version","1.0.0"); H5Gclose(ids);
-    hid_t lg=H5Gcreate2(out,"DataSetInfo/Log",lcpl,H5P_DEFAULT,H5P_DEFAULT); if(lg<0) return bad;
-    ok&=setStrAttr(lg,"Entries","0"); H5Gclose(lg);
-    { hid_t g=H5Gcreate2(out,"DataSet",lcpl,H5P_DEFAULT,H5P_DEFAULT); if(g<0) return bad; H5Gclose(g); }
-    return ok?Status():bad;
+    return Status();
+}
+// Root attributes, /DataSet and /DataSetInfo at once, with the histograms summed from the per-tile partial
+// histograms in cd (the tile path).
+inline Status writeImsMeta(hid_t out,const Manifest& m,const std::string& cd,hid_t lcpl,
+                           const std::vector<int>& srcCh,const std::vector<int>& colorTps,int nTime){
+    Status s=writeImsRoot(out,lcpl); if(!s.ok()) return s;
+    return writeImsDataSetInfo(out,m,lcpl,srcCh,colorTps,nTime,[&](int r,int c,int t,std::vector<uint64_t>& bins){ return sumPartialHists(m,cd,r,c,t,bins); });
 }
 
 } // namespace imscore
