@@ -47,8 +47,8 @@ std::string finishedPath(const std::string& wd){ return monoDir(wd)+"/finished";
 double seconds(){ return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 int threadsOf(int n){ return n>0?n:std::max(1,piw::defaultThreads()); }
 
-// ---------------- manifest (timepoints, channels, voxel size, optional output, metadata; setup's store) ----------------
-struct MonoManifest { int nT=0, nC=0; float vox[3]={0,0,0}; std::string output, store; imsmeta::Metadata meta; };
+// ---------------- manifest (timepoints, channels, voxel size, optional output, metadata; setup's store; a plan's kind) ----------------
+struct MonoManifest { int nT=0, nC=0; float vox[3]={0,0,0}; std::string output, store, kind; imsmeta::Metadata meta; };
 // The metadata of o's fields for nC channels x nT timepoints (imsmeta::resolveMetadataFields; without input files
 // the start time is startTime, else the current time)
 std::string resolveMonoMetadata(const piw::MonoInitOptions& o,int nT,int nC,imsmeta::Metadata& md){
@@ -66,7 +66,7 @@ Status readMonoManifest(const std::string& wd,MonoManifest& m){
         if(!j.contains("voxel")||j["voxel"].size()!=3) return Status(Code::InvalidArgument,p+" has no voxel size");
         for(int a=0;a<3;a++) m.vox[a]=j["voxel"][a].get<float>();
         if(j.contains("output")) m.output=j["output"].get<std::string>();
-        m.store=j.value("store",std::string());
+        m.store=j.value("store",std::string()); m.kind=j.value("kind",std::string());
         if((hasMeta=j.contains("metadata"))){ imscore::Status ms=imscore::readMetadataJson(j["metadata"],m.nC,m.nT,m.meta);
             if(!ms.ok()) return Status(Code::InvalidArgument,p+": "+ms.message); }
     }catch(const std::exception& e){ return Status(Code::InvalidArgument,"invalid "+p+": "+e.what()); }
@@ -562,8 +562,15 @@ Status monoPlace(const MonoPlaceOptions& o,MonoPlaceResult* result) noexcept{
 #ifndef _WIN32
 namespace {
 // ---------------- tile workdirs (setup + worker, mono store: parallel.h) ----------------
-// A workdir whose single file the tile workers write: setup's mono store, and no part placed (no layout.json).
-bool tilesWorkdir(const std::string& wd,const MonoManifest& m){ return m.store=="mono"&&!exists(monoDir(wd)+"/layout.json"); }
+// A workdir whose single file the tile workers write: a tile plan's (src/cluster.cpp: the manifest's kind decides),
+// else setup's mono store once a tile worker has marked it (mono/tiles). A setup workdir without the mark takes parts
+// (monoplace) until a worker marks it.
+bool tilesWorkdir(const std::string& wd,const MonoManifest& m){
+    if(!m.kind.empty()) return m.kind=="tiles";
+    return m.store=="mono"&&exists(monoDir(wd)+"/tiles"); }
+// Nothing decides yet whether a setup workdir (mono store) takes parts or tiles: nothing placed, no mark.
+bool undecidedWorkdir(const std::string& wd,const MonoManifest& m){
+    return m.kind.empty()&&m.store=="mono"&&!exists(monoDir(wd)+"/tiles")&&!exists(monoDir(wd)+"/layout.json"); }
 struct TileId { int r, t, c; long tile; };
 // Every tile of the manifest, in (level, timepoint, channel, tile) order.
 std::vector<TileId> allTiles(const imscore::Manifest& im){
@@ -1006,7 +1013,9 @@ Status monoFinish(const MonoFinishOptions& o,MonoFinishResult* result) noexcept{
                 if(result) *result=res;
                 return Status();
             }
-            return Status(Code::NotFound,"no "+partial+(tiles?": no tile was placed yet (run the workers first)":": no part was placed yet (run monoplace first)"));
+            return Status(Code::NotFound,"no "+partial+(tiles?": no tile was placed yet (run the workers first)":
+                                                       undecidedWorkdir(wd,m)?": nothing was placed yet (run monoplace for the parts, or the tile workers)":
+                                                       ": no part was placed yet (run monoplace first)"));
         }
         if(!tiles&&exists(monoDir(wd)+"/tiles"))
             return Status(Code::InvalidArgument,wd+" holds both parts (monoplace) and tiles (worker): its single file cannot be finished (use a new workdir)");
@@ -1053,6 +1062,25 @@ bool options(int argc,char** argv,std::vector<std::string>& pos,int& threads,boo
 double gbps(uint64_t b,double s){ return s>0?(double)b/1e9/s:0.0; }
 }  // namespace
 
+std::string monoPlaceLine(const piw::MonoPlaceResult& r){
+    char b[512];
+    snprintf(b,sizeof b,"monoplace %s: %llu chunks, %d levels, %.2f GB at %llu: scan %.1f s, decode %.1f s, place %.1f s (%.2f GB/s, %s, %d threads), total %.1f s",
+             r.owner.c_str(),(unsigned long long)r.chunks,r.levels,(double)r.bytes/1e9,(unsigned long long)r.claimOffset,r.scanSeconds,r.decodeSeconds,
+             r.placeSeconds,gbps(r.bytes,r.placeSeconds),r.direct?"direct I/O":"buffered + sync",r.threads,r.totalSeconds);
+    return b;
+}
+void monoPrintFinish(const piw::MonoFinishResult& r,bool verify){
+    if(r.alreadyFinished){ printf("monofinish: already finished: %s\n",r.outputFile.c_str()); return; }
+    printf("monofinish: %d timepoints x %d channels x %d levels, %llu chunks, %.2f GB -> %s\n",r.timepoints,r.channels,r.levels,
+           (unsigned long long)r.chunks,(double)r.fileBytes/1e9,r.outputFile.c_str());
+    printf("  sidecars + seal %.1f s, HDF5 structure %.1f s (%.1f MB after the raw region), stock-driver check %.1f s%s, total %.1f s\n",
+           r.readSeconds,r.indexSeconds,(double)(r.fileBytes-r.rawEnd)/1e6,r.checkSeconds,
+           verify?(", --verify "+std::to_string((long long)(r.verifySeconds+0.5))+" s").c_str():"",r.totalSeconds);
+    if(!r.rechunkedLevels.empty()){ std::string l; for(size_t i=0;i<r.rechunkedLevels.size();i++) l+=(i?", ":"")+std::to_string(r.rechunkedLevels[i]);
+        printf("  levels %s re-chunked to the %d-timepoint layout (%llu chunks)\n",l.c_str(),r.timepoints,(unsigned long long)r.rechunkedChunks); }
+    if(!r.note.empty()) printf("  note: %s\n",r.note.c_str());
+}
+
 bool isMonoCommand(const char* c){ return c&&(!strcmp(c,"monoinit")||!strcmp(c,"monoplace")||!strcmp(c,"monofinish")||!strcmp(c,"monostatus")); }
 
 int runMono(int argc,char** argv){
@@ -1079,9 +1107,7 @@ int runMono(int argc,char** argv){
         if(pos.size()!=4||!parseInt(pos[1].c_str(),o.timepoint)||!parseInt(pos[2].c_str(),o.channel)) return usage("monoplace");
         o.workdir=pos[0]; o.partFile=pos[3]; o.numThreads=threads;
         piw::MonoPlaceResult r; piw::Status s=piw::monoPlace(o,&r); if(!s.ok()) return fail(s);
-        printf("monoplace %s: %llu chunks, %d levels, %.2f GB at %llu: scan %.1f s, decode %.1f s, place %.1f s (%.2f GB/s, %s, %d threads), total %.1f s\n",
-               r.owner.c_str(),(unsigned long long)r.chunks,r.levels,(double)r.bytes/1e9,(unsigned long long)r.claimOffset,r.scanSeconds,r.decodeSeconds,
-               r.placeSeconds,gbps(r.bytes,r.placeSeconds),r.direct?"direct I/O":"buffered + sync",r.threads,r.totalSeconds);
+        printf("%s\n",monoPlaceLine(r).c_str());
         return 0;
     }
     if(cmd=="monofinish"){
@@ -1090,15 +1116,7 @@ int runMono(int argc,char** argv){
         o.workdir=pos[0]; if(pos.size()>1) o.outputFile=pos[1]; o.verify=verify; o.numThreads=threads;
         piw::MonoFinishResult r; piw::Status s=piw::monoFinish(o,&r);
         if(!s.ok()){ fail(s); return r.missing.empty()?1:3; }
-        if(r.alreadyFinished){ printf("monofinish: already finished: %s\n",r.outputFile.c_str()); return 0; }
-        printf("monofinish: %d timepoints x %d channels x %d levels, %llu chunks, %.2f GB -> %s\n",r.timepoints,r.channels,r.levels,
-               (unsigned long long)r.chunks,(double)r.fileBytes/1e9,r.outputFile.c_str());
-        printf("  sidecars + seal %.1f s, HDF5 structure %.1f s (%.1f MB after the raw region), stock-driver check %.1f s%s, total %.1f s\n",
-               r.readSeconds,r.indexSeconds,(double)(r.fileBytes-r.rawEnd)/1e6,r.checkSeconds,
-               o.verify?(", --verify "+std::to_string((long long)(r.verifySeconds+0.5))+" s").c_str():"",r.totalSeconds);
-        if(!r.rechunkedLevels.empty()){ std::string l; for(size_t i=0;i<r.rechunkedLevels.size();i++) l+=(i?", ":"")+std::to_string(r.rechunkedLevels[i]);
-            printf("  levels %s re-chunked to the %d-timepoint layout (%llu chunks)\n",l.c_str(),r.timepoints,(unsigned long long)r.rechunkedChunks); }
-        if(!r.note.empty()) printf("  note: %s\n",r.note.c_str());
+        monoPrintFinish(r,o.verify);
         return 0;
     }
     if(cmd=="monostatus"){

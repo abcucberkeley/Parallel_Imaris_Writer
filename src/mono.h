@@ -40,7 +40,8 @@
 // coarser levels read the finer levels' chunks back from the file. monofinish (which monitor runs once every
 // sidecar exists) then works as for parts, with the geometry from the manifest (setup lays the blocks out for all
 // nT timepoints, so no level is re-chunked) and each dataset's histogram summed from its tiles'. A workdir takes
-// parts or tiles, never both.
+// parts or tiles, never both: a plan's workdir (parallel.h's clusterPlan) says which in its manifest ("kind"); a
+// setup workdir is a tile workdir once its first worker has marked it (mono/tiles) and takes parts until then.
 //
 // Every step is also a function here: it returns a Status (no exit, no printing; the command line prints the
 // results), takes its thread count as an argument, and holds the library's HDF5 mutex only around its HDF5
@@ -149,5 +150,8 @@ Status monoFinish(const MonoFinishOptions& options, MonoFinishResult* result = n
 // True if cmd is one of the commands above; runMono runs it (argv[1] = the command), returns the exit code.
 bool isMonoCommand(const char* cmd);
 int runMono(int argc, char** argv);
+// The lines monoplace and monofinish print (also printed by parallel.h's task and finish).
+std::string monoPlaceLine(const piw::MonoPlaceResult& result);
+void monoPrintFinish(const piw::MonoFinishResult& result, bool verify);
 
 #endif

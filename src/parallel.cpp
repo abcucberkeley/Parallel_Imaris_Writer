@@ -20,6 +20,7 @@
 #include <chrono>
 #include <ctime>
 #include <memory>
+#include <mutex>
 #include <dirent.h>
 #include <unistd.h>
 #ifndef _WIN32
@@ -297,9 +298,10 @@ static Status storeMono(const Manifest& m,const std::string& wd,int r,int c,int 
 }
 #endif
 
-// One tile: its level-r voxels (level 0 from the zarr; coarser levels downsampled from the finer level's region
-// under it), zero past the level's size, encoded, stored. Prints one timing line.
-static Status workTile(const Manifest& m,const std::string& wd,int r,long index){
+// One tile: its level-r voxels (level 0 from the zarr, at the manifest's origin; coarser levels downsampled from the
+// finer level's region under it), zero past the level's size, encoded, stored. line: its timing line (empty for an
+// empty tile).
+static Status workTile(const Manifest& m,const std::string& wd,int r,long index,std::string& line){
     const std::string cd=wd+"/chunks"; const Lev& Lr=m.lev[r]; const long perCT=tilesPerCT(Lr); const bool mono=m.store=="mono";
     const int c=(int)(index/((long)m.nT*perCT)); const long rem=index%((long)m.nT*perCT); const int t=(int)(rem/perCT); const long ti=rem%perCT;
     const int threads=std::max(1,omp_get_max_threads());
@@ -313,7 +315,7 @@ static Status workTile(const Manifest& m,const std::string& wd,int r,long index)
     Vox tile(NULL,free); double tDown=0; bool readDirect=false;
     if(r==0){
         const bpSize ex=std::min(to[0]+td[0],m.X),ey=std::min(to[1]+td[1],m.Y),ez=std::min(to[2]+td[2],m.Z), rx=ex-to[0],ry=ey-to[1],rz=ez-to[2];
-        Vox reg((uint16_t*)readZarrParallelHelper(zarrAt(m,c,t).c_str(),to[0],to[1],to[2],ex,ey,ez,0),free);
+        Vox reg((uint16_t*)readZarrParallelHelper(zarrAt(m,c,t).c_str(),m.org[0]+to[0],m.org[1]+to[1],m.org[2]+to[2],m.org[0]+ex,m.org[1]+ey,m.org[2]+ez,0),free);
         if(!reg) return Status::fail("cannot read "+zarrAt(m,c,t));
         if(rx==td[0]&&ry==td[1]&&rz==td[2]) tile=std::move(reg);   // the whole tile is inside the image
         else { tile=newVox(nv); if(!tile) return Status::fail("out of memory");
@@ -365,12 +367,50 @@ static Status workTile(const Manifest& m,const std::string& wd,int r,long index)
     std::string rd=r==0?"read "+fmt1(tRead)+" s":"read + downsample level "+std::to_string(r-1)+" "+fmt1(tRead)+" s"+(mono?(readDirect?" (direct I/O)":" (buffered)"):"")
                                                    +(tDown>0?", downsample "+fmt1(tDown)+" s":"");
     std::string wr=mono?"place "+fmt1(tWrite)+" s"+(writeDirect?" (direct I/O)":" (buffered + sync)"):"write pack "+fmt1(tWrite)+" s";
-    printf("worker %s: %zu chunks, %.2f GB -> %.2f GB: %s, encode %s s, %s, total %s s, %d threads\n",
+    char b[512]; snprintf(b,sizeof b,"worker %s: %zu chunks, %.2f GB -> %.2f GB: %s, encode %s s, %s, total %s s, %d threads",
            tileOwner(r,c,t,ti).c_str(),o.comp.size(),(double)nv*2/1e9,(double)o.bytes/1e9,rd.c_str(),fmt1(tEnc).c_str(),wr.c_str(),fmt1(now()-t0).c_str(),threads);
-    fflush(stdout);
+    line=b;
     return Status();
 }
-// Tiles index .. index+count-1 of level r (clipped to the level's last tile), one after the other.
+// The calling thread's OpenMP thread count for the duration of a call (n > 0), as the converter's library calls.
+struct OmpThreads {
+    bool set; int prev;
+    explicit OmpThreads(int n):set(n>0),prev(omp_get_max_threads()){ if(set) omp_set_num_threads(n); }
+    ~OmpThreads(){ if(set) omp_set_num_threads(prev); }
+    OmpThreads(const OmpThreads&)=delete; OmpThreads& operator=(const OmpThreads&)=delete;
+};
+// Whether a tile's commit point is there: its histogram and its sidecar (mono store) or pack (packs store), what
+// monitor waits for.
+static bool tileDone(const Manifest& m,const std::string& wd,int r,int c,int t,long ti){
+    const std::string cd=wd+"/chunks";
+    return fileExists(m.store=="mono"?tileIdxName(cd,r,c,t,ti):packName(cd,r,c,t,ti))&&fileExists(histName(cd,r,c,t,ti));
+}
+// Tiles index .. index+count-1 of level r (clipped to the level's last tile), one after the other. In the mono store
+// the workdir is marked as a tile workdir first (monoplace then refuses it). skipDone: tiles whose commit point is
+// there are not done again. onLine: each tile's timing line.
+static Status workTiles(const Manifest& m,const std::string& wd,int r,long index,long count,bool skipDone,
+                        const std::function<void(const std::string&)>& onLine){
+    const long jobs=jobsAtLevel(m,r);
+    if(m.store=="mono"){
+#ifdef _WIN32
+        return Status::fail(NOSUP_MONO);
+#else
+        // the single file is built from tiles: refuse a workdir that holds placed parts, and mark it for monoplace
+        if(fileExists(monoClaimsDir(wd)+"/layout.json")) return Status::fail(wd+" holds parts placed by monoplace: its single file cannot also take tiles (use a new workdir)");
+        Status s=makeDirs(monoClaimsDir(wd)); if(!s.ok()) return s;
+        int fd=::open((monoClaimsDir(wd)+"/tiles").c_str(),O_WRONLY|O_CREAT,0666);
+        if(fd<0) return Status::fail("cannot create "+monoClaimsDir(wd)+"/tiles: "+strerror(errno));
+        close(fd);
+#endif
+    }
+    const long last=count>jobs-index?jobs:index+count, perCT=tilesPerCT(m.lev[r]);
+    for(long i=index;i<last;i++){
+        if(skipDone){ const int c=(int)(i/((long)m.nT*perCT)); const long rem=i%((long)m.nT*perCT);
+            if(tileDone(m,wd,r,c,(int)(rem/perCT),rem%perCT)) continue; }
+        std::string line; Status s=workTile(m,wd,r,i,line); if(!s.ok()) return s;
+        if(!line.empty()&&onLine) onLine(line); }
+    return Status();
+}
 static int doWorker(const std::string& wd,int r,long index,long count){
     Manifest m; Status s=readManifest(wd,m); if(!s.ok()) return fail(s);
     if(m.elem!=2) return fail(std::string(UINT16_ONLY)+"; "+wd+" has "+std::to_string(m.elem)+"-byte voxels");
@@ -379,21 +419,8 @@ static int doWorker(const std::string& wd,int r,long index,long count){
     const long jobs=jobsAtLevel(m,r);
     if(index<0||index>=jobs){ fprintf(stderr,"index %ld out of range [0,%ld) for level %d\n",index,jobs,r); return 1; }
     if(count<1) return fail("worker: the tile count must be at least 1");
-    if(m.store=="mono"){
-#ifdef _WIN32
-        return fail(NOSUP_MONO);
-#else
-        // the single file is built from tiles: refuse a workdir that holds placed parts, and mark it for monoplace
-        if(fileExists(monoClaimsDir(wd)+"/layout.json")) return fail(wd+" holds parts placed by monoplace: its single file cannot also take tiles (use a new workdir)");
-        s=makeDirs(monoClaimsDir(wd)); if(!s.ok()) return fail(s);
-        int fd=::open((monoClaimsDir(wd)+"/tiles").c_str(),O_WRONLY|O_CREAT,0666);
-        if(fd<0) return fail("cannot create "+monoClaimsDir(wd)+"/tiles: "+strerror(errno));
-        close(fd);
-#endif
-    }
-    const long last=count>jobs-index?jobs:index+count;
-    for(long i=index;i<last;i++){ s=workTile(m,wd,r,i); if(!s.ok()) return fail(s); }
-    return 0;
+    s=workTiles(m,wd,r,index,count,false,[](const std::string& l){ printf("%s\n",l.c_str()); fflush(stdout); });
+    return s.ok()?0:fail(s);
 }
 
 // ===================== gather: parallel-read packs, single HDF5 writer =====================
@@ -463,15 +490,17 @@ static Status writePackThumbnail(hid_t out,const Manifest& m,const std::string& 
     return imsthumb::writeThumbnail(out,sizes,vol,display,ext);
 }
 // close the file; on any failure remove the half-written output
-static int finishOutput(hid_t out,const std::string& outPath,Status s){
+static Status closeOutput(hid_t out,const std::string& outPath,Status s){
     if(H5Fclose(out)<0&&s.ok()) s=Status::fail("cannot close "+outPath+" (HDF5 error above)");
-    if(!s.ok()){ remove(outPath.c_str()); return fail(s.message+"; removed "+outPath); }
-    return 0;
+    if(!s.ok()){ remove(outPath.c_str()); return Status::fail(s.message+"; removed "+outPath); }
+    return Status();
 }
+static int finishOutput(hid_t out,const std::string& outPath,Status s){ s=closeOutput(out,outPath,s); return s.ok()?0:fail(s); }
 
-static int doCombine(const Manifest& m,const std::string& wd,const std::string& outPath){
+// packs store: every tile's packs and histograms into one new .ims (checked by checkPacks first)
+static Status combinePacks(const Manifest& m,const std::string& wd,const std::string& outPath){
     std::string cd=wd+"/chunks"; int nT=m.nT, nC=m.nC, nR=(int)m.lev.size();
-    hid_t out=imsCreate(outPath); if(out<0) return fail("cannot create "+outPath+" (HDF5 error above)");
+    hid_t out=imsCreate(outPath); if(out<0) return Status::fail("cannot create "+outPath+" (HDF5 error above)");
     hid_t lcpl=H5Pcreate(H5P_LINK_CREATE); H5Pset_create_intermediate_group(lcpl,1);
     std::vector<ChannelDisplay> display;
     Status s=writeImsMeta(out,m,cd,lcpl,iota0(nC),iota0(nT),&display);
@@ -480,8 +509,11 @@ static int doCombine(const Manifest& m,const std::string& wd,const std::string& 
     for(int r=0;r<nR&&s.ok();r++) for(int t=0;t<nT&&s.ok();t++) for(int c=0;c<nC&&s.ok();c++) s=writeOneDataset(out,m,cd,lcpl,dtype,r,t,c,t,c);
     if(s.ok()) s=writePackThumbnail(out,m,cd,iota0(nC),0,display);
     H5Tclose(dtype); H5Pclose(lcpl);
-    if(finishOutput(out,outPath,s)) return 1;
-    printf("merged %d channels x %d timepoints x %d levels -> %s\n",nC,nT,nR,outPath.c_str()); return 0;
+    return closeOutput(out,outPath,s);
+}
+static int doCombine(const Manifest& m,const std::string& wd,const std::string& outPath){
+    Status s=combinePacks(m,wd,outPath); if(!s.ok()) return fail(s);
+    printf("merged %d channels x %d timepoints x %d levels -> %s\n",m.nC,m.nT,(int)m.lev.size(),outPath.c_str()); return 0;
 }
 
 // one (timepoint, channel) -> a single-tp/channel .ims (renumbered to TimePoint 0 / Channel 0). Independent
@@ -674,6 +706,18 @@ static int linkParts(const std::string& wd,const std::string& outPath,const std:
 }
 
 // ===================== monitor: wait for every expected tile, check them, then combine =====================
+// packs store: every pack must hold exactly its tile's chunks and every histogram must be whole before anything is
+// written
+static Status checkPacks(const Manifest& m,const std::string& wd){
+    const std::string cd=wd+"/chunks";
+    for(int r=0;r<(int)m.lev.size();r++) for(int c=0;c<m.nC;c++) for(int t=0;t<m.nT;t++) for(long ti=0;ti<tilesPerCT(m.lev[r]);ti++){
+        std::string pp=packName(cd,r,c,t,ti); std::vector<uint64_t> idx;
+        Status s=readPackIndex(pp,idx); if(s.ok()) s=checkPackTile(idx,m.lev[r],ti,pp);
+        if(!s.ok()) return Status::fail(s.message+" (re-run its worker)");
+        std::string hp=histName(cd,r,c,t,ti); struct stat st;
+        if(stat(hp.c_str(),&st)!=0||(size_t)st.st_size!=HIST_BYTES) return Status::fail(hp+" is missing or not "+std::to_string(HIST_BYTES)+" bytes (re-run its worker)"); }
+    return Status();
+}
 // A tile is done when its histogram and its pack (packs store) or sidecar (mono store) exist: the worker writes
 // that one last. Only the expected names count, so stale or foreign files in chunks/ are ignored.
 // PIW_MONITOR_TIMEOUT=<seconds> gives up (exit 1, listing missing tiles) instead of waiting forever for a worker
@@ -707,12 +751,7 @@ static int doMonitor(const std::string& wd,const std::string& out,const std::vec
         return runMono((int)av.size(),av.data());
     }
     if(!finishArgs.empty()) return fail("monitor: --verify and --threads are for the single-file store");
-    // every pack must hold exactly its tile's chunks and every histogram must be whole before anything is written
-    for(const Want& w:want){ std::string pp=packName(cd,w.r,w.c,w.t,w.tile); std::vector<uint64_t> idx;
-        s=readPackIndex(pp,idx); if(s.ok()) s=checkPackTile(idx,m.lev[w.r],w.tile,pp);
-        if(!s.ok()) return fail(s.message+" (re-run its worker)");
-        std::string hp=histName(cd,w.r,w.c,w.t,w.tile); struct stat st;
-        if(stat(hp.c_str(),&st)!=0||(size_t)st.st_size!=HIST_BYTES) return fail(hp+" is missing or not "+std::to_string(HIST_BYTES)+" bytes (re-run its worker)"); }
+    s=checkPacks(m,wd); if(!s.ok()) return fail(s);
     printf("all tiles present -> merging %s\n",out.c_str());
     return doCombine(m,wd,out);
 }
@@ -787,6 +826,40 @@ static int doSetup(int argc,char** argv){
     if(m.elem!=2) fprintf(stderr,"WARNING: %s; this %llu-byte input can only go through per-(timepoint,channel) converter jobs + linkparts\n",UINT16_ONLY,(unsigned long long)m.elem);
     return 0;
 }
+
+// ===================== the tile steps as library calls (src/cluster.cpp) =====================
+namespace piw { namespace detail {
+std::mutex& libraryMutex();   // src/converter.cpp
+piw::Status tileTask(const std::string& wd,int level,long index,long count,int threads,std::vector<std::string>* lines) noexcept{
+    try{
+        Manifest m; imscore::Status s=readManifest(wd,m); if(!s.ok()) return piw::Status(piw::Code::InvalidArgument,s.message);
+        if(m.elem!=2) return piw::Status(piw::Code::Unsupported,std::string(UINT16_ONLY)+"; "+wd+" has "+std::to_string(m.elem)+"-byte voxels");
+        if(level<0||level>=(int)m.lev.size()) return piw::Status(piw::Code::InvalidArgument,"level "+std::to_string(level)+" out of range [0,"+std::to_string(m.lev.size())+")");
+        const long jobs=jobsAtLevel(m,level);
+        if(index<0||index>=jobs||count<1) return piw::Status(piw::Code::InvalidArgument,"tiles "+std::to_string(index)+" (+"+std::to_string(count)+") out of range [0,"+std::to_string(jobs)+") for level "+std::to_string(level));
+        OmpThreads th(threads);
+        s=workTiles(m,wd,level,index,count,true,[lines](const std::string& l){ if(lines) lines->push_back(l); });
+        if(s.ok()) return piw::Status();
+        return piw::Status(s.message.find(" needs ")!=std::string::npos?piw::Code::NotFound:piw::Code::WriteFailed,s.message);
+    }
+    catch(const std::exception& e){ return piw::Status(piw::Code::Internal,std::string("unexpected error: ")+e.what()); }
+    catch(...){ return piw::Status(piw::Code::Internal,"unexpected error: unknown exception"); }
+}
+piw::Status packsFinish(const std::string& wd,const std::string& out) noexcept{
+    try{
+        Manifest m; imscore::Status s=readManifest(wd,m); if(!s.ok()) return piw::Status(piw::Code::InvalidArgument,s.message);
+        if(m.elem!=2) return piw::Status(piw::Code::Unsupported,std::string(UINT16_ONLY)+"; "+wd+" has "+std::to_string(m.elem)+"-byte voxels");
+        if(m.store!="packs") return piw::Status(piw::Code::InvalidArgument,wd+" does not use the packs store");
+        s=checkPacks(m,wd); if(!s.ok()) return piw::Status(piw::Code::ReadFailed,s.message);
+        std::lock_guard<std::mutex> lock(libraryMutex());
+        if(!registerLZ4()) return piw::Status(piw::Code::Internal,"cannot register the LZ4 filter id with HDF5");
+        s=combinePacks(m,wd,out);
+        return s.ok()?piw::Status():piw::Status(piw::Code::WriteFailed,s.message);
+    }
+    catch(const std::exception& e){ return piw::Status(piw::Code::Internal,std::string("unexpected error: ")+e.what()); }
+    catch(...){ return piw::Status(piw::Code::Internal,"unexpected error: unknown exception"); }
+}
+} }  // namespace piw::detail
 
 bool isParallelCommand(const char* c){ return c && (!strcmp(c,"setup")||!strcmp(c,"worker")||!strcmp(c,"monitor")||!strcmp(c,"combineone")||!strcmp(c,"link")||!strcmp(c,"linkparts")||!strcmp(c,"layout")); }
 

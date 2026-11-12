@@ -89,6 +89,7 @@ void printUsage(FILE* aOut)
     fprintf(aOut,
         "usage: parallelimariswriter -F FOLDER[,FOLDER...] -P PATTERN[,PATTERN...] [options]\n"
         "       parallelimariswriter setup|worker|monitor|combineone|link|linkparts|layout|monoinit|monoplace|monofinish|monostatus ...\n"
+        "       parallelimariswriter plan|task|status|finish ...   (plan -h: the cluster steps as tasks)\n"
         "Converts TIFF or Zarr stacks to one Imaris .ims file. Each pattern is one channel; the files in the\n"
         "folders whose names contain it are its time points, in the order of their names (full paths).\n"
         "  -F FOLDERS      comma-separated input folders\n"
@@ -241,31 +242,46 @@ void resetGetopt()
 #endif
 }
 
-int convertToImaris(int argc, char **argv)
+// The converter's options as the command line gives them (readConversion); plan takes the same.
+struct ConversionArgs {
+    piw::ConvertOptions options;                       // reader, files, -v, -b, -B, -C, the metadata options
+    std::vector<std::string> folders, patterns;        // -F (tilde-expanded), -P
+    std::string folderList;                            // -F as written into timepoints.txt
+    const char* outputDir = NULL;                      // -o, -n
+    const char* outName = NULL;
+    std::vector<std::pair<int, std::string> > extra;   // a subcommand's own long options: (index, value)
+};
+// A subcommand's own long option.
+struct ExtraOption {
+    const char* name;
+    bool value;
+};
+
+// Reads argv[1..] (getopt) and finds the input files (options.files; -c and -t checked against them). -1 when
+// that worked, else the exit code (0 after -h, which prints aUsage; 1 after an ERROR line).
+int readConversion(int argc, char** argv, ConversionArgs& aArgs, const std::vector<ExtraOption>& aExtra, void (*aUsage)(FILE*))
 {
-    if(argc < 2){
-        printUsage(stderr);
-        return cliError("No arguments were given; the options are listed above.");
-    }
     const char* channelsString = NULL;
     const char* timepointsString = NULL;
     int option_index = 0;
     const char* vVoxelSizes = NULL;
     const char* folderNames = NULL;
     const char* patterns = NULL;
-    const char* outputDirArg = NULL;
-    const char* outName = NULL;
     const char* reader = NULL;
     const char* blockSizes = NULL;
     const char* blockProcessString = NULL;
     const char* boundingBoxString = NULL;
-    piw::ConvertOptions vOptions;
+    piw::ConvertOptions& vOptions = aArgs.options;
     // The metadata options (--channel-names, --colors, ...; see imsmeta.h) are long options only.
-    const int kMetadataBase = 1000;
+    const int kMetadataBase = 1000, kExtraBase = 2000;
     const std::vector<imsmeta::OptionInfo>& vMetadataOptions = imsmeta::metadataOptions();
     std::vector<struct option> vLongOptions;
     for(size_t i = 0; i < vMetadataOptions.size(); ++i){
         struct option vOption = {vMetadataOptions[i].name, required_argument, NULL, kMetadataBase + (int)i};
+        vLongOptions.push_back(vOption);
+    }
+    for(size_t i = 0; i < aExtra.size(); ++i){
+        struct option vOption = {aExtra[i].name, aExtra[i].value ? required_argument : no_argument, NULL, kExtraBase + (int)i};
         vLongOptions.push_back(vOption);
     }
     struct option vHelp = {"help", no_argument, NULL, 'h'};
@@ -279,12 +295,16 @@ int convertToImaris(int argc, char **argv)
             if(!vError.empty()) return cliError(vError);
             continue;
         }
+        if(option_index >= kExtraBase && option_index < kExtraBase + (int)aExtra.size()){
+            aArgs.extra.push_back(std::make_pair(option_index - kExtraBase, std::string(optarg ? optarg : "")));
+            continue;
+        }
         // The argument getopt just looked at, to name a bad long option.
         const char* vArg = (optind > 0 && optind <= argc) ? argv[optind - 1] : "";
         const bool vLong = !strncmp(vArg, "--", 2);
         switch (option_index) {
         case 'h':
-            printUsage(stdout);
+            aUsage(stdout);
             return 0;
         case 'c':
             channelsString = optarg;
@@ -299,7 +319,7 @@ int convertToImaris(int argc, char **argv)
             folderNames = optarg;
             break;
         case 'o':
-            outputDirArg = optarg;
+            aArgs.outputDir = optarg;
             break;
         case 'r':
             reader = optarg;
@@ -308,7 +328,7 @@ int convertToImaris(int argc, char **argv)
             vVoxelSizes = optarg;
             break;
         case 'n':
-            outName = optarg;
+            aArgs.outName = optarg;
             break;
         case 'b':
             blockSizes = optarg;
@@ -323,6 +343,9 @@ int convertToImaris(int argc, char **argv)
             if(optopt >= kMetadataBase && optopt < kMetadataBase + (int)vMetadataOptions.size()){
                 return cliError(std::string("Option --") + vMetadataOptions[optopt - kMetadataBase].name + " needs a value. Run with -h for the options.");
             }
+            if(optopt >= kExtraBase && optopt < kExtraBase + (int)aExtra.size()){
+                return cliError(std::string("Option --") + aExtra[optopt - kExtraBase].name + " needs a value. Run with -h for the options.");
+            }
             if(vLong && strchr(vArg, '=')) return cliError(std::string("Option ") + vArg + " takes no value. Run with -h for the options.");
             if(vLong) return cliError(std::string("Option ") + vArg + " needs a value. Run with -h for the options.");
             return cliError(std::string("Option -") + (char)optopt + " needs a value. Run with -h for the options.");
@@ -335,13 +358,14 @@ int convertToImaris(int argc, char **argv)
     if(optind < argc) return cliError(std::string("Unexpected argument \"") + argv[optind] + "\". Run with -h for the options.");
 
     // Tilde expansion item by item (a leading ~ only), then the folders without empty items
-    std::vector<std::string> folders = listItems(folderNames ? folderNames : "");
-    std::string folderNamesString;
+    std::vector<std::string>& folders = aArgs.folders;
+    folders = listItems(folderNames ? folderNames : "");
+    std::string& folderNamesString = aArgs.folderList;
     for(size_t i = 0; i < folders.size(); ++i){
         folders[i] = expandHome(folders[i]);
         folderNamesString += (i ? "," : "") + folders[i];
     }
-    const std::vector<std::string> patternList = patterns ? listItems(patterns) : std::vector<std::string>();
+    const std::vector<std::string>& patternList = aArgs.patterns = patterns ? listItems(patterns) : std::vector<std::string>();
     if(folders.empty()) return cliError("No input folder given. Use -F folder1,folder2,... to give the folders to search.");
     if(patternList.empty()) return cliError("No channel pattern given. Use -P pattern1,pattern2,... (one pattern per channel).");
 
@@ -369,6 +393,7 @@ int convertToImaris(int argc, char **argv)
     if(strcmp(reader,"tiff") && strcmp(reader,"zarr")){
         return cliError(std::string("Reader type \"") + reader + "\" is not a supported reader type (tiff or zarr).");
     }
+    vOptions.reader = reader;
 
     // Files and patterns: files[channel][timepoint], sorted by name
     piw::Status vStatus = piw::findInputFiles(folders, patternList, reader, vOptions.files);
@@ -383,13 +408,12 @@ int convertToImaris(int argc, char **argv)
         return cliError("-t " + std::to_string((unsigned long long)timepoints) + " was given, but each channel has " +
                         std::to_string((unsigned long long)nTimepoints) + " file(s).");
     }
+    return -1;
+}
 
-    std::string outputDirString;
-    if(!outputDirArg){
-        outputDirString = folders[0];
-        printf("Output Directory not provided. Using %s as the output directory.\n",outputDirString.c_str());
-    }
-    else outputDirString = expandHome(outputDirArg);
+// Creates the output folder if needed and checks that it can be written to; 0, or the exit code after an ERROR line.
+int prepareOutputFolder(const std::string& outputDirString)
+{
     const int vMkdirErrno = makeFolders(outputDirString);
     DIR* outputDir = opendir(outputDirString.c_str());
     if(!outputDir){
@@ -401,6 +425,33 @@ int convertToImaris(int argc, char **argv)
     if(access(outputDirString.c_str(), W_OK)){
         return cliError("Given Output Directory \"" + outputDirString + "\" exists but cannot be written to.");
     }
+    return 0;
+}
+
+int convertToImaris(int argc, char **argv)
+{
+    if(argc < 2){
+        printUsage(stderr);
+        return cliError("No arguments were given; the options are listed above.");
+    }
+    ConversionArgs vArgs;
+    const int vRead = readConversion(argc, argv, vArgs, std::vector<ExtraOption>(), printUsage);
+    if(vRead >= 0) return vRead;
+    piw::ConvertOptions& vOptions = vArgs.options;
+    const std::vector<std::string>& folders = vArgs.folders;
+    const std::vector<std::string>& patternList = vArgs.patterns;
+    const std::string& folderNamesString = vArgs.folderList;
+    const char* outputDirArg = vArgs.outputDir;
+    const char* outName = vArgs.outName;
+
+    std::string outputDirString;
+    if(!outputDirArg){
+        outputDirString = folders[0];
+        printf("Output Directory not provided. Using %s as the output directory.\n",outputDirString.c_str());
+    }
+    else outputDirString = expandHome(outputDirArg);
+    const int vFolder = prepareOutputFolder(outputDirString);
+    if(vFolder) return vFolder;
     if (!outName) outName = "output";
     #ifdef _WIN32
     const std::string outputFile = outputDirString + "\\" + outName + ".ims";
@@ -421,7 +472,6 @@ int convertToImaris(int argc, char **argv)
     }
     else fprintf(stderr, "WARNING: Could not open %s: %s; continuing without it.\n", timepointsFile.c_str(), strerror(errno));
 
-    vOptions.reader = reader;
     vOptions.outputFile = outputFile;
     if(vOptions.channelNames.empty()) vOptions.channelNames = patternList;   // the channels are named after their patterns
 
@@ -436,6 +486,89 @@ int convertToImaris(int argc, char **argv)
     return cliExitCode(piw::convert(vOptions, vCallbacks));
 }
 
+void printPlanUsage(FILE* aOut)
+{
+    fprintf(aOut,
+        "usage: parallelimariswriter plan WORKDIR -F FOLDER[,FOLDER...] -P PATTERN[,PATTERN...] [options]\n"
+        "Checks every input as the converter does and writes WORKDIR/manifest.json: stages of independent tasks, each\n"
+        "run by 'task WORKDIR STAGE INDEX' (any process, any node, any order within a stage), then 'finish WORKDIR'\n"
+        "('status WORKDIR' lists the tasks not done). The converter's options apply (-h without plan lists them); -o\n"
+        "and -n name the finished file (default WORKDIR/output.ims, on WORKDIR's filesystem) and -C is each task's\n"
+        "process block. Without --tiles: a time series, stage \"convert\" with one task per (timepoint, channel).\n"
+        "  --tiles X,Y,Z       one enormous volume per (timepoint, channel), cut into tiles of X,Y,Z voxels: stages\n"
+        "                      \"level0\", \"level1\", ... (each after the one before); Zarr input, uint16\n"
+        "  --store mono|packs  tiles: straight into the single file (default; not on Windows) or one file per tile\n"
+        "  --tiles-per-task N  tiles: consecutive tiles of a level per task (default 1)\n"
+        "  --chunk-bytes N     tiles: the chunk budget (default: env PIW_CHUNK_BYTES, else 1048576, the converter's)\n");
+}
+
+// plan WORKDIR [the converter's options] [the plan's own]: piw::clusterPlan (src/parallel.h).
+int planCommand(int argc, char** argv)
+{
+    if(argc >= 3 && (!strcmp(argv[2], "-h") || !strcmp(argv[2], "--help"))){ printPlanUsage(stdout); return 0; }
+    if(argc < 3 || argv[2][0] == '-'){ printPlanUsage(stderr); return cliError("plan needs the workdir first; the options are listed above."); }
+    const std::string vWorkdir = expandHome(argv[2]);
+    std::vector<char*> vArgv(1, argv[0]);
+    for(int i = 3; i < argc; ++i) vArgv.push_back(argv[i]);
+    vArgv.push_back(NULL);
+    std::vector<ExtraOption> vExtra;
+    const ExtraOption vOwn[4] = {{"tiles", true}, {"store", true}, {"tiles-per-task", true}, {"chunk-bytes", true}};
+    vExtra.assign(vOwn, vOwn + 4);
+    ConversionArgs vArgs;
+    const int vRead = readConversion((int)vArgv.size() - 1, vArgv.data(), vArgs, vExtra, printPlanUsage);
+    if(vRead >= 0) return vRead;
+    piw::ClusterPlanOptions vPlan;
+    vPlan.workdir = vWorkdir;
+    vPlan.folders = vArgs.folders;
+    vPlan.patterns = vArgs.patterns;
+    vPlan.convert = vArgs.options;
+    for(size_t i = 0; i < vArgs.extra.size(); ++i){
+        const std::string& vValue = vArgs.extra[i].second;
+        uint64_t vWhole = 0;
+        switch(vArgs.extra[i].first){
+        case 0:
+            if(!parseWholes(vValue.c_str(), 3, 1, vPlan.tileSize)) return cliError("Could not read --tiles \"" + vValue + "\": expected three whole numbers of at least 1 (X,Y,Z).");
+            vPlan.kind = "tiles";
+            break;
+        case 1: vPlan.store = vValue; break;
+        case 2:
+            if(!parseWhole(vValue, vWhole) || !vWhole || vWhole > 1000000000ull) return cliError("Could not read --tiles-per-task \"" + vValue + "\": expected a whole number of at least 1.");
+            vPlan.tilesPerTask = (long)vWhole;
+            break;
+        case 3:
+            if(!parseWhole(vValue, vWhole) || vWhole < 4096) return cliError("Could not read --chunk-bytes \"" + vValue + "\": expected a whole number of at least 4096.");
+            vPlan.chunkBytes = vWhole;
+            break;
+        }
+    }
+    if(vPlan.kind != "tiles" && (!vPlan.store.empty() || vPlan.tilesPerTask != 1 || vPlan.chunkBytes))
+        return cliError("--store, --tiles-per-task and --chunk-bytes are for a tile plan (--tiles X,Y,Z).");
+    if(vArgs.outputDir || vArgs.outName){
+        const std::string vDir = vArgs.outputDir ? expandHome(vArgs.outputDir) : vWorkdir;
+        if(vArgs.outputDir){ const int vFolder = prepareOutputFolder(vDir); if(vFolder) return vFolder; }
+        #ifdef _WIN32
+        vPlan.convert.outputFile = vDir + "\\" + (vArgs.outName ? vArgs.outName : "output") + ".ims";
+        #else
+        vPlan.convert.outputFile = vDir + "/" + (vArgs.outName ? vArgs.outName : "output") + ".ims";
+        #endif
+    }
+    piw::ClusterPlan vResult;
+    const piw::Status vStatus = piw::clusterPlan(vPlan, &vResult);
+    if(!vStatus.ok()) return cliExitCode(vStatus);
+    const char* vTypes[5] = {"", "uint8", "uint16", "float32", "uint32"};
+    printf("plan: %s: %s%s, %d timepoints x %d channels, %llux%llux%llu %s, %d levels -> %s\n", vResult.workdir.c_str(), vResult.kind.c_str(),
+           vResult.kind == "tiles" ? (" (" + vResult.store + " store)").c_str() : "", vResult.timepoints, vResult.channels,
+           (unsigned long long)vResult.size[0], (unsigned long long)vResult.size[1], (unsigned long long)vResult.size[2],
+           vTypes[(int)vResult.dataType], vResult.levels, vResult.outputFile.c_str());
+    for(size_t i = 0; i < vResult.stages.size(); ++i){
+        const piw::ClusterStage& vStage = vResult.stages[i];
+        printf("  stage %s: %ld tasks%s%s: task %s %s <0..%ld>\n", vStage.name.c_str(), vStage.tasks, vStage.after.empty() ? "" : ", after ",
+               vStage.after.c_str(), vResult.workdir.c_str(), vStage.name.c_str(), vStage.tasks - 1);
+    }
+    printf("  then: finish %s [--verify]\n", vResult.workdir.c_str());
+    return 0;
+}
+
 }  // namespace
 
 namespace piw {
@@ -446,6 +579,8 @@ int runCli(int argc, char** argv) noexcept
     try{
         // Cluster subcommands (setup/worker/monitor/..., monoinit/monoplace/...); otherwise the single-node conversion.
         if(argc >= 2 && isParallelCommand(argv[1])) vExitCode = runParallel(argc, argv);
+        else if(argc >= 2 && !strcmp(argv[1], "plan")) vExitCode = planCommand(argc, argv);
+        else if(argc >= 2 && isClusterCommand(argv[1])) vExitCode = runCluster(argc, argv);
         else if(argc >= 2 && isMonoCommand(argv[1])) vExitCode = runMono(argc, argv);
         else vExitCode = convertToImaris(argc, argv);
     }

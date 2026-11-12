@@ -240,8 +240,9 @@ struct Lev { Vec3 size, block, nch, tb, nt; };   // tb = tile size in blocks; nt
 // meta = the metadata setup resolved (imsmeta::resolveMetadata of the zarrs and setup's options).
 // store: where the tile workers put their chunks: "mono" = straight into the single file (sidecars in chunks/,
 // see mono.h), "packs" = one .pack per tile for monitor's serial combine, combineone and link (manifests written
-// before the field existed are "packs").
-struct Manifest { std::vector<std::string> zarrs; int nC=1,nT=1; bpSize X,Y,Z,elem; float vox[3]; bpSize cap[3]={0,0,0}; std::vector<Lev> lev; imsmeta::Metadata meta; std::string store="packs"; };
+// before the field existed are "packs"). org: the image's first voxel in every zarr (a plan's bounding box; X, Y, Z
+// = the box's size), written as "origin" only when not 0.
+struct Manifest { std::vector<std::string> zarrs; int nC=1,nT=1; bpSize X,Y,Z,elem; float vox[3]; bpSize cap[3]={0,0,0}; std::vector<Lev> lev; imsmeta::Metadata meta; std::string store="packs"; bpSize org[3]={0,0,0}; };
 inline const std::string& zarrAt(const Manifest& m,int c,int t){ return m.zarrs[(size_t)c*m.nT+t]; }
 inline bpSize levStride(const Manifest& m,int r,int a){ bpSize s=m.lev[r-1].size[a]/m.lev[r].size[a]; return s?s:1; }
 inline long jobsAtLevel(const Manifest& m,int r){ const Lev& L=m.lev[r]; return (long)m.nC*m.nT*L.nt[0]*L.nt[1]*L.nt[2]; }
@@ -290,8 +291,10 @@ inline Status readMetadataJson(const nlohmann::json& md,int nC,int nT,imsmeta::M
         return Status::fail("the metadata lists do not match "+std::to_string(nC)+" channels and "+std::to_string(nT)+" timepoints");
     return Status();
 }
-inline Status writeManifest(const std::string& wd,const Manifest& m){
+// The text of manifest.json; extra: more fields (a plan's), written first.
+inline std::string manifestText(const Manifest& m,const nlohmann::ordered_json* extra=NULL){
     using nlohmann::ordered_json; ordered_json j;
+    if(extra) for(auto it=extra->begin();it!=extra->end();++it) j[it.key()]=it.value();
     long total=0; ordered_json jpl=ordered_json::array(); for(size_t r=0;r<m.lev.size();++r){ long n=jobsAtLevel(m,(int)r); jpl.push_back(n); total+=n; }
     j["jobsTotal"]=total; j["jobsPerLevel"]=jpl;       // submit one array per level: worker <wd> <r> 0..jobsPerLevel[r]-1
     j["channels"]=m.nC; j["timepoints"]=m.nT; j["levels"]=(int)m.lev.size();
@@ -299,6 +302,7 @@ inline Status writeManifest(const std::string& wd,const Manifest& m){
     j["voxel"]={voxClean(m.vox[0]),voxClean(m.vox[1]),voxClean(m.vox[2])};
     j["tile"]={(unsigned long long)m.cap[0],(unsigned long long)m.cap[1],(unsigned long long)m.cap[2]};
     j["store"]=m.store;
+    if(m.org[0]||m.org[1]||m.org[2]) j["origin"]={(unsigned long long)m.org[0],(unsigned long long)m.org[1],(unsigned long long)m.org[2]};
     ordered_json lv=ordered_json::array();
     for(const Lev& L:m.lev){ ordered_json e;
         e["size"]={(unsigned long long)L.size[0],(unsigned long long)L.size[1],(unsigned long long)L.size[2]};
@@ -311,7 +315,10 @@ inline Status writeManifest(const std::string& wd,const Manifest& m){
     ordered_json zs=ordered_json::array(); for(int c=0;c<m.nC;c++){ ordered_json ch=ordered_json::array(); for(int t=0;t<m.nT;t++) ch.push_back(zarrAt(m,c,t)); zs.push_back(ch); }
     j["zarrs"]=zs;
     j["metadata"]=metadataJson(m.meta);
-    std::string s=j.dump(2)+"\n";
+    return j.dump(2)+"\n";
+}
+inline Status writeManifest(const std::string& wd,const Manifest& m){
+    std::string s=manifestText(m);
     return writeFileAtomic(wd+"/manifest.json",s.data(),s.size());
 }
 inline Status readManifest(const std::string& wd,Manifest& m){
@@ -325,6 +332,7 @@ inline Status readManifest(const std::string& wd,Manifest& m){
         m.vox[0]=m.vox[1]=m.vox[2]=1.f;
         if(j.contains("voxel")){ auto&v=j["voxel"]; for(int a=0;a<3;a++) m.vox[a]=v[a].get<float>(); }
         if(j.contains("tile")){ auto&c=j["tile"]; for(int a=0;a<3;a++) m.cap[a]=c[a].get<bpSize>(); }
+        if(j.contains("origin")){ auto&o=j["origin"]; for(int a=0;a<3;a++) m.org[a]=o[a].get<bpSize>(); }
         m.store=j.value("store",std::string("packs"));
         if(m.store!="packs"&&m.store!="mono") return Status::fail(p+": unknown store '"+m.store+"' (expected mono or packs)");
         for(auto& e:j["level"]){ Lev L; for(int a=0;a<3;a++){ L.size[a]=e["size"][a].get<bpSize>(); L.block[a]=e["block"][a].get<bpSize>(); L.nch[a]=e["nchunks"][a].get<bpSize>(); L.tb[a]=e["tileBlocks"][a].get<bpSize>(); L.nt[a]=e["ntiles"][a].get<bpSize>(); } m.lev.push_back(L); }

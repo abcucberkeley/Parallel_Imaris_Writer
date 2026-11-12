@@ -724,26 +724,35 @@ uint64_t numBlocks(uint64_t aSize, uint64_t aBlockSize){
 // The conversion itself (options validated, library mutex held). The options and the printed
 // lines are along the input's axes 0, 1, 2; the writer gets Imaris X, Y, Z, and vAxis[i] is the
 // input axis that becomes Imaris axis i.
+// The checks of a conversion before any output exists (options validated): the metadata first (a
+// bad metadata option fails before any input is read), then the first input's sample type and every
+// input against it. aShape, aChunks: the first input's shape and default blocks.
+Status inspectInputs(const ConvertOptions& aOptions, imsmeta::Metadata& aMetadata, uint64_t aShape[3], uint64_t aChunks[3],
+                     DataType& aType){
+    const bool vTiff = aOptions.reader == "tiff";
+    const std::string vMetadataError = imsmeta::resolveMetadata(aOptions, aMetadata);
+    if(!vMetadataError.empty()) return Status(Code::InvalidArgument, vMetadataError);
+
+    std::string vSampleType;
+    Status vStatus = volumeInfo(vTiff, aOptions.files[0][0], aShape, aChunks, vSampleType);
+    if(!vStatus.ok()) return vStatus;
+    // The type of the first input decides the .ims's (every other input must have the same).
+    aType = DataType::UInt16;
+    if(!imsDataType(vSampleType, aType)) return unsupportedType(aOptions.files[0][0], vSampleType);
+    return checkInputs(aOptions, vTiff, aShape, vSampleType);
+}
+
 Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallbacks){
     const bool vTiff = aOptions.reader == "tiff";
     const uint64_t channels = aOptions.files.size();
     const uint64_t timepoints = aOptions.files[0].size();
     const int vAxis[3] = {aOptions.xOnImarisX ? 1 : 0, aOptions.xOnImarisX ? 0 : 1, 2};
 
-    // The metadata first: a bad metadata option fails before any input is read.
     imsmeta::Metadata vMetadata;
-    const std::string vMetadataError = imsmeta::resolveMetadata(aOptions, vMetadata);
-    if(!vMetadataError.empty()) return Status(Code::InvalidArgument, vMetadataError);
-
     uint64_t vShape[3] = {0, 0, 0};
     uint64_t vChunks[3] = {0, 0, 0};
-    std::string vSampleType;
-    Status vStatus = volumeInfo(vTiff, aOptions.files[0][0], vShape, vChunks, vSampleType);
-    if(!vStatus.ok()) return vStatus;
-    // The type of the first input decides the .ims's (every other input must have the same).
     DataType vType = DataType::UInt16;
-    if(!imsDataType(vSampleType, vType)) return unsupportedType(aOptions.files[0][0], vSampleType);
-    vStatus = checkInputs(aOptions, vTiff, vShape, vSampleType);
+    Status vStatus = inspectInputs(aOptions, vMetadata, vShape, vChunks, vType);
     if(!vStatus.ok()) return vStatus;
 
     // Use custom chunk sizes if provided
@@ -1106,6 +1115,30 @@ Status findInputFiles(const std::vector<std::string>& folders, const std::vector
     catch(const std::exception& vError){ return internalError(vError.what()); }
     catch(...){ return internalError("unknown exception"); }
 }
+
+namespace detail {
+// What convert() checks before it creates its output, without converting (src/cluster.cpp's plan):
+// the options, the metadata, every input's sample type and shape, the bounding box. aSize: the
+// output's Imaris X, Y, Z; aMetadata: the metadata the conversion would write.
+Status inspectConversion(const ConvertOptions& aOptions, uint64_t aSize[3], DataType& aType, imsmeta::Metadata& aMetadata){
+    try{
+        Status vStatus = validate(aOptions);
+        if(!vStatus.ok()) return vStatus;
+        uint64_t vShape[3] = {0, 0, 0}, vChunks[3] = {0, 0, 0};
+        vStatus = inspectInputs(aOptions, aMetadata, vShape, vChunks, aType);
+        if(!vStatus.ok()) return vStatus;
+        if(aOptions.hasBoundingBox) for(int i = 0; i < 3; ++i) vShape[i] = aOptions.boundingBox[i + 3] - aOptions.boundingBox[i];
+        const int vAxis[3] = {aOptions.xOnImarisX ? 1 : 0, aOptions.xOnImarisX ? 0 : 1, 2};
+        for(int i = 0; i < 3; ++i) aSize[i] = vShape[vAxis[i]];
+        if(aSize[0] > UINT_MAX || aSize[1] > UINT_MAX || aSize[2] > UINT_MAX || aOptions.files.size() > UINT_MAX || aOptions.files[0].size() > UINT_MAX){
+            return Status(Code::Unsupported, "The image size does not fit the Imaris writer (at most " + std::to_string(UINT_MAX) + " per axis).");
+        }
+        return Status();
+    }
+    catch(const std::exception& vError){ return internalError(vError.what()); }
+    catch(...){ return internalError("unknown exception"); }
+}
+}  // namespace detail
 
 Status findInputFiles(const std::vector<std::string>& folders, const std::vector<std::string>& patterns,
                       std::vector<std::vector<std::string> >& files) noexcept{

@@ -100,6 +100,22 @@ For datasets too large or too numerous for one machine, the conversion can be sp
 
 Requirements and limits: the workdir and the output must be on one shared POSIX file system that every job can write (Linux or macOS; the single-file subcommands are not available on Windows); the single-file path takes uint16 data (other types: use the link option below). Jobs write with `O_DIRECT` and fall back to buffered writes plus a sync where the file system refuses it.
 
+### Plan, tasks, finish (any job system)
+
+The steps below are also available as one **plan** of independent **tasks**, which any job system (or a plain loop) can run; the same steps are library functions (`piw::clusterPlan`, `clusterTask`, `clusterStatus`, `clusterFinish` in `src/parallel.h`):
+
+1. **`plan <workdir> -F <folders> -P <patterns> [the converter's options]`** — finds and checks every input exactly as the converter does (reader, `-v`, `-b`, `-B`, `-C`, `-c`, `-t`, the [metadata](#metadata) options; `-o`/`-n` name the finished file, default `<workdir>/output.ims`) before anything is written, and writes `<workdir>/manifest.json` with its stages. Without `--tiles` it plans a time series: stage `convert`, one task per `(timepoint, channel)` (task `t*nC + c`). With **`--tiles X,Y,Z`** it plans one tiled volume per `(timepoint, channel)` (Zarr, uint16): stages `level0`, `level1`, ..., each after the one before, with `--store mono|packs` (as `setup`'s), `--tiles-per-task N` and `--chunk-bytes N`.
+2. **`task <workdir> <stage> <index> [--threads N] [--stage-dir DIR] [-C X,Y,Z]`** — runs one task (the stage by name or number): a time-series task converts its volume, stages the part in `/dev/shm` when it fits (raw size × 1.15 + 8 GB within 90% of the job's memory and of the free `/dev/shm`) or else in `<workdir>/stage`, places it and removes it; a tile task runs its tiles' workers. A task that is done is skipped and a failed one is simply run again. A `SIGTERM` that reaches the task stops its conversion between blocks and removes the part (`scancel` signals only the batch shell: see Staging below); a part that a killed task left in `/dev/shm` is removed by the next task that stages there.
+3. **`status <workdir>`** — per stage, the tasks not done, as `--array` ranges (exit code 3 while any is missing).
+4. **`finish <workdir> [out.ims] [--verify] [--threads N]`** — exit code 3, naming the missing tasks, until every task is done; then `monofinish` (or, for the packs store, the merge).
+
+Example (SLURM; `<...>` are your own values):
+````
+parallelimariswriter plan /path/to/workdir -F /path/to/zarrs -P CamA,CamB -r zarr -v 0.108,0.108,0.25 -C 2048,2048,512
+sbatch --array=0-<tasks-1> -c 8 --wrap 'parallelimariswriter task /path/to/workdir convert $SLURM_ARRAY_TASK_ID --threads 8'
+sbatch --dependency=afterany:<array job> -c 16 --wrap 'parallelimariswriter finish /path/to/workdir --verify --threads 16'
+````
+
 ### Time series: one job per (timepoint, channel)  *(recommended)*
 
 When each `(timepoint, channel)` volume can be converted by one node (stream it with `-C`), convert each one independently and move it into the single file:
@@ -152,7 +168,7 @@ sbatch --dependency=afterok:<level 0 array> --array=0-<jobsPerLevel[1]-1> -c 8 -
 sbatch --dependency=afterok:<last level's array> -c 16 --wrap 'parallelimariswriter monitor /path/to/workdir /path/to/out.ims --verify --threads 16'
 ````
 
-**Restarting.** Run the worker of a failed tile again, then the levels after it; `monitor` and `monostatus` name a missing tile `L<r>_C<c>_T<t>_<tile>` (its index at level `r` is `(c*nT + t)*n + tile`, with `n = jobsPerLevel[r] / (nC*nT)` tiles per volume). Once the finish has started, the journal is sealed and later workers fail instead of changing the file. A workdir takes either tiles or parts (`monoplace`), never both.
+**Restarting.** Run the worker of a failed tile again, then the levels after it; `monitor` and `monostatus` name a missing tile `L<r>_C<c>_T<t>_<tile>` (its index at level `r` is `(c*nT + t)*n + tile`, with `n = jobsPerLevel[r] / (nC*nT)` tiles per volume). Once the finish has started, the journal is sealed and later workers fail instead of changing the file. A workdir takes either tiles or parts (`monoplace`), never both: a `setup` workdir becomes a tile workdir with its first worker and takes parts until then (a `plan` workdir is one or the other from the start).
 
 **Claims at scale.** A huge volume has thousands of tiles, and many workers claim at once: there `PIW_CLAIM=fcntl` (see Claims above; only where `fcntl` locks work across nodes) is faster than the default `link()` journal, whose claims retry under contention.
 

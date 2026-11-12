@@ -561,6 +561,12 @@ if(PIW_BUILD_TESTS)
     piw_add_test(mono tests/monotest.cpp LIBS cppZarr_shared)
     set_tests_properties(mono PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The cluster steps as a plan of tasks (plan, task, status, finish; src/parallel.h), every task a
+    # separate process: a time series and a tiled plan (both stores) equal to a single-node conversion,
+    # failure and restart cases. Reports "skipped" on Windows.
+    piw_add_test(cluster tests/clustertest.cpp LIBS cppZarr_shared)
+    set_tests_properties(cluster PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
     # The converter's command line: options, values, input discovery and exit codes (every error
     # exits 1 with one ERROR line, never 0 or a signal); the POSIX-only cases are skipped on Windows.
     piw_add_test(clitest tests/clitest.cpp LIBS cppTiff_shared cppZarr_shared)
