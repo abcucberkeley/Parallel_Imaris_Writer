@@ -91,37 +91,64 @@ parallelimariswriter -r zarr -F /path/to/zarrs -P CamA -o /path/to/out -C 512,51
 
 ## Cluster (distributed) conversion
 
-For datasets too large or too numerous for one machine, the conversion can be split across many independent jobs (for example a SLURM job array) that together produce one Imaris dataset. The `parallelimariswriter` binary exposes a few extra **subcommands** for this; orchestrate them with whatever scheduler you use. This path takes **Zarr** input (one `.zarr` per channel per timepoint).
+For datasets too large or too numerous for one machine, the conversion can be split across many independent jobs (for example a SLURM job array) that together produce **one self-contained `.ims` file**: no link file, no `parts/` directory, and the same data, histograms and metadata as converting everything in a single process. The `parallelimariswriter` binary exposes a few extra **subcommands** for this; orchestrate them with whatever scheduler you use.
 
-Why it needs structure: an `.ims` is a single HDF5 container with one shared chunk index per array, so multiple processes cannot write into one `.ims` concurrently without corrupting it. There are two ways to work within that, chosen by the shape of the data.
+**How a single file is written in parallel.** Each job compresses its chunks exactly as the single-node converter does and writes the compressed bytes once, straight into the final file, at a byte range it claims in a small journal next to the file (claims never overlap, so jobs need no other coordination). It also leaves a small sidecar index of where each chunk went, plus exact histograms. A short serial `monofinish` step then builds the HDF5 structure in that same file — every chunk index, the histograms, the dataset metadata and the thumbnail — pointing at the chunks already on disk, and checks the result with the stock HDF5 library before renaming the file into place. The output is an ordinary HDF5 1.8-format `.ims` with real chunks.
 
-### Approach 1 — one job per (timepoint, channel)  *(recommended for time series)*
+Requirements and limits: the workdir and the output must be on one shared POSIX file system that every job can write (Linux or macOS; the single-file subcommands are not available on Windows); the single-file path takes uint16 data (other types: use the link option below). Jobs write with `O_DIRECT` and fall back to buffered writes plus a sync where the file system refuses it.
 
-When each individual `(timepoint, channel)` volume fits in one node's memory (stream it with `-C`), convert each one independently and then stitch the results together:
+### Time series: one job per (timepoint, channel)  *(recommended)*
 
-1. **`setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--channel-names ... --start-time ...]`** — enumerates the `(channel, timepoint)` → `.zarr` mapping into `<workdir>/manifest.json`, with the metadata (channel names, colors, wavelengths, timepoint times) the converter would write for the same inputs and options. It takes the converter's metadata options (see [Metadata](#metadata)); `linkparts`, `monitor` and `link` write that metadata.
-2. For each `(timepoint, channel)`, run the **normal converter** on that single `.zarr` into `<parts>/part_t{t}_c{c}.ims` (add `-C` to bound memory). Every one is independent, so run them all at once.
-3. **`linkparts <workdir> <out.ims> <parts>`** — writes a tiny `.ims` of **HDF5 external links** into the parts; Imaris follows them and opens the whole set as one dataset.
+When each `(timepoint, channel)` volume can be converted by one node (stream it with `-C`), convert each one independently and move it into the single file:
 
-The compressed data is written **once**, with no shared writer and no separate merge step. The output is a directory — the `<out.ims>` link file plus its `parts/` — so keep them together (links are stored as relative paths). Data-identical to converting all timepoints in a single process.
+1. **`setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--channel-names ... --start-time ...]`** — finds the `(channel, timepoint)` → `.zarr` inputs and writes `<workdir>/manifest.json`, with the metadata (channel names, colors, wavelengths, timepoint times) the converter would write for the same inputs and options. It takes the converter's metadata options (see [Metadata](#metadata)); every output made from the workdir carries that metadata. For any other input (TIFF, cropped with `-B`, ...) write the manifest with **`monoinit <workdir> <nT> <nC> <vx,vy,vz> [out.ims]`** instead.
+2. For each `(timepoint, channel)` — all at once, e.g. one array task each:
+   - run the **normal converter** on that one volume into a part file (`-c 1 -t 1`, same options for every part);
+   - **`monoplace <workdir> <t> <c> <part.ims> [--threads N]`** copies the part's compressed chunks into the single file and writes its sidecar (the task's commit point);
+   - delete the part.
+3. **`monofinish <workdir> [out.ims] [--verify] [--threads N]`** — once every part is placed: builds the index and the metadata and renames the file to `out.ims` (default `<workdir>/output.ims`; it must be on the same file system as the workdir). `--verify` also decodes every chunk of the finished file again and checks it against the parts' histograms (this reads the whole file).
 
-### Approach 2 — spatial tiling  *(for a single volume too big for one node)*
+**`monostatus <workdir>`** lists the placed and the missing parts (exit code 3 while any is missing).
+
+Example array task (SLURM; `<...>` are your own values):
+````
+t=$((SLURM_ARRAY_TASK_ID / 2)); c=$((SLURM_ARRAY_TASK_ID % 2))
+stage=/dev/shm/piw_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}
+mkdir -p $stage; trap 'rm -rf $stage' EXIT
+run(){ "$@" & pid=$!; wait $pid; }; trap 'kill $pid; wait $pid; exit 143' TERM   # see "Staging"
+run parallelimariswriter -r zarr -F /path/to/zarrs -P <name of the (t,c) zarr> -c 1 -t 1 -v 0.108,0.108,0.25 -C 2048,2048,512 -o $stage -n part || exit 1
+run parallelimariswriter monoplace /path/to/workdir $t $c $stage/part.ims --threads $SLURM_CPUS_PER_TASK
+````
+and after the whole array (e.g. `--dependency=afterany:<array job>`):
+````
+parallelimariswriter monofinish /path/to/workdir /path/to/out.ims --verify --threads 16
+````
+
+**Staging.** A part only lives until it is placed, so write it to fast node-local memory (`/dev/shm`) when it fits — roughly the raw size of the volume plus a few GB, within the job's memory limit (on Linux files in `/dev/shm` count toward it) — and otherwise to a scratch directory on the shared file system. Remove the stage directory when the task ends, also when it is cancelled (`trap`). SLURM's `scancel` sends `SIGTERM` to the batch shell only, and a shell runs its trap only after the running command has finished, so the converter would go on until it is killed with the whole job, and the trap would never run: run each step in the background and `wait` for it, with a `TERM` trap that stops it (as above). A task killed outright (out of memory, `SIGKILL`) may leave its files in `/dev/shm` until they are removed. Do not stage on slow local disks.
+
+**Restarting.** A failed, cancelled or killed task is simply run again: the same part claims the same byte range and writes the same bytes there, and a part whose sidecar exists can be skipped. `monofinish` refuses (exit code 3) and names the missing parts while any is missing, so run it after the array whatever the tasks' outcome, resubmit exactly the missing `(t,c)` (task index `t*nC + c` above), and run `monofinish` again. Once `monofinish` has started, the journal is sealed and later `monoplace` calls fail instead of changing the file. Until it has renamed the file, `monofinish` can be run again.
+
+**Claims.** By default a claim takes a numbered journal record with `link()`, which is atomic on NFS servers too. Set `PIW_CLAIM=fcntl` in the jobs to use one whole-file `fcntl` lock instead (only where `fcntl` locks work across nodes; it is refused on Linux mounts whose locks are node-local). A run records the mechanism its first job used, and every later job uses that one.
+
+**Keeping the parts instead (link option).** To keep one file per `(timepoint, channel)`, convert the parts into `<workdir>/parts/part_t{t}_c{c}.ims` and run **`linkparts <workdir> <out.ims> parts`**: it writes a small `.ims` of **HDF5 external links** into the parts that Imaris opens as one dataset. The output is then a directory — the `<out.ims>` link file plus its `parts/` (relative links) — that must stay together. It takes every bit depth the converter writes (the `/Thumbnail` only for uint16). An existing link + parts output can be turned into one file later: `monoinit`, `monoplace` on each part, then `monofinish`.
+
+### Single huge volume: spatial tiling
 
 When even one `(timepoint, channel)` is too large for a node, tile it spatially. Work is divided by `(channel, timepoint, spatial tile)` at every pyramid level; because each coarser level downsamples the one below it, the levels run **in order**.
 
-1. **`setup ... <cx,cy,cz> ...`** — plans into `manifest.json`; `jobsPerLevel[]` gives the worker count per level. Output chunk size comes from the `PIW_CHUNK_BYTES` env var (bytes, default 1 MiB).
+1. **`setup ... <cx,cy,cz> ...`** — plans into `manifest.json`; `jobsPerLevel[]` gives the worker count per level. Output chunk size comes from the `PIW_CHUNK_BYTES` env var (bytes, default 1 MiB, which matches the single-node converter's chunking).
 2. **`worker <workdir> <level> <index>`** — builds one tile of one level (`index` runs `0..jobsPerLevel[level]-1`). Level 0 reads the Zarr; coarser levels downsample the finer level's tiles, so **level r+1 must run after level r** (e.g. via `--dependency=afterok`). Writes atomically (temp file + rename); safe to re-run.
 3. Assemble the tiles into the `.ims`, either as one file or in parallel:
-   - **`monitor <workdir> [out.ims]`** — one HDF5 writer reads all tiles and writes a single self-contained `.ims`.
+   - **`monitor <workdir> [out.ims]`** — one HDF5 writer reads all tiles and writes a single self-contained `.ims` (one write stream: the slowest step for large data).
    - or **`combineone <workdir> <t> <c> <out.ims>`** per `(timepoint, channel)` into its own `.ims`, then **`link <workdir> <out.ims> <parts>`** to stitch them with external links (same as `linkparts`, but sourced from the tiled chunk files).
 
 **Memory:** the binding constraint is the **coarse levels**, not level 0 — a level>0 worker loads the finer level's region (up to ~8× its own tile) in order to downsample it, needing several times the level-0 footprint. On ~5000×22000×350 data a 2048³ tile fits in ~21 GB at every level; 3072³ OOMs level 1 even at 48 GB.
 
 ### Notes
 
-- **Parallelize at the (timepoint, channel) level, not within one array.** A single self-contained `.ims` (`monitor`) is written by one HDF5 stream — the throughput ceiling for that path. Splitting one array across processes with MPI-IO does **not** help (HDF5's collective compressed-write coordination is worse than a single writer). External links (`link` / `linkparts`) instead give many independent writers with no shared index, so the merge parallelizes across the cluster and is then limited only by aggregate storage bandwidth — turning a multi-hour single-writer combine into a parallel step of minutes on a large multi-timepoint dataset.
-- **Chunk size.** For the single-writer (`monitor`) path, fewer/bigger chunks cut per-chunk overhead — `PIW_CHUNK_BYTES=8388608` (8 MiB) noticeably speeds the combine, at some cost to Imaris interactive-read speed. The per-(timepoint,channel) approaches use the converter's default chunking.
-- **Scope & output.** The cluster outputs carry the same `/Thumbnail` preview image as the single-node converter (for uint16 `linkparts` output, built from the parts with their timepoint-0 color ranges). External-link output is a directory that must stay together (the link `.ims` plus its `parts/`). The normal single-process converter (above) handles all supported readers and bit depths.
+- **Throughput.** The parallel steps are limited by the shared file system's write bandwidth into one file; `monofinish` is serial but writes only metadata (minutes even for millions of chunks). Splitting one HDF5 array across processes with MPI-IO does **not** help (HDF5's collective compressed writes are slower than a single writer).
+- **Chunk size.** Keep the converter's default chunking for the per-(timepoint, channel) path; for the tiled `monitor` path, `PIW_CHUNK_BYTES=8388608` (8 MiB) speeds the single-writer combine at some cost to Imaris interactive-read speed, and changes the chunking from the single-node converter's.
+- **Thumbnail and metadata.** All cluster outputs carry the same `/Thumbnail` preview image as the single-node converter. The single-file output's `ColorRange` comes from the histograms of every timepoint, as in a single-node conversion; the `linkparts` output takes each channel's range from its timepoint-0 part. The normal single-process converter (above) handles all supported readers and bit depths.
 
 ## Reference
 
