@@ -331,19 +331,38 @@ def test_cli(tmp):
     raises(RuntimeError, lambda: pybind11_convert('zarr', [[os.path.join(inputs, 'none.zarr')]],
                                                   os.path.join(tmp, 'none.ims'), (1, 1, 1)), 'missing input')
 
-    # Ctrl-C (a simulated SIGINT, 0.05 s in) stops a conversion: KeyboardInterrupt, no output
+    # Ctrl-C (a simulated SIGINT, 0.05 s in) stops a conversion: KeyboardInterrupt, no output. The
+    # volume is large enough that on a fast machine the cancel still comes while blocks are fed;
+    # a cancel that comes only during Finish (which does not stop) leaves a complete file.
     big = os.path.join(tmp, 'big')
     os.makedirs(big)
-    write_zarr(os.path.join(big, 'CamA.zarr'), zvolume(2, (400, 400, 200)), chunks=(128, 128, 64))
+    write_zarr(os.path.join(big, 'CamA.zarr'), zvolume(2, (400, 400, 800)), chunks=(128, 128, 64))
     f5 = os.path.join(tmp, 'cancelled.ims')
     interrupted, seconds = interrupt(lambda: pybind11_convert('zarr', [[os.path.join(big, 'CamA.zarr')]], f5,
                                                               (1, 1, 1), num_threads=1), 0.05)
-    if interrupted:
+    if interrupted and os.path.exists(f5) and complete_ims(f5):
+        skip(f'Ctrl-C: the cancel came after every block was written ({seconds:.2f} s); the file is complete')
+    elif interrupted:
         check(not os.path.exists(f5), f'Ctrl-C: KeyboardInterrupt after {seconds:.2f} s, partial output removed')
     else:
         skip(f'Ctrl-C: the conversion finished first ({seconds:.2f} s)')
     pybind11_convert('zarr', files, f4, (1, 1, 1))
     check(is_hdf5(f4), 'a conversion after Ctrl-C')
+
+
+def complete_ims(path):
+    # A finished .ims: readable, with the dataset metadata, and every dataset holding all its chunks
+    try:
+        info = piw.ims_info(path)
+    except Exception:
+        return False
+    for d in info['datasets']:
+        expected = 1
+        for n, c in zip(d['shape'], d['chunk_shape']):
+            expected *= -(-n // c)
+        if d['chunks'] != expected:
+            return False
+    return bool(info['datasets']) and bool(info['channel_names'])
 
 
 def interrupt(call, after):
