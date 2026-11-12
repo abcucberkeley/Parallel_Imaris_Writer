@@ -452,7 +452,8 @@ if(PIW_BUILD_TESTS)
     # -C block processing yields the same .ims as a whole-timepoint read.
     piw_add_test(blockEquivalence tests/blocktest.cpp LIBS cppTiff_shared cppZarr_shared)
     # The cluster subcommands assemble a single .ims with the same data as the
-    # monolithic conversion. Zarr-only (the parallel path reads Zarr).
+    # monolithic conversion, through both stores of the tile workers (packs and the
+    # single file). Zarr-only (the parallel path reads Zarr).
     piw_add_test(parallelEquivalence tests/paralleltest.cpp LIBS cppZarr_shared)
     # piw::convert (the core objects, linked like the executable) writes the same .ims as
     # the executable, and fails cleanly: error returns, cancel, progress, concurrent calls.
@@ -504,4 +505,13 @@ if(PIW_BUILD_TESTS)
         piw_add_test(failtest tests/failtest.cpp LIBS cppZarr_shared)
         set_tests_properties(failtest PROPERTIES TIMEOUT 300)
     endif()
+
+    # The single-file finisher of a tile workdir (setup's mono store) from generated sidecars, without
+    # image data: a small layout here; run by hand with a 100 TB-class layout for the scale check
+    # (tests/monoscaletest.cpp). Links the core like apiEquivalence. Reports "skipped" on Windows.
+    piw_add_test(monoScale tests/monoscaletest.cpp LIBS ${PIW_LINK_LIBRARIES})
+    target_sources(monoScaleTest PRIVATE $<TARGET_OBJECTS:piw_core>)
+    target_include_directories(monoScaleTest PRIVATE ${SRC_DIR} ${PIW_INCLUDE_DIRS})
+    piw_link_like_executable(monoScaleTest)
+    set_tests_properties(monoScale PROPERTIES SKIP_RETURN_CODE 77)
 endif()

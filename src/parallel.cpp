@@ -1,20 +1,30 @@
 // Parallel .ims tool (self-contained, multi-channel + multi-timepoint). Work is split by
 // (channel, timepoint, spatial tile, pyramid level): many workers can share one volume.
-// Each worker produces one .pack file (all its block chunks) for its tile at one level (level 0
-// from the zarr, coarser levels by downsampling the finer level's packs -- so LEVELS RUN IN ORDER),
-// plus a partial histogram. A parallel merge (OpenMP read, single HDF5 writer) assembles the
-// packs into ONE .ims, byte-identical to a monolithic conversion. The subcommands are listed in
+// Each worker encodes the chunks of its tile at one level (level 0 from the zarr, coarser levels by
+// downsampling the finer level's chunks -- so LEVELS RUN IN ORDER) plus a partial histogram, and stores
+// them as the manifest says: "mono" (the default) writes them straight into the one .ims being built (at a
+// byte range it claims, with a sidecar; monitor/monofinish then index them, see mono.h), "packs" writes one
+// .pack file per tile, which a parallel merge (OpenMP read, single HDF5 writer) assembles into ONE .ims.
+// Either way the .ims is byte-identical to a monolithic conversion. The subcommands are listed in
 // parallel.h; the shared .ims building blocks are in imscore.h. Every failure prints a message on
 // stderr and gives a non-zero exit code.
 #include "imscore.h"
 #include "imsthumb.h"
+#include "mono.h"
+#include "monoclaim.h"
+#include "monoidx.h"
 #include "zarr.h"
 #include "parallelreadzarr.h"
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <ctime>
+#include <memory>
 #include <dirent.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
 #include <omp.h>
 #include "parallel.h"
 
@@ -22,7 +32,9 @@ using namespace imscore;
 
 static int fail(const std::string& msg){ fprintf(stderr,"ERROR: %s\n",msg.c_str()); return 1; }
 static int fail(const Status& s){ return fail(s.message); }
+static int usage(const char* u){ fprintf(stderr,"usage: parallelimariswriter %s  (see parallel.h)\n",u); return 2; }
 static const char* UINT16_ONLY="the tile workers and the pack-based combine (worker/monitor/combineone/link) take uint16 data only";
+static const char* PACKS_ONLY="combineone and link read the packs of setup --store packs";
 static bool parseLong(const char* s,long& v){ char* e=NULL; errno=0; long r=strtol(s,&e,10); if(e==s||*e||errno) return false; v=r; return true; }
 static std::string dirOf(const std::string& p){ size_t s=p.find_last_of("/"
 #ifdef _WIN32
@@ -31,89 +43,356 @@ static std::string dirOf(const std::string& p){ size_t s=p.find_last_of("/"
     ); return s==std::string::npos?std::string("."):(s==0?std::string("/"):p.substr(0,s)); }
 
 // ===================== worker: one (channel, timepoint, tile) at one level =====================
-// Assemble a finer-level sub-region [fo, fo+fn) from its packs (zero beyond the finer size).
-static Status assembleFinerRegion(const Manifest& m,const std::string& cd,int fr,int c,int t,const bpSize fo[3],const bpSize fn[3],std::vector<uint16_t>& fine){
-    const Lev& F=m.lev[fr]; fine.assign((size_t)fn[0]*fn[1]*fn[2],0);
-    bpSize fb[3]={F.block[0],F.block[1],F.block[2]}; const size_t rawBytes=(size_t)fb[0]*fb[1]*fb[2]*sizeof(uint16_t);
-    // finer blocks covering the footprint, then the finer TILES holding those blocks
-    bpSize cb0[3],cb1[3],ft0[3],ft1[3];
-    for(int a=0;a<3;a++){ cb0[a]=fo[a]/fb[a]; cb1[a]=std::min((fo[a]+fn[a]-1)/fb[a],F.nch[a]-1); ft0[a]=cb0[a]/F.tb[a]; ft1[a]=std::min(cb1[a]/F.tb[a],(bpSize)F.nt[a]-1); }
-    for(bpSize ftz=ft0[2];ftz<=ft1[2];ftz++)for(bpSize fty=ft0[1];fty<=ft1[1];fty++)for(bpSize ftx=ft0[0];ftx<=ft1[0];ftx++){
-        long tileIdx=(long)ftx+(long)fty*F.nt[0]+(long)ftz*F.nt[0]*F.nt[1];
-        std::string pp=packName(cd,fr,c,t,tileIdx);
-        Status s=forEachPackedChunk(pp,[&](bpSize cz,bpSize cy,bpSize cx,const uint8_t* by,size_t sz)->Status{
-            std::vector<uint8_t> vox; Status d=decodeChunk(by,sz,vox,rawBytes); if(!d.ok()) return Status::fail(pp+": "+d.message);
-            const uint16_t* cv=(const uint16_t*)vox.data();
-            bpSize bx0=cx*fb[0],by0=cy*fb[1],bz0=cz*fb[2];
-            for(bpSize z=0;z<fb[2]&&bz0+z<F.size[2];z++)for(bpSize y=0;y<fb[1]&&by0+y<F.size[1];y++)for(bpSize x=0;x<fb[0]&&bx0+x<F.size[0];x++){
-                bpSize GX=bx0+x,GY=by0+y,GZ=bz0+z;
-                if(GX>=fo[0]&&GX<fo[0]+fn[0]&&GY>=fo[1]&&GY<fo[1]+fn[1]&&GZ>=fo[2]&&GZ<fo[2]+fn[2])
-                    fine[(GX-fo[0])+(GY-fo[1])*fn[0]+(GZ-fo[2])*(size_t)fn[0]*fn[1]]=cv[x+y*fb[0]+z*(size_t)fb[0]*fb[1]];
-            }
-            return Status();
-        },&F,tileIdx);
-        if(!s.ok()) return Status::fail("level "+std::to_string(fr+1)+" needs level "+std::to_string(fr)+"'s packs (run its workers first): "+s.message);
+static double now(){ return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static std::string fmt1(double v){ char b[32]; snprintf(b,sizeof b,"%.1f",v); return b; }
+#ifdef _WIN32
+static const char* NOSUP_MONO="the single-file store is not supported on this platform (use setup --store packs)";
+#endif
+// Voxel buffers from calloc/malloc (the reader's buffers are malloc'd too): calloc'd pages read as zero without
+// a pass that writes them.
+typedef std::unique_ptr<uint16_t,void(*)(void*)> Vox;
+static Vox newVox(size_t n){ return Vox((uint16_t*)calloc(n?n:1,sizeof(uint16_t)),free); }
+
+// Decodes chunk (cx,cy,cz) of level F from its shuffled bytes sh straight into the region [fo, fo+fn) of F (x
+// fastest): the voxels inside the region and inside F's image; nothing else of the region is touched.
+static void scatterChunk(const uint8_t* sh,const Lev& F,bpSize cx,bpSize cy,bpSize cz,const bpSize fo[3],const bpSize fn[3],uint16_t* fine){
+    const bpSize b[3]={F.block[0],F.block[1],F.block[2]}, c0[3]={cx*b[0],cy*b[1],cz*b[2]};
+    bpSize lo[3],hi[3];
+    for(int a=0;a<3;a++){ lo[a]=std::max(c0[a],fo[a]); hi[a]=std::min(std::min(c0[a]+b[a],fo[a]+fn[a]),F.size[a]); if(lo[a]>=hi[a]) return; }
+    const uint8_t* L=sh; const uint8_t* H=sh+(size_t)(b[0]*b[1]*b[2]); const size_t nx=(size_t)(hi[0]-lo[0]);
+    for(bpSize z=lo[2];z<hi[2];z++) for(bpSize y=lo[1];y<hi[1];y++){
+        const size_t i0=(size_t)((lo[0]-c0[0])+(y-c0[1])*b[0]+(z-c0[2])*b[0]*b[1]);
+        uint16_t* d=fine+(size_t)((lo[0]-fo[0])+(y-fo[1])*fn[0]+(z-fo[2])*fn[0]*fn[1]);
+        for(size_t x=0;x<nx;x++) d[x]=(uint16_t)(L[i0+x]|((unsigned)H[i0+x]<<8));
     }
+}
+// Box-averages chunk (cx,cy,cz) of level F, from its shuffled bytes sh, straight into the coarse tile: tile voxel o
+// (td voxels per axis, x fastest) is the average of the finer voxels [fo + o*st, fo + (o+1)*st), zero beyond F's
+// image -- what boxDown gives for the region [fo, fo+fn) of F. Each box lies inside one chunk when every reduced
+// axis (st 2) has an even block size (downInChunks); chunks write disjoint tile voxels.
+static bool downInChunks(const Lev& F,const bpSize st[3]){
+    for(int a=0;a<3;a++) if(st[a]>2||(st[a]==2&&F.block[a]%2)) return false;
+    return true;
+}
+static void downChunk(const uint8_t* sh,const Lev& F,bpSize cx,bpSize cy,bpSize cz,const bpSize fo[3],const bpSize fn[3],const bpSize st[3],
+                      const bpSize td[3],uint16_t* tile){
+    const bpSize b[3]={F.block[0],F.block[1],F.block[2]}, c0[3]={cx*b[0],cy*b[1],cz*b[2]};
+    bpSize olo[3],ohi[3]; bool inside=true;
+    for(int a=0;a<3;a++){ const bpSize lo=std::max(c0[a],fo[a]), hi=std::min(c0[a]+b[a],fo[a]+fn[a]); if(lo>=hi) return;
+        olo[a]=(lo-fo[a])/st[a]; ohi[a]=(hi-fo[a])/st[a]; inside=inside&&c0[a]+b[a]<=F.size[a]; }
+    const uint8_t* L=sh; const uint8_t* H=sh+(size_t)(b[0]*b[1]*b[2]);
+    const unsigned shift=(unsigned)((st[0]-1)+(st[1]-1)+(st[2]-1));
+    size_t off[8]; int n=0;   // the box's voxels relative to its first one, in the chunk
+    for(bpSize dz=0;dz<st[2];dz++) for(bpSize dy=0;dy<st[1];dy++) for(bpSize dx=0;dx<st[0];dx++) off[n++]=(size_t)(dx+dy*b[0]+dz*b[0]*b[1]);
+    for(bpSize oz=olo[2];oz<ohi[2];oz++) for(bpSize oy=olo[1];oy<ohi[1];oy++){
+        const bpSize fz=fo[2]+oz*st[2], fy=fo[1]+oy*st[1];
+        uint16_t* out=tile+(size_t)(oy*td[0]+oz*td[0]*td[1]);
+        for(bpSize ox=olo[0];ox<ohi[0];ox++){
+            const bpSize fx=fo[0]+ox*st[0]; const size_t i0=(size_t)((fx-c0[0])+(fy-c0[1])*b[0]+(fz-c0[2])*b[0]*b[1]);
+            uint32_t sum=0;
+            if(inside) for(int k=0;k<n;k++) sum+=(uint32_t)(L[i0+off[k]]|((unsigned)H[i0+off[k]]<<8));
+            else for(bpSize dz=0;dz<st[2];dz++) for(bpSize dy=0;dy<st[1];dy++) for(bpSize dx=0;dx<st[0];dx++)
+                if(fx+dx<F.size[0]&&fy+dy<F.size[1]&&fz+dz<F.size[2]){ const size_t i=i0+(size_t)(dx+dy*b[0]+dz*b[0]*b[1]); sum+=(uint32_t)(L[i]|((unsigned)H[i]<<8)); }
+            out[ox]=(uint16_t)(sum>>shift);
+        }
+    }
+}
+// What assembling does with each decoded finer chunk (its shuffled bytes): scatterChunk or downChunk.
+typedef std::function<void(const uint8_t* sh,bpSize cx,bpSize cy,bpSize cz)> ChunkSink;
+// The finer level F's blocks [cb0, cb1) under the region [fo, fo+fn), and the tiles that hold them.
+static std::vector<long> finerTiles(const Lev& F,const bpSize fo[3],const bpSize fn[3],bpSize cb0[3],bpSize cb1[3]){
+    bpSize ft0[3],ft1[3];
+    for(int a=0;a<3;a++){ cb0[a]=fo[a]/F.block[a]; cb1[a]=std::min((fo[a]+fn[a]-1)/F.block[a]+1,F.nch[a]); ft0[a]=cb0[a]/F.tb[a]; ft1[a]=std::min((cb1[a]-1)/F.tb[a],F.nt[a]-1); }
+    std::vector<long> v;
+    for(bpSize z=ft0[2];z<=ft1[2];z++) for(bpSize y=ft0[1];y<=ft1[1];y++) for(bpSize x=ft0[0];x<=ft1[0];x++) v.push_back((long)(x+y*F.nt[0]+z*F.nt[0]*F.nt[1]));
+    return v;
+}
+static bool blockIn(bpSize cx,bpSize cy,bpSize cz,const bpSize cb0[3],const bpSize cb1[3]){
+    return cx>=cb0[0]&&cx<cb1[0]&&cy>=cb0[1]&&cy<cb1[1]&&cz>=cb0[2]&&cz<cb1[2]; }
+static void firstError(std::atomic<bool>& failed,std::string& err,const std::string& msg){
+    #pragma omp critical(piw_err)
+    { if(!failed.load()){ err=msg; failed=true; } }
+}
+
+// packs store: every chunk of level fr under the region [fo, fo+fn), from the finer tiles' packs, decoded and
+// handed to put (from several threads).
+static Status assembleFromPacks(const Manifest& m,const std::string& cd,int fr,int c,int t,const bpSize fo[3],const bpSize fn[3],const ChunkSink& put){
+    const Lev& F=m.lev[fr]; bpSize cb0[3],cb1[3]; const std::vector<long> tiles=finerTiles(F,fo,fn,cb0,cb1);
+    const size_t raw=(size_t)(F.block[0]*F.block[1]*F.block[2])*sizeof(uint16_t);
+    std::atomic<bool> failed(false); std::string err;
+    #pragma omp parallel for schedule(dynamic)
+    for(long i=0;i<(long)tiles.size();i++){
+        if(failed.load()) continue;
+        std::vector<uint8_t> sh(raw); const std::string pp=packName(cd,fr,c,t,tiles[(size_t)i]);
+        Status s=forEachPackedChunk(pp,[&](bpSize cz,bpSize cy,bpSize cx,const uint8_t* by,size_t sz)->Status{
+            if(!blockIn(cx,cy,cz,cb0,cb1)) return Status();
+            Status d=decodeChunkShuffled(by,sz,sh.data(),raw); if(!d.ok()) return Status::fail(pp+": "+d.message);
+            put(sh.data(),cx,cy,cz); return Status();
+        },&F,tiles[(size_t)i]);
+        if(!s.ok()) firstError(failed,err,s.message);
+    }
+    if(failed) return Status::fail("level "+std::to_string(fr+1)+" needs level "+std::to_string(fr)+"'s packs (run its workers first): "+err);
     return Status();
 }
-static int doWorker(const std::string& wd,int r,long index){
+
+#ifndef _WIN32
+// The single file, for reading: O_DIRECT where the filesystem takes it (probed: some refuse only the reads),
+// macOS F_NOCACHE, else buffered. Reads need 4096-aligned offsets, sizes and buffers.
+struct MonoReader {
+    int fd=-1; bool direct=false;
+    MonoReader(){}
+    ~MonoReader(){ if(fd>=0) close(fd); }
+    MonoReader(const MonoReader&)=delete; MonoReader& operator=(const MonoReader&)=delete;
+    Status open(const std::string& path){
+#ifdef O_DIRECT
+        fd=::open(path.c_str(),O_RDONLY|O_DIRECT);
+        if(fd>=0){ void* p=NULL; ssize_t k=-1; int e=ENOMEM;
+            if(posix_memalign(&p,4096,4096)==0){ k=pread(fd,p,4096,0); e=errno; free(p); }
+            if(k>=0) direct=true;
+            else { close(fd); fd=-1; if(e!=EINVAL) return Status::fail("cannot read "+path+": "+strerror(e)); } }
+#endif
+        if(fd<0&&(fd=::open(path.c_str(),O_RDONLY))<0) return Status::fail("cannot open "+path+": "+strerror(errno));
+#ifdef __APPLE__
+        direct=fcntl(fd,F_NOCACHE,1)==0;
+#endif
+        return Status();
+    }
+    int readAt(void* buf,size_t n,uint64_t off) const {   // 0, or an errno (EIO: the file ends early)
+        char* p=(char*)buf; size_t got=0;
+        while(got<n){ ssize_t k=pread(fd,p+got,n-got,(off_t)(off+got)); if(k<0&&errno==EINTR) continue; if(k<0) return errno; if(k==0) return EIO; got+=(size_t)k; }
+        return 0;
+    }
+};
+struct NeedChunk { uint64_t off; uint32_t size, cx, cy, cz; };
+// mono store: every chunk of level fr under the region [fo, fo+fn), from the single file, decoded and handed to put
+// (from several threads). The finer tiles' sidecars (commit points: level fr's workers must all have finished) name
+// every chunk; only the chunks under the region are read, in runs of nearby chunks. A short read (this node may
+// see an old size of a file other nodes write) is retried once with the file opened again.
+static Status assembleFromMono(const Manifest& m,const std::string& wd,int fr,int c,int t,const bpSize fo[3],const bpSize fn[3],const ChunkSink& put,bool* direct){
+    const Lev& F=m.lev[fr]; bpSize cb0[3],cb1[3]; const std::vector<long> tiles=finerTiles(F,fo,fn,cb0,cb1);
+    const std::string cd=wd+"/chunks", path=monoFilePath(wd), hint=" (run level "+std::to_string(fr)+"'s workers first; re-run the worker of a damaged sidecar)";
+    std::vector<NeedChunk> need;
+    for(long ft:tiles){
+        const std::string p=tileIdxName(cd,fr,c,t,ft); MonoIdx x; std::string e;
+        if(!fileExists(p)) return Status::fail("level "+std::to_string(fr+1)+" needs "+p+hint);
+        if(!mono_idx_read(p,x,&e)) return Status::fail(e+hint);
+        bool geo=x.owner==tileOwner(fr,c,t,ft)&&x.timepoint==t&&x.channel==c&&x.levels.size()==1&&x.levels[0].level==(uint32_t)fr&&x.levels[0].dtype==MONO_U16;
+        for(int a=0;geo&&a<3;a++) geo=x.levels[0].size[a]==F.size[a]&&x.levels[0].chunk[a]==F.block[a]&&x.levels[0].grid[a]==F.nch[a];
+        if(!geo) return Status::fail(p+" is not the sidecar of that tile in this workdir's layout"+hint);
+        Status s=checkTileChunks(x.chunks.size(),[&](uint64_t i,bpSize& cx,bpSize& cy,bpSize& cz){ cx=x.chunks[i].cx; cy=x.chunks[i].cy; cz=x.chunks[i].cz; },F,ft,p);
+        if(!s.ok()) return Status::fail(s.message+hint);
+        for(const MonoChunk& ch:x.chunks) if(blockIn(ch.cx,ch.cy,ch.cz,cb0,cb1)){ NeedChunk n={ch.offset,ch.size,ch.cx,ch.cy,ch.cz}; need.push_back(n); }
+    }
+    std::sort(need.begin(),need.end(),[](const NeedChunk& a,const NeedChunk& b){ return a.off<b.off; });
+    // runs: chunks at most 256 KiB apart, up to 64 MiB (or one bigger chunk), 4096-aligned
+    struct Run { uint64_t off, end; size_t first, last; };
+    std::vector<Run> runs; size_t maxRun=4096;
+    for(size_t i=0;i<need.size();){
+        Run r; r.first=i; r.off=need[i].off&~(uint64_t)4095; uint64_t e=need[i].off+need[i].size; i++;
+        while(i<need.size()&&need[i].off<=e+(256u<<10)&&need[i].off+need[i].size-r.off<=(64u<<20)){ e=std::max(e,need[i].off+need[i].size); i++; }
+        r.last=i; r.end=(e+4095)&~(uint64_t)4095; runs.push_back(r); maxRun=std::max(maxRun,(size_t)(r.end-r.off));
+    }
+    MonoReader rd; Status s=rd.open(path); if(!s.ok()) return s;
+    if(direct) *direct=rd.direct;
+    const size_t raw=(size_t)(F.block[0]*F.block[1]*F.block[2])*sizeof(uint16_t);
+    std::atomic<bool> failed(false); std::string err;
+    #pragma omp parallel
+    {
+        void* buf=NULL; std::vector<uint8_t> sh(raw);
+        if(posix_memalign(&buf,4096,maxRun)){ buf=NULL; firstError(failed,err,"out of memory"); }
+        #pragma omp for schedule(dynamic)
+        for(long k=0;k<(long)runs.size();k++){
+            if(failed.load()) continue;
+            const Run& r=runs[(size_t)k]; const size_t n=(size_t)(r.end-r.off); std::string why;
+            int re=rd.readAt(buf,n,r.off);
+            if(re==EIO){ MonoReader again; Status o=again.open(path); if(!o.ok()) why=o.message; else re=again.readAt(buf,n,r.off); }
+            if(re&&why.empty()) why="cannot read "+path+" at "+std::to_string(r.off)+": "+(re==EIO?std::string("the file ends early"):std::string(strerror(re)));
+            for(size_t i=r.first;why.empty()&&i<r.last;i++){ const NeedChunk& q=need[i];
+                Status d=decodeChunkShuffled((const uint8_t*)buf+(q.off-r.off),q.size,sh.data(),raw);
+                if(!d.ok()) why=path+": level "+std::to_string(fr)+" chunk ("+std::to_string(q.cx)+","+std::to_string(q.cy)+","+std::to_string(q.cz)+") at "+std::to_string(q.off)+": "+d.message;
+                else put(sh.data(),q.cx,q.cy,q.cz); }
+            if(!why.empty()) firstError(failed,err,why);
+        }
+        free(buf);
+    }
+    if(failed) return Status::fail(err+hint);
+    return Status();
+}
+#endif
+
+// The chunks of one tile, encoded in (z, y, x) order, and the histogram of its in-image voxels (OpenMP over the
+// blocks: each block is shuffled straight from the tile and counted on the way).
+struct TileChunks { std::vector<std::vector<uint8_t> > comp; std::vector<uint64_t> hist; uint64_t bytes=0; };
+static Status encodeTile(const uint16_t* tile,const bpSize td[3],const Lev& L,const bpSize cb0[3],const bpSize cb1[3],TileChunks& o){
+    const bpSize b0=L.block[0],b1=L.block[1],b2=L.block[2]; const size_t nb=(size_t)(b0*b1*b2);
+    const bpSize nbx=cb1[0]-cb0[0],nby=cb1[1]-cb0[1]; const long long n=(long long)(nbx*nby*(cb1[2]-cb0[2]));
+    o.comp.assign((size_t)n,std::vector<uint8_t>()); o.hist.assign(65536,0); o.bytes=0;
+    std::atomic<bool> bad(false);
+    #pragma omp parallel
+    {
+        std::vector<uint64_t> h(65536,0); std::vector<uint8_t> sh(2*nb); uint8_t* lo=sh.data(); uint8_t* hi=sh.data()+nb;
+        #pragma omp for schedule(dynamic)
+        for(long long k=0;k<n;k++){
+            const bpSize ix=(bpSize)k%nbx, iy=((bpSize)k/nbx)%nby, iz=(bpSize)k/(nbx*nby), by=cb0[1]+iy, bz=cb0[2]+iz;
+            const size_t xv=(size_t)std::min(b0,L.size[0]-(cb0[0]+ix)*b0);
+            for(bpSize z=0;z<b2;z++) for(bpSize y=0;y<b1;y++){
+                const uint16_t* src=tile+(size_t)(ix*b0+(iy*b1+y)*td[0]+(iz*b2+z)*td[0]*td[1]);
+                const size_t j0=(size_t)(y*b0+z*b0*b1);
+                for(size_t x=0;x<b0;x++){ const uint16_t v=src[x]; lo[j0+x]=(uint8_t)v; hi[j0+x]=(uint8_t)(v>>8); }
+                if(by*b1+y<L.size[1]&&bz*b2+z<L.size[2]) for(size_t x=0;x<xv;x++) h[src[x]]++;
+            }
+            if(!encodeChunkShuffled(sh.data(),2*nb,o.comp[(size_t)k])) bad=true;
+        }
+        #pragma omp critical(piw_hist)
+        for(size_t i=0;i<65536;i++) o.hist[i]+=h[i];
+    }
+    if(bad) return Status::fail("LZ4 could not compress a chunk");
+    for(const std::vector<uint8_t>& v:o.comp) o.bytes+=v.size();
+    return Status();
+}
+// packs store: every chunk of the tile in ONE file (body, then the index, then the count), then its histogram;
+// the pack's name is the commit point the monitor waits for.
+static Status storePack(const std::string& cd,int r,int c,int t,long ti,const bpSize cb0[3],const bpSize cb1[3],const TileChunks& o){
+    const std::string pp=packName(cd,r,c,t,ti), ptmp=pp+".tmp"; FILE* pf=fopen(ptmp.c_str(),"wb");
+    if(!pf) return Status::fail("cannot create "+ptmp+": "+strerror(errno));
+    std::vector<uint64_t> pidx; bool wok=true; size_t k=0;
+    for(bpSize bz=cb0[2];bz<cb1[2];bz++)for(bpSize by=cb0[1];by<cb1[1];by++)for(bpSize bx=cb0[0];bx<cb1[0];bx++,k++){
+        const std::vector<uint8_t>& v=o.comp[k];
+        wok=wok&&fwrite(v.data(),1,v.size(),pf)==v.size(); pidx.push_back(bz); pidx.push_back(by); pidx.push_back(bx); pidx.push_back(v.size()); }
+    uint64_t N=pidx.size()/4;
+    if(wok&&N) wok=fwrite(pidx.data(),8,pidx.size(),pf)==pidx.size();
+    if(wok) wok=fwrite(&N,8,1,pf)==1;
+    int e=errno; wok=(fclose(pf)==0)&&wok;
+    if(!wok){ remove(ptmp.c_str()); return Status::fail("cannot write "+ptmp+": "+strerror(e?e:errno)); }
+    Status s=writeFileAtomic(histName(cd,r,c,t,ti),o.hist.data(),o.hist.size()*sizeof(uint64_t));
+    if(!s.ok()){ remove(ptmp.c_str()); return s; }
+    if(!renameReplace(ptmp,pp)){ e=errno; remove(ptmp.c_str()); return Status::fail("cannot rename "+ptmp+" to "+pp+": "+strerror(e)); }
+    return Status();
+}
+#ifndef _WIN32
+// mono store: claims the tile's range of the single file (a re-run gets the same range), writes the chunks there,
+// then the histogram and the sidecar (the commit point).
+static Status storeMono(const Manifest& m,const std::string& wd,int r,int c,int t,long ti,const bpSize cb0[3],const bpSize cb1[3],
+                        const TileChunks& o,int threads,bool* direct){
+    const Lev& L=m.lev[r]; const std::string cd=wd+"/chunks", owner=tileOwner(r,c,t,ti); std::string e;
+    MonoClaims claims; MonoClaim rec;
+    if(!claims.open(monoClaimsDir(wd),"",&e)||!claims.claim(owner,o.bytes,rec,&e)) return Status::fail(e);
+    MonoIdx x; x.owner=owner; x.timepoint=t; x.channel=c; x.claimOffset=rec.offset; x.claimSize=rec.size; x.blobBytes=o.bytes;
+    MonoIdxLevel g; g.level=(uint32_t)r; g.dtype=MONO_U16; g.nChunks=o.comp.size();
+    for(int a=0;a<3;a++){ g.size[a]=L.size[a]; g.chunk[a]=(uint32_t)L.block[a]; g.grid[a]=(uint32_t)L.nch[a]; }
+    x.levels.push_back(g); x.chunks.reserve(o.comp.size());
+    MonoBlobWriter w; uint64_t off=rec.offset; size_t k=0;
+    bool ok=w.open(monoFilePath(wd),rec.offset,rec.size,threads,&e);
+    for(bpSize bz=cb0[2];ok&&bz<cb1[2];bz++)for(bpSize by=cb0[1];ok&&by<cb1[1];by++)for(bpSize bx=cb0[0];ok&&bx<cb1[0];bx++,k++){
+        const std::vector<uint8_t>& v=o.comp[k];
+        ok=w.append(v.data(),v.size(),&e);
+        MonoChunk ch; memset(&ch,0,sizeof ch);
+        ch.offset=off; ch.cx=(uint32_t)bx; ch.cy=(uint32_t)by; ch.cz=(uint32_t)bz; ch.size=(uint32_t)v.size(); ch.level=(uint16_t)r;
+        x.chunks.push_back(ch); off+=v.size(); }
+    if(ok) ok=w.finish(&e);
+    if(!ok) return Status::fail(e+" (nothing was committed; run the worker again)");
+    if(direct) *direct=w.direct();
+    if(!mono_write_atomic(histName(cd,r,c,t,ti),o.hist.data(),HIST_BYTES,&e)||!mono_idx_write(tileIdxName(cd,r,c,t,ti),x,&e)) return Status::fail(e);
+    return Status();
+}
+#endif
+
+// One tile: its level-r voxels (level 0 from the zarr; coarser levels downsampled from the finer level's region
+// under it), zero past the level's size, encoded, stored. Prints one timing line.
+static Status workTile(const Manifest& m,const std::string& wd,int r,long index){
+    const std::string cd=wd+"/chunks"; const Lev& Lr=m.lev[r]; const long perCT=tilesPerCT(Lr); const bool mono=m.store=="mono";
+    const int c=(int)(index/((long)m.nT*perCT)); const long rem=index%((long)m.nT*perCT); const int t=(int)(rem/perCT); const long ti=rem%perCT;
+    const int threads=std::max(1,omp_get_max_threads());
+    const double t0=now();
+    bpSize cb0[3],cb1[3]; tileBlockRange(Lr,ti,cb0,cb1);
+    if(cb0[0]>=Lr.nch[0]||cb0[1]>=Lr.nch[1]||cb0[2]>=Lr.nch[2]) return Status();   // empty tile
+    const bpSize blk[3]={Lr.block[0],Lr.block[1],Lr.block[2]};
+    const bpSize to[3]={cb0[0]*blk[0],cb0[1]*blk[1],cb0[2]*blk[2]};                                  // tile voxel origin
+    const bpSize td[3]={(cb1[0]-cb0[0])*blk[0],(cb1[1]-cb0[1])*blk[1],(cb1[2]-cb0[2])*blk[2]};      // tile voxel extent (block-aligned)
+    const size_t nv=(size_t)(td[0]*td[1]*td[2]);
+    Vox tile(NULL,free); double tDown=0; bool readDirect=false;
+    if(r==0){
+        const bpSize ex=std::min(to[0]+td[0],m.X),ey=std::min(to[1]+td[1],m.Y),ez=std::min(to[2]+td[2],m.Z), rx=ex-to[0],ry=ey-to[1],rz=ez-to[2];
+        Vox reg((uint16_t*)readZarrParallelHelper(zarrAt(m,c,t).c_str(),to[0],to[1],to[2],ex,ey,ez,0),free);
+        if(!reg) return Status::fail("cannot read "+zarrAt(m,c,t));
+        if(rx==td[0]&&ry==td[1]&&rz==td[2]) tile=std::move(reg);   // the whole tile is inside the image
+        else { tile=newVox(nv); if(!tile) return Status::fail("out of memory");
+            for(bpSize z=0;z<rz;z++) for(bpSize y=0;y<ry;y++) memcpy(tile.get()+(size_t)(y*td[0]+z*td[0]*td[1]),reg.get()+(size_t)(y*rx+z*rx*ry),(size_t)rx*2); }
+    } else {
+        // the finer level's chunks under the tile, box-averaged straight into it (or, for a block layout where a box
+        // may span chunks, assembled into the finer region first and then downsampled)
+        const bpSize st[3]={levStride(m,r,0),levStride(m,r,1),levStride(m,r,2)};
+        const bpSize fo[3]={to[0]*st[0],to[1]*st[1],to[2]*st[2]}, fn[3]={td[0]*st[0],td[1]*st[1],td[2]*st[2]};
+        const Lev& F=m.lev[r-1]; const bool inChunks=downInChunks(F,st);
+        Vox fine(NULL,free); tile=newVox(nv);
+        if(!inChunks) fine=newVox((size_t)(fn[0]*fn[1]*fn[2]));
+        if(!tile||(!inChunks&&!fine)) return Status::fail("out of memory");
+        uint16_t* T=tile.get(); uint16_t* Fv=fine.get();
+        const ChunkSink put=inChunks?ChunkSink([&](const uint8_t* sh,bpSize cx,bpSize cy,bpSize cz){ downChunk(sh,F,cx,cy,cz,fo,fn,st,td,T); })
+                                    :ChunkSink([&](const uint8_t* sh,bpSize cx,bpSize cy,bpSize cz){ scatterChunk(sh,F,cx,cy,cz,fo,fn,Fv); });
+        Status s;
+        if(mono){
+#ifdef _WIN32
+            s=Status::fail(NOSUP_MONO);
+#else
+            s=assembleFromMono(m,wd,r-1,c,t,fo,fn,put,&readDirect);
+#endif
+        } else s=assembleFromPacks(m,cd,r-1,c,t,fo,fn,put);
+        if(!s.ok()) return s;
+        if(!inChunks){ const double t1=now();
+            bpSize dOut[3]; boxDown(fine.get(),fn,st,tile.get(),dOut);   // tile <- downsample(fine); dims td = fn/st
+            tDown=now()-t1; }
+    }
+    const double tRead=now()-t0-tDown;
+    // zero voxels past the true level size (floor-halving tail; the writer zero-pads them)
+    const bpSize ex=std::min(td[0],Lr.size[0]-to[0]), ey=std::min(td[1],Lr.size[1]-to[1]), ez=std::min(td[2],Lr.size[2]-to[2]);
+    if(ex<td[0]||ey<td[1]||ez<td[2])
+        for(bpSize z=0;z<td[2];z++) for(bpSize y=0;y<td[1];y++){ uint16_t* row=tile.get()+(size_t)(y*td[0]+z*td[0]*td[1]);
+            if(y>=ey||z>=ez) memset(row,0,(size_t)td[0]*2); else memset(row+ex,0,(size_t)(td[0]-ex)*2); }
+    const double te=now();
+    TileChunks o; Status s=encodeTile(tile.get(),td,Lr,cb0,cb1,o); if(!s.ok()) return Status::fail(s.message+" of "+tileOwner(r,c,t,ti));
+    tile.reset();
+    const double tEnc=now()-te, tw=now(); bool writeDirect=false;
+    if(mono){
+#ifdef _WIN32
+        s=Status::fail(NOSUP_MONO);
+#else
+        s=storeMono(m,wd,r,c,t,ti,cb0,cb1,o,std::min(threads,8),&writeDirect);
+#endif
+    } else s=storePack(cd,r,c,t,ti,cb0,cb1,o);
+    if(!s.ok()) return s;
+    const double tWrite=now()-tw;
+    std::string rd=r==0?"read "+fmt1(tRead)+" s":"read + downsample level "+std::to_string(r-1)+" "+fmt1(tRead)+" s"+(mono?(readDirect?" (direct I/O)":" (buffered)"):"")
+                                                   +(tDown>0?", downsample "+fmt1(tDown)+" s":"");
+    std::string wr=mono?"place "+fmt1(tWrite)+" s"+(writeDirect?" (direct I/O)":" (buffered + sync)"):"write pack "+fmt1(tWrite)+" s";
+    printf("worker %s: %zu chunks, %.2f GB -> %.2f GB: %s, encode %s s, %s, total %s s, %d threads\n",
+           tileOwner(r,c,t,ti).c_str(),o.comp.size(),(double)nv*2/1e9,(double)o.bytes/1e9,rd.c_str(),fmt1(tEnc).c_str(),wr.c_str(),fmt1(now()-t0).c_str(),threads);
+    fflush(stdout);
+    return Status();
+}
+// Tiles index .. index+count-1 of level r (clipped to the level's last tile), one after the other.
+static int doWorker(const std::string& wd,int r,long index,long count){
     Manifest m; Status s=readManifest(wd,m); if(!s.ok()) return fail(s);
     if(m.elem!=2) return fail(std::string(UINT16_ONLY)+"; "+wd+" has "+std::to_string(m.elem)+"-byte voxels");
-    std::string cd=wd+"/chunks"; int L=(int)m.lev.size();
+    int L=(int)m.lev.size();
     if(r<0||r>=L){ fprintf(stderr,"level %d out of range [0,%d)\n",r,L); return 1; }
-    const Lev& Lr=m.lev[r]; long perCT=tilesPerCT(Lr), jobs=(long)m.nC*m.nT*perCT;
+    const long jobs=jobsAtLevel(m,r);
     if(index<0||index>=jobs){ fprintf(stderr,"index %ld out of range [0,%ld) for level %d\n",index,jobs,r); return 1; }
-    int c=(int)(index/((long)m.nT*perCT)); long rem=index%((long)m.nT*perCT); int t=(int)(rem/perCT); long ti=rem%perCT;
-    bpSize blk[3]={Lr.block[0],Lr.block[1],Lr.block[2]};
-    // this tile's level-r block range and voxel extent (clipped to the level size)
-    bpSize cb0[3],cb1[3]; tileBlockRange(Lr,ti,cb0,cb1);
-    if(cb0[0]>=Lr.nch[0]||cb0[1]>=Lr.nch[1]||cb0[2]>=Lr.nch[2]) return 0;   // empty tile
-    bpSize to[3]={cb0[0]*blk[0],cb0[1]*blk[1],cb0[2]*blk[2]};                // tile voxel origin
-    bpSize td[3]={(cb1[0]-cb0[0])*blk[0],(cb1[1]-cb0[1])*blk[1],(cb1[2]-cb0[2])*blk[2]};  // tile voxel extent (block-aligned)
-    std::vector<uint16_t> tile((size_t)td[0]*td[1]*td[2],0);
-    if(r==0){
-        bpSize ex=std::min(to[0]+td[0],m.X),ey=std::min(to[1]+td[1],m.Y),ez=std::min(to[2]+td[2],m.Z);
-        if(to[0]<m.X&&to[1]<m.Y&&to[2]<m.Z){ bpSize rx=ex-to[0],ry=ey-to[1],rz=ez-to[2];
-            uint16_t* reg=(uint16_t*)readZarrParallelHelper(zarrAt(m,c,t).c_str(),to[0],to[1],to[2],ex,ey,ez,0);
-            if(!reg){ fprintf(stderr,"cannot read %s\n",zarrAt(m,c,t).c_str()); return 1; }
-            for(bpSize z=0;z<rz;z++)for(bpSize y=0;y<ry;y++)for(bpSize x=0;x<rx;x++) tile[x+y*td[0]+z*(size_t)td[0]*td[1]]=reg[x+y*rx+z*(size_t)rx*ry];
-            free(reg); }
-    } else {
-        bpSize st[3]={levStride(m,r,0),levStride(m,r,1),levStride(m,r,2)};
-        bpSize fo[3]={to[0]*st[0],to[1]*st[1],to[2]*st[2]}, fn[3]={td[0]*st[0],td[1]*st[1],td[2]*st[2]};
-        std::vector<uint16_t> fine; s=assembleFinerRegion(m,cd,r-1,c,t,fo,fn,fine); if(!s.ok()) return fail(s);
-        bpSize dOut[3]; boxDown(fine,fn,st,tile,dOut);   // tile <- downsample(fine); dims td = fn/st
+    if(count<1) return fail("worker: the tile count must be at least 1");
+    if(m.store=="mono"){
+#ifdef _WIN32
+        return fail(NOSUP_MONO);
+#else
+        // the single file is built from tiles: refuse a workdir that holds placed parts, and mark it for monoplace
+        if(fileExists(monoClaimsDir(wd)+"/layout.json")) return fail(wd+" holds parts placed by monoplace: its single file cannot also take tiles (use a new workdir)");
+        s=makeDirs(monoClaimsDir(wd)); if(!s.ok()) return fail(s);
+        int fd=::open((monoClaimsDir(wd)+"/tiles").c_str(),O_WRONLY|O_CREAT,0666);
+        if(fd<0) return fail("cannot create "+monoClaimsDir(wd)+"/tiles: "+strerror(errno));
+        close(fd);
+#endif
     }
-    // zero voxels past the true level size (floor-halving tail; the writer zero-pads them)
-    for(bpSize z=0;z<td[2];z++)for(bpSize y=0;y<td[1];y++)for(bpSize x=0;x<td[0];x++)
-        if(to[0]+x>=Lr.size[0]||to[1]+y>=Lr.size[1]||to[2]+z>=Lr.size[2]) tile[x+y*td[0]+z*(size_t)td[0]*td[1]]=0;
-    // pack every block chunk of this tile into ONE file (body streamed, index at the end);
-    // accumulate the tile histogram over in-size voxels only.
-    std::vector<uint64_t> hist(65536,0), pidx;
-    std::string pp=packName(cd,r,c,t,ti), ptmp=pp+".tmp"; FILE* pf=fopen(ptmp.c_str(),"wb");
-    if(!pf) return fail("cannot create "+ptmp+": "+strerror(errno));
-    bool wok=true, eok=true;
-    for(bpSize bz=cb0[2];wok&&eok&&bz<cb1[2];bz++)for(bpSize by=cb0[1];wok&&eok&&by<cb1[1];by++)for(bpSize bx=cb0[0];wok&&eok&&bx<cb1[0];bx++){
-        std::vector<uint16_t> cbk((size_t)blk[0]*blk[1]*blk[2]);
-        bpSize lx=(bx-cb0[0])*blk[0],ly=(by-cb0[1])*blk[1],lz=(bz-cb0[2])*blk[2];
-        for(bpSize z=0;z<blk[2];z++)for(bpSize y=0;y<blk[1];y++)for(bpSize x=0;x<blk[0];x++){
-            uint16_t v=tile[(lx+x)+(ly+y)*td[0]+(lz+z)*(size_t)td[0]*td[1]];
-            cbk[x+y*blk[0]+z*(size_t)blk[0]*blk[1]]=v;
-            if(bx*blk[0]+x<Lr.size[0]&&by*blk[1]+y<Lr.size[1]&&bz*blk[2]+z<Lr.size[2]) hist[v]++;
-        }
-        std::vector<uint8_t> comp; eok=encodeChunk((uint8_t*)cbk.data(),cbk.size()*2,comp);
-        if(eok){ wok=fwrite(comp.data(),1,comp.size(),pf)==comp.size(); pidx.push_back(bz); pidx.push_back(by); pidx.push_back(bx); pidx.push_back(comp.size()); }
-    }
-    uint64_t N=pidx.size()/4;
-    if(wok&&eok&&N) wok=fwrite(pidx.data(),8,pidx.size(),pf)==pidx.size();
-    if(wok&&eok) wok=fwrite(&N,8,1,pf)==1;
-    int e=errno; wok=(fclose(pf)==0)&&wok;
-    if(!eok){ remove(ptmp.c_str()); return fail("LZ4 could not compress a chunk of "+pp); }
-    if(!wok){ remove(ptmp.c_str()); return fail("cannot write "+ptmp+": "+strerror(e?e:errno)); }
-    // the histogram first, then the pack: the pack's name is the commit point the monitor waits for
-    s=writeFileAtomic(histName(cd,r,c,t,ti),hist.data(),hist.size()*sizeof(uint64_t));
-    if(!s.ok()){ remove(ptmp.c_str()); return fail(s); }
-    if(!renameReplace(ptmp,pp)){ e=errno; remove(ptmp.c_str()); return fail("cannot rename "+ptmp+" to "+pp+": "+strerror(e)); }
+    const long last=count>jobs-index?jobs:index+count;
+    for(long i=index;i<last;i++){ s=workTile(m,wd,r,i); if(!s.ok()) return fail(s); }
     return 0;
 }
 
@@ -211,6 +490,7 @@ static int doCombine(const Manifest& m,const std::string& wd,const std::string& 
 static int combineOne(const std::string& wd,int T,int C,const std::string& outPath){
     Manifest m; Status s=readManifest(wd,m); if(!s.ok()) return fail(s);
     if(m.elem!=2) return fail(std::string(UINT16_ONLY)+"; "+wd+" has "+std::to_string(m.elem)+"-byte voxels");
+    if(m.store!="packs") return fail(std::string(PACKS_ONLY)+"; "+wd+" uses the single-file store");
     std::string cd=wd+"/chunks"; int nR=(int)m.lev.size();
     if(T<0||T>=m.nT||C<0||C>=m.nC){ fprintf(stderr,"(t=%d,c=%d) out of range (nT=%d,nC=%d)\n",T,C,m.nT,m.nC); return 1; }
     hid_t out=imsCreate(outPath); if(out<0){ fprintf(stderr,"cannot create %s\n",outPath.c_str()); return 1; }
@@ -300,6 +580,7 @@ static Status writePartsThumbnail(hid_t out,const std::string& partDir,const std
 static int buildLink(const std::string& wd,const std::string& outPath,const std::string& partRel){
     Manifest m; Status s=readManifest(wd,m); if(!s.ok()) return fail(s);
     if(m.elem!=2) return fail(std::string(UINT16_ONLY)+"; "+wd+" has "+std::to_string(m.elem)+"-byte voxels");
+    if(m.store!="packs") return fail(std::string(PACKS_ONLY)+"; "+wd+" uses the single-file store");
     std::string cd=wd+"/chunks"; int nT=m.nT,nC=m.nC,nR=(int)m.lev.size();
     std::vector<Vec3> want; for(const Lev& L:m.lev) want.push_back(L.size);
     std::string outDir=dirOf(outPath), partDir=partRel.empty()?outDir:outDir+"/"+partRel;
@@ -392,30 +673,40 @@ static int linkParts(const std::string& wd,const std::string& outPath,const std:
     return 0;
 }
 
-// ===================== monitor: wait for every expected pack, check them, then combine =====================
-// A tile is done when its pack and histogram exist (the worker renames the pack last). Only the expected
-// names count, so stale or foreign packs in chunks/ are ignored. PIW_MONITOR_TIMEOUT=<seconds> gives up
-// (exit 1, listing missing tiles) instead of waiting forever for a worker that failed.
-static int doMonitor(const std::string& wd,const std::string& out){
+// ===================== monitor: wait for every expected tile, check them, then combine =====================
+// A tile is done when its histogram and its pack (packs store) or sidecar (mono store) exist: the worker writes
+// that one last. Only the expected names count, so stale or foreign files in chunks/ are ignored.
+// PIW_MONITOR_TIMEOUT=<seconds> gives up (exit 1, listing missing tiles) instead of waiting forever for a worker
+// that failed. Then the packs store checks every pack and merges them into a new file; the mono store runs
+// monofinish (mono.h), which checks every sidecar and builds the index of the placed chunks.
+static int doMonitor(const std::string& wd,const std::string& out,const std::vector<std::string>& finishArgs){
     Manifest m; Status s=readManifest(wd,m); if(!s.ok()) return fail(s);
     if(m.elem!=2) return fail(std::string(UINT16_ONLY)+"; "+wd+" has "+std::to_string(m.elem)+"-byte voxels");
-    std::string cd=wd+"/chunks";
+    const std::string cd=wd+"/chunks"; const bool mono=m.store=="mono";
     struct Want { int r,c,t; long tile; };
-    std::vector<Want> want;   // one .pack per (level,channel,timepoint,tile) = per worker
+    std::vector<Want> want;   // one pack or sidecar per (level,channel,timepoint,tile) = per worker
     for(int r=0;r<(int)m.lev.size();r++) for(int c=0;c<m.nC;c++) for(int t=0;t<m.nT;t++) for(long ti=0;ti<tilesPerCT(m.lev[r]);ti++) want.push_back({r,c,t,ti});
+    auto doneName=[&](const Want& w){ return mono?tileIdxName(cd,w.r,w.c,w.t,w.tile):packName(cd,w.r,w.c,w.t,w.tile); };
     double timeout=0; { const char* e=getenv("PIW_MONITOR_TIMEOUT"); if(e&&*e){ char* end=NULL; timeout=strtod(e,&end); if(end==e||*end||timeout<0) return fail(std::string("bad PIW_MONITOR_TIMEOUT '")+e+"' (seconds)"); } }
     std::vector<char> done(want.size(),0); size_t nDone=0; time_t t0=time(NULL);
     for(;;){
         for(size_t i=0;i<want.size();i++){ const Want& w=want[i];
-            if(!done[i]&&fileExists(packName(cd,w.r,w.c,w.t,w.tile))&&fileExists(histName(cd,w.r,w.c,w.t,w.tile))){ done[i]=1; nDone++; } }
+            if(!done[i]&&fileExists(doneName(w))&&fileExists(histName(cd,w.r,w.c,w.t,w.tile))){ done[i]=1; nDone++; } }
         printf("monitor: %llu/%llu tiles\n",(unsigned long long)nDone,(unsigned long long)want.size()); fflush(stdout);
         if(nDone>=want.size()) break;
         double el=difftime(time(NULL),t0);
         if(timeout>0&&el>=timeout){ int shown=0;
-            for(size_t i=0;i<want.size()&&shown<10;i++) if(!done[i]){ const Want& w=want[i]; fprintf(stderr,"missing: %s\n",packName(cd,w.r,w.c,w.t,w.tile).c_str()); shown++; }
+            for(size_t i=0;i<want.size()&&shown<10;i++) if(!done[i]){ fprintf(stderr,"missing: %s\n",doneName(want[i]).c_str()); shown++; }
             return fail("monitor gave up after "+std::to_string((long)el)+" s (PIW_MONITOR_TIMEOUT): "+std::to_string(want.size()-nDone)+" tiles missing"); }
         double nap=timeout>0?std::min(5.0,timeout-el):5.0; sleep((unsigned)std::max(1.0,nap));
     }
+    if(mono){   // monofinish <workdir> <out> [--verify] [--threads N]: it reports and returns like the command
+        printf("all tiles placed -> finishing %s\n",out.c_str()); fflush(stdout);
+        std::vector<std::string> a={"parallelimariswriter","monofinish",wd,out}; a.insert(a.end(),finishArgs.begin(),finishArgs.end());
+        std::vector<char*> av; for(std::string& x:a) av.push_back(&x[0]);
+        return runMono((int)av.size(),av.data());
+    }
+    if(!finishArgs.empty()) return fail("monitor: --verify and --threads are for the single-file store");
     // every pack must hold exactly its tile's chunks and every histogram must be whole before anything is written
     for(const Want& w:want){ std::string pp=packName(cd,w.r,w.c,w.t,w.tile); std::vector<uint64_t> idx;
         s=readPackIndex(pp,idx); if(s.ok()) s=checkPackTile(idx,m.lev[w.r],w.tile,pp);
@@ -434,15 +725,28 @@ static std::vector<std::string> listZarrs(const std::string& folder,const std::s
 }
 static int doSetup(int argc,char** argv){
     std::string folder=argv[2],patterns=argv[3],wd=argv[4];
-    // [vx,vy,vz] then the converter's metadata options (--name value or --name=value)
+    // [vx,vy,vz] then --store mono|packs and the converter's metadata options (--name value or --name=value);
+    // store default: env PIW_STORE, else mono (packs on Windows)
     int argi=6; const char* voxArg=NULL; if(argc>6&&strncmp(argv[6],"--",2)!=0){ voxArg=argv[6]; argi=7; }
+    const char* envStore=getenv("PIW_STORE");
+    std::string store=envStore&&*envStore?envStore:
+#ifdef _WIN32
+        "packs";
+#else
+        "mono";
+#endif
     piw::ConvertOptions mo;
     for(;argi<argc;argi++){ std::string a=argv[argi], name, value;
-        if(a.compare(0,2,"--")!=0) return fail("unexpected argument '"+a+"' (setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--option value ...])");
+        if(a.compare(0,2,"--")!=0) return usage("setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--store mono|packs] [--option value ...]");
         size_t eq=a.find('='); name=a.substr(2,eq==std::string::npos?std::string::npos:eq-2);
-        if(!imsmeta::isMetadataOption(name)) return fail("unknown setup option --"+name);
+        if(name!="store"&&!imsmeta::isMetadataOption(name)) return fail("unknown setup option --"+name);
         if(eq!=std::string::npos) value=a.substr(eq+1); else if(argi+1<argc) value=argv[++argi]; else return fail("--"+name+" needs a value");
+        if(name=="store"){ store=value; continue; }
         std::string e=imsmeta::parseMetadataOption(name,value,mo); if(!e.empty()) return fail(e); }
+    if(store!="mono"&&store!="packs") return fail("unknown store '"+store+"' (expected mono or packs)");
+#ifdef _WIN32
+    if(store=="mono") return fail(NOSUP_MONO);
+#endif
     if(wd.find_first_of("/"
 #ifdef _WIN32
         "\\:"
@@ -452,7 +756,7 @@ static int doSetup(int argc,char** argv){
     if(!cap[0]||!cap[1]||!cap[2]){ fprintf(stderr,"bad tile size '%s' (expected X,Y,Z voxels)\n",argv[5]); return 1; }
     std::vector<std::string> pats; { std::stringstream ss(patterns); std::string p; while(std::getline(ss,p,',')) if(!p.empty()) pats.push_back(p); }
     if(pats.empty()){ fprintf(stderr,"no channel patterns given\n"); return 1; }
-    Manifest m; m.nC=(int)pats.size(); for(int a=0;a<3;a++) m.cap[a]=cap[a];
+    Manifest m; m.nC=(int)pats.size(); m.store=store; for(int a=0;a<3;a++) m.cap[a]=cap[a];
     std::vector<std::vector<std::string>> perCh;
     for(auto&p:pats){ auto zs=listZarrs(folder,p); if(zs.empty()){ fprintf(stderr,"no .zarr matching '%s' in %s\n",p.c_str(),folder.c_str()); return 1; } perCh.push_back(zs); }
     m.nT=(int)perCh[0].size();
@@ -470,30 +774,43 @@ static int doSetup(int argc,char** argv){
     mo.files=perCh; if(mo.channelNames.empty()) mo.channelNames=pats;
     { std::string e=imsmeta::resolveMetadata(mo,m.meta); if(!e.empty()) return fail(e); }
     bpSize chunkBytes=chunkBudgetBytes();   // only the BLOCK budget changes; the pyramid (level count) is unchanged
-    m.lev=makeLevels(m.X,m.Y,m.Z,m.elem,cap,chunkBytes);
+    m.lev=makeLevels(m.X,m.Y,m.Z,m.elem,cap,chunkBytes,(bpSize)m.nT);   // the block layout of an nT-timepoint file
     Status s=makeDirs(wd+"/chunks"); if(!s.ok()) return fail(s);
     s=writeManifest(wd,m); if(!s.ok()) return fail(s);
-    long total=0; printf("setup: %llux%llux%llu elem=%llu, %d channels, %d timepoints, %zu levels\n",(unsigned long long)m.X,(unsigned long long)m.Y,(unsigned long long)m.Z,(unsigned long long)m.elem,m.nC,m.nT,m.lev.size());
+    long total=0; printf("setup: %llux%llux%llu elem=%llu, %d channels, %d timepoints, %zu levels, %s store\n",(unsigned long long)m.X,(unsigned long long)m.Y,(unsigned long long)m.Z,(unsigned long long)m.elem,m.nC,m.nT,m.lev.size(),
+                         m.store=="mono"?"single-file":"packs");
     printf("  workdir: %s\n  tile: %llu,%llu,%llu voxels\n  chunk budget %llu bytes -> L0 block %llu,%llu,%llu voxels\n",wd.c_str(),(unsigned long long)cap[0],(unsigned long long)cap[1],(unsigned long long)cap[2],(unsigned long long)chunkBytes,(unsigned long long)m.lev[0].block[0],(unsigned long long)m.lev[0].block[1],(unsigned long long)m.lev[0].block[2]);
     printf("  run one worker array PER LEVEL, in order (level r+1 after level r):\n");
-    for(int r=0;r<(int)m.lev.size();++r){ long jr=jobsAtLevel(m,r); total+=jr; printf("    level %d: worker <workdir> %d <index>   index 0..%ld  (%lld tiles/(ch*tp))\n",r,r,jr-1,(long long)((long long)m.lev[r].nt[0]*m.lev[r].nt[1]*m.lev[r].nt[2])); }
+    for(int r=0;r<(int)m.lev.size();++r){ long jr=jobsAtLevel(m,r); total+=jr; printf("    level %d: worker <workdir> %d <index> [count]   index 0..%ld  (%lld tiles/(ch*tp))\n",r,r,jr-1,(long long)((long long)m.lev[r].nt[0]*m.lev[r].nt[1]*m.lev[r].nt[2])); }
     printf("  total worker jobs across all levels: %ld\n",total);
+    printf("  then: monitor <workdir> [out.ims]  (%s)\n",m.store=="mono"?"indexes the chunks the workers placed in the single file":"merges the packs");
     if(m.elem!=2) fprintf(stderr,"WARNING: %s; this %llu-byte input can only go through per-(timepoint,channel) converter jobs + linkparts\n",UINT16_ONLY,(unsigned long long)m.elem);
     return 0;
 }
 
 bool isParallelCommand(const char* c){ return c && (!strcmp(c,"setup")||!strcmp(c,"worker")||!strcmp(c,"monitor")||!strcmp(c,"combineone")||!strcmp(c,"link")||!strcmp(c,"linkparts")||!strcmp(c,"layout")); }
 
+// Splits argv[2..] into positional arguments and the options --verify and --threads N (monitor).
+static bool monitorArgs(int argc,char** argv,std::vector<std::string>& pos,std::vector<std::string>& finishArgs){
+    for(int i=2;i<argc;i++){ std::string a=argv[i];
+        if(a=="--verify") finishArgs.push_back(a);
+        else if(a=="--threads"){ long n; if(i+1>=argc||!parseLong(argv[i+1],n)||n<1) return false; finishArgs.push_back(a); finishArgs.push_back(argv[++i]); }
+        else if(a.size()>2&&a.compare(0,2,"--")==0) return false;
+        else pos.push_back(a); }
+    return true;
+}
 int runParallel(int argc,char** argv){
     if(!registerLZ4()) return fail("cannot register the LZ4 filter id with HDF5");
     std::string cmd=argc>=2?argv[1]:"";
-    if(cmd=="layout"&&argc>=5){ Vec3 img{(bpSize)atoll(argv[2]),(bpSize)atoll(argv[3]),(bpSize)atoll(argv[4])}; bpSize e=argc>5?atoll(argv[5]):2;
-        if(!img[0]||!img[1]||!img[2]||(e!=1&&e!=2&&e!=4)) return fail("layout needs X Y Z > 0 and elemSize 1, 2 or 4");
-        bpSize cb=chunkBudgetBytes(); auto ls=GetOptimalImagePyramid((1024*1024)/e,img,true),bs=GetOptimalBlockSizes(cb/e,ls,1); printf("chunk budget %llu bytes\n",(unsigned long long)cb); printf("%zu levels\n",ls.size()); for(size_t i=0;i<ls.size();++i) printf("  L%zu size=%llu,%llu,%llu block=%llu,%llu,%llu\n",i,(unsigned long long)ls[i][0],(unsigned long long)ls[i][1],(unsigned long long)ls[i][2],(unsigned long long)bs[i][0],(unsigned long long)bs[i][1],(unsigned long long)bs[i][2]); return 0; }
+    if(cmd=="layout"&&argc>=5){ Vec3 img{(bpSize)atoll(argv[2]),(bpSize)atoll(argv[3]),(bpSize)atoll(argv[4])}; bpSize e=argc>5?atoll(argv[5]):2, nT=argc>6?atoll(argv[6]):1;
+        if(!img[0]||!img[1]||!img[2]||(e!=1&&e!=2&&e!=4)||nT<1) return fail("layout needs X Y Z > 0, elemSize 1, 2 or 4 and timepoints >= 1");
+        bpSize cb=chunkBudgetBytes(); auto ls=GetOptimalImagePyramid((1024*1024)/e,img,true),bs=GetOptimalBlockSizes(cb/e,ls,nT); printf("chunk budget %llu bytes, %llu timepoints\n",(unsigned long long)cb,(unsigned long long)nT); printf("%zu levels\n",ls.size()); for(size_t i=0;i<ls.size();++i) printf("  L%zu size=%llu,%llu,%llu block=%llu,%llu,%llu\n",i,(unsigned long long)ls[i][0],(unsigned long long)ls[i][1],(unsigned long long)ls[i][2],(unsigned long long)bs[i][0],(unsigned long long)bs[i][1],(unsigned long long)bs[i][2]); return 0; }
     if(cmd=="setup"&&argc>=6) return doSetup(argc,argv);
-    if(cmd=="worker"&&argc>=5){ long r,i; if(!parseLong(argv[3],r)||!parseLong(argv[4],i)) return fail("worker needs a numeric level and index");
-        return doWorker(argv[2],(int)r,i); }
-    if(cmd=="monitor"&&argc>=3){ std::string wd=argv[2]; return doMonitor(wd,argc>3?argv[3]:wd+"/output.ims"); }
+    if(cmd=="worker"&&argc>=5){ long r,i,n=1; if(!parseLong(argv[3],r)||!parseLong(argv[4],i)||(argc>5&&!parseLong(argv[5],n))||argc>6) return usage("worker <workdir> <level> <index> [count]");
+        return doWorker(argv[2],(int)r,i,n); }
+    if(cmd=="monitor"){ std::vector<std::string> pos, fa;
+        if(!monitorArgs(argc,argv,pos,fa)||pos.empty()||pos.size()>2) return usage("monitor <workdir> [out.ims] [--verify] [--threads N]");
+        return doMonitor(pos[0],pos.size()>1?pos[1]:pos[0]+"/output.ims",fa); }
     if(cmd=="combineone"&&argc>=6){ long t,c; if(!parseLong(argv[3],t)||!parseLong(argv[4],c)) return fail("combineone needs a numeric timepoint and channel");
         return combineOne(argv[2],(int)t,(int)c,argv[5]); }
     if(cmd=="link"&&argc>=5) return buildLink(argv[2],argv[3],argv[4]);

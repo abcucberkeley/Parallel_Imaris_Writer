@@ -94,14 +94,21 @@ inline void shuffle2(const uint8_t* s,size_t n,uint8_t* d){ size_t h=n/2; for(si
 inline void unshuffle2(const uint8_t* s,size_t n,uint8_t* d){ size_t h=n/2; for(size_t i=0;i<h;i++){d[2*i]=s[i];d[2*i+1]=s[h+i];} }
 inline void wbe(uint8_t* d,uint64_t v,int nb){ for(int i=0;i<nb;i++) d[nb-1-i]=(uint8_t)((v>>(8*i))&0xff); }
 inline uint64_t rbe(const uint8_t* d,int nb){ uint64_t v=0; for(int i=0;i<nb;i++)v=(v<<8)|d[i]; return v; }
-// false if LZ4 failed (or nb is beyond what one LZ4 block takes)
-inline bool encodeChunk(const uint8_t* vox,size_t nb,std::vector<uint8_t>& out){
+// The LZ4 stage of encodeChunk: nb already shuffled bytes. false if LZ4 failed (or nb is beyond what one LZ4
+// block takes).
+inline bool encodeChunkShuffled(const uint8_t* sh,size_t nb,std::vector<uint8_t>& out){
     if(nb>(size_t)LZ4_MAX_INPUT_SIZE){ out.clear(); return false; }
-    std::vector<uint8_t> sh(nb); shuffle2(vox,nb,sh.data()); int bd=LZ4_compressBound((int)nb); out.resize(16+bd);
-    int c=LZ4_compress_default((const char*)sh.data(),(char*)out.data()+16,(int)nb,bd);
+    int bd=LZ4_compressBound((int)nb); out.resize(16+bd);
+    int c=LZ4_compress_default((const char*)sh,(char*)out.data()+16,(int)nb,bd);
     if(c<=0&&nb>0){ out.clear(); return false; }
     wbe(out.data(),nb,8); wbe(out.data()+8,nb,4); wbe(out.data()+12,(uint64_t)c,4); out.resize(16+c);
     return true;
+}
+// false if LZ4 failed (or nb is beyond what one LZ4 block takes)
+inline bool encodeChunk(const uint8_t* vox,size_t nb,std::vector<uint8_t>& out){
+    if(nb>(size_t)LZ4_MAX_INPUT_SIZE){ out.clear(); return false; }
+    std::vector<uint8_t> sh(nb); shuffle2(vox,nb,sh.data());
+    return encodeChunkShuffled(sh.data(),nb,out);
 }
 // The LZ4 stage of decodeChunk: the chunk's still shuffled bytes into sh (expectRaw bytes, the header must agree).
 inline Status decodeChunkShuffled(const uint8_t* c,size_t cs,uint8_t* sh,size_t expectRaw){
@@ -130,14 +137,32 @@ inline void chunkToVolume(const uint16_t* v,const bpSize b[3],bpSize cx,bpSize c
     for(bpSize z=0;z<zv;z++) for(bpSize y=0;y<yv;y++)
         memcpy(vol+(size_t)(x0+(y0+y)*size[0]+(z0+z)*size[0]*size[1]),v+(size_t)(y+z*b[1])*b[0],(size_t)xv*2);
 }
-// Box-average one pyramid step; dims/strides [x,y,z] (x fastest), di a multiple of st.
-inline void boxDown(const std::vector<uint16_t>& in,const bpSize di[3],const bpSize st[3],std::vector<uint16_t>& out,bpSize dOut[3]){
+// Box-average one pyramid step (ImarisWriter's ResampleBlockT: the sum as float, divided by the box volume,
+// truncated); dims/strides [x,y,z] (x fastest), di a multiple of st. Output planes in parallel (OpenMP).
+// Strides of 1 or 2 (every pyramid step) sum in integers and shift: the float sum of at most 8 uint16 values is
+// exact and dividing it by a power of two is too, so the result is the same. out: dOut[0]*dOut[1]*dOut[2] voxels.
+inline void boxDown(const uint16_t* in,const bpSize di[3],const bpSize st[3],uint16_t* out,bpSize dOut[3]){
     for(int a=0;a<3;a++) dOut[a]=di[a]/st[a];
-    out.assign((size_t)dOut[0]*dOut[1]*dOut[2],0); const float dn=(float)(st[0]*st[1]*st[2]);
-    for(bpSize oz=0;oz<dOut[2];oz++)for(bpSize oy=0;oy<dOut[1];oy++)for(bpSize ox=0;ox<dOut[0];ox++){ float s=0;
+    const long long nz=(long long)dOut[2]; const size_t pi=(size_t)di[0]*di[1], po=(size_t)dOut[0]*dOut[1];
+    if(st[0]<=2&&st[1]<=2&&st[2]<=2){
+        const unsigned sh=(unsigned)((st[0]-1)+(st[1]-1)+(st[2]-1));
+        const size_t dx=(size_t)st[0]-1, dy=(size_t)(st[1]-1)*di[0], dz=(size_t)(st[2]-1)*pi;
+        #pragma omp parallel for schedule(static)
+        for(long long oz=0;oz<nz;oz++) for(bpSize oy=0;oy<dOut[1];oy++){
+            const uint16_t* a=in+(size_t)oz*st[2]*pi+(size_t)oy*st[1]*di[0];
+            uint16_t* o=out+(size_t)oz*po+(size_t)oy*dOut[0];
+            for(bpSize ox=0;ox<dOut[0];ox++){ const uint16_t* p=a+(size_t)ox*st[0];
+                uint32_t s=(uint32_t)p[0]+p[dx]+p[dy]+p[dy+dx]+p[dz]+p[dz+dx]+p[dz+dy]+p[dz+dy+dx];   // repeats when an axis is not reduced
+                o[ox]=(uint16_t)((s>>(3-sh))>>sh); }   // s counts each voxel 8/2^sh times
+        }
+        return;
+    }
+    const float dn=(float)(st[0]*st[1]*st[2]);
+    #pragma omp parallel for schedule(static)
+    for(long long oz=0;oz<nz;oz++)for(bpSize oy=0;oy<dOut[1];oy++)for(bpSize ox=0;ox<dOut[0];ox++){ float s=0;
         for(bpSize dz=0;dz<st[2];dz++)for(bpSize dy=0;dy<st[1];dy++)for(bpSize dx=0;dx<st[0];dx++)
-            s+=in[(ox*st[0]+dx)+(oy*st[1]+dy)*di[0]+(oz*st[2]+dz)*(size_t)di[0]*di[1]];
-        out[ox+oy*dOut[0]+oz*(size_t)dOut[0]*dOut[1]]=(uint16_t)(s/dn); }
+            s+=in[(ox*st[0]+dx)+(oy*st[1]+dy)*di[0]+((bpSize)oz*st[2]+dz)*pi];
+        out[ox+oy*dOut[0]+(size_t)oz*po]=(uint16_t)(s/dn); }
 }
 
 // ===================== files (portable: 64-bit offsets, atomic replace, mkdir -p) =====================
@@ -212,8 +237,11 @@ inline bool readFileBytes(const std::string& p,std::vector<uint8_t>& b){
 
 // ===================== manifest (JSON) =====================
 struct Lev { Vec3 size, block, nch, tb, nt; };   // tb = tile size in blocks; nt = tile grid
-// meta = the metadata setup resolved (imsmeta::resolveMetadata of the zarrs and setup's options)
-struct Manifest { std::vector<std::string> zarrs; int nC=1,nT=1; bpSize X,Y,Z,elem; float vox[3]; bpSize cap[3]={0,0,0}; std::vector<Lev> lev; imsmeta::Metadata meta; };
+// meta = the metadata setup resolved (imsmeta::resolveMetadata of the zarrs and setup's options).
+// store: where the tile workers put their chunks: "mono" = straight into the single file (sidecars in chunks/,
+// see mono.h), "packs" = one .pack per tile for monitor's serial combine, combineone and link (manifests written
+// before the field existed are "packs").
+struct Manifest { std::vector<std::string> zarrs; int nC=1,nT=1; bpSize X,Y,Z,elem; float vox[3]; bpSize cap[3]={0,0,0}; std::vector<Lev> lev; imsmeta::Metadata meta; std::string store="packs"; };
 inline const std::string& zarrAt(const Manifest& m,int c,int t){ return m.zarrs[(size_t)c*m.nT+t]; }
 inline bpSize levStride(const Manifest& m,int r,int a){ bpSize s=m.lev[r-1].size[a]/m.lev[r].size[a]; return s?s:1; }
 inline long jobsAtLevel(const Manifest& m,int r){ const Lev& L=m.lev[r]; return (long)m.nC*m.nT*L.nt[0]*L.nt[1]*L.nt[2]; }
@@ -227,9 +255,11 @@ inline double voxClean(float f){ char b[32]; snprintf(b,sizeof b,"%.7g",(double)
 inline double floatExact(float f){ char b[32]; snprintf(b,sizeof b,"%.9g",(double)f); return atof(b); }   // reads back to f
 // The pyramid of an X*Y*Z volume of elem-byte voxels: per level its size, block (chunk) size, chunk grid, and
 // the grid of cap-voxel tiles (one worker each). chunkBytes = the chunk budget, chunkBudgetBytes() by default.
-inline std::vector<Lev> makeLevels(bpSize X,bpSize Y,bpSize Z,bpSize elem,const bpSize cap[3],bpSize chunkBytes){
+// nT = the timepoints of the file: ImarisWriter's block layout takes them into account (a block may span
+// timepoints where that pads less, so some small levels of an nT-timepoint file have smaller chunks).
+inline std::vector<Lev> makeLevels(bpSize X,bpSize Y,bpSize Z,bpSize elem,const bpSize cap[3],bpSize chunkBytes,bpSize nT=1){
     std::vector<Lev> lev;   // only the BLOCK budget changes with chunkBytes; the pyramid (level count) does not
-    auto ls=GetOptimalImagePyramid((1024*1024)/elem,{X,Y,Z},true),bs=GetOptimalBlockSizes(chunkBytes/elem,ls,1);
+    auto ls=GetOptimalImagePyramid((1024*1024)/elem,{X,Y,Z},true),bs=GetOptimalBlockSizes(chunkBytes/elem,ls,nT?nT:1);
     for(size_t r=0;r<ls.size();++r){ Lev L; L.size=ls[r]; L.block=bs[r];
         for(int a=0;a<3;a++){ L.nch[a]=(ls[r][a]+bs[r][a]-1)/bs[r][a]; L.tb[a]=std::max((bpSize)1,(cap[a]+bs[r][a]-1)/bs[r][a]); L.nt[a]=(L.nch[a]+L.tb[a]-1)/L.tb[a]; }
         lev.push_back(L); }
@@ -268,6 +298,7 @@ inline Status writeManifest(const std::string& wd,const Manifest& m){
     j["size"]={(unsigned long long)m.X,(unsigned long long)m.Y,(unsigned long long)m.Z}; j["elem"]=(unsigned long long)m.elem;
     j["voxel"]={voxClean(m.vox[0]),voxClean(m.vox[1]),voxClean(m.vox[2])};
     j["tile"]={(unsigned long long)m.cap[0],(unsigned long long)m.cap[1],(unsigned long long)m.cap[2]};
+    j["store"]=m.store;
     ordered_json lv=ordered_json::array();
     for(const Lev& L:m.lev){ ordered_json e;
         e["size"]={(unsigned long long)L.size[0],(unsigned long long)L.size[1],(unsigned long long)L.size[2]};
@@ -294,6 +325,8 @@ inline Status readManifest(const std::string& wd,Manifest& m){
         m.vox[0]=m.vox[1]=m.vox[2]=1.f;
         if(j.contains("voxel")){ auto&v=j["voxel"]; for(int a=0;a<3;a++) m.vox[a]=v[a].get<float>(); }
         if(j.contains("tile")){ auto&c=j["tile"]; for(int a=0;a<3;a++) m.cap[a]=c[a].get<bpSize>(); }
+        m.store=j.value("store",std::string("packs"));
+        if(m.store!="packs"&&m.store!="mono") return Status::fail(p+": unknown store '"+m.store+"' (expected mono or packs)");
         for(auto& e:j["level"]){ Lev L; for(int a=0;a<3;a++){ L.size[a]=e["size"][a].get<bpSize>(); L.block[a]=e["block"][a].get<bpSize>(); L.nch[a]=e["nchunks"][a].get<bpSize>(); L.tb[a]=e["tileBlocks"][a].get<bpSize>(); L.nt[a]=e["ntiles"][a].get<bpSize>(); } m.lev.push_back(L); }
         if(m.nC<1||m.nT<1||m.lev.empty()||m.X==0||m.Y==0||m.Z==0||(m.elem!=1&&m.elem!=2&&m.elem!=4)) return Status::fail(p+" has no levels, an empty size, or an unknown element size");
         for(const Lev& L:m.lev) for(int a=0;a<3;a++) if(!L.size[a]||!L.block[a]||!L.nch[a]||!L.tb[a]||!L.nt[a]) return Status::fail(p+" has a level with a zero size, block or grid");
@@ -318,6 +351,13 @@ inline Status readManifest(const std::string& wd,Manifest& m){
 inline std::string packName(const std::string& d,int r,int c,int t,long tile){ char b[128]; snprintf(b,sizeof b,"/L%d_C%d_T%d_%ld.pack",r,c,t,tile); return d+b; }
 inline std::string histName(const std::string& d,int r,int c,int t,long tile){ char b[128]; snprintf(b,sizeof b,"/h_L%d_C%d_T%d_%ld.hist",r,c,t,tile); return d+b; }
 static const size_t HIST_BYTES=65536*sizeof(uint64_t);
+// The "mono" store (mono.h): a tile's chunks go straight into the single file being built, at a byte range its
+// worker claims in <workdir>/mono (owner L<r>_C<c>_T<t>_<tile>); its sidecar chunks/<owner>.idx, written after the
+// histogram, is the tile's commit point. mono/tiles marks a workdir whose tile workers use the store.
+inline std::string monoFilePath(const std::string& wd){ return wd+"/output.ims.partial"; }
+inline std::string monoClaimsDir(const std::string& wd){ return wd+"/mono"; }
+inline std::string tileOwner(int r,int c,int t,long tile){ char b[96]; snprintf(b,sizeof b,"L%d_C%d_T%d_%ld",r,c,t,tile); return b; }
+inline std::string tileIdxName(const std::string& d,int r,int c,int t,long tile){ return d+"/"+tileOwner(r,c,t,tile)+".idx"; }
 // Read and check a pack's index (idx = N*{cz,cy,cx,size}): the body sizes + index + count must add up to the
 // file size exactly, so a truncated, padded or trailer-less pack is refused.
 inline Status readPackIndex(FILE* f,const std::string& path,std::vector<uint64_t>& idx){
@@ -335,18 +375,22 @@ inline Status readPackIndex(const std::string& path,std::vector<uint64_t>& idx){
     FILE* f=fopen(path.c_str(),"rb"); if(!f){ idx.clear(); return Status::fail("missing pack "+path); }
     Status s=readPackIndex(f,path,idx); fclose(f); return s;
 }
-// The index must hold exactly the blocks of tile `tile` of level L, each once.
-inline Status checkPackTile(const std::vector<uint64_t>& idx,const Lev& L,long tile,const std::string& path){
+// The chunks coord(i, cx, cy, cz), i < N, must be exactly the blocks of tile `tile` of level L, each once.
+template<class CoordFn> inline Status checkTileChunks(uint64_t N,const CoordFn& coord,const Lev& L,long tile,const std::string& path){
     bpSize cb0[3],cb1[3]; tileBlockRange(L,tile,cb0,cb1);
-    uint64_t want=(cb1[0]-cb0[0])*(cb1[1]-cb0[1])*(cb1[2]-cb0[2]), N=idx.size()/4;
+    uint64_t want=(cb1[0]-cb0[0])*(cb1[1]-cb0[1])*(cb1[2]-cb0[2]);
     if(N!=want) return Status::fail(path+": "+std::to_string(N)+" chunks, the tile has "+std::to_string(want));
     std::vector<bool> seen(want,false);
-    for(uint64_t i=0;i<N;i++){ bpSize cz=idx[i*4],cy=idx[i*4+1],cx=idx[i*4+2];
+    for(uint64_t i=0;i<N;i++){ bpSize cx,cy,cz; coord(i,cx,cy,cz);
         if(cx<cb0[0]||cx>=cb1[0]||cy<cb0[1]||cy>=cb1[1]||cz<cb0[2]||cz>=cb1[2]) return Status::fail(path+": chunk outside its tile");
         uint64_t k=(cx-cb0[0])+(cy-cb0[1])*(cb1[0]-cb0[0])+(cz-cb0[2])*(cb1[0]-cb0[0])*(cb1[1]-cb0[1]);
         if(seen[k]) return Status::fail(path+": chunk listed twice");
         seen[k]=true; }
     return Status();
+}
+// The index must hold exactly the blocks of tile `tile` of level L, each once.
+inline Status checkPackTile(const std::vector<uint64_t>& idx,const Lev& L,long tile,const std::string& path){
+    return checkTileChunks(idx.size()/4,[&](uint64_t i,bpSize& cx,bpSize& cy,bpSize& cz){ cz=idx[i*4]; cy=idx[i*4+1]; cx=idx[i*4+2]; },L,tile,path);
 }
 typedef std::function<Status(bpSize cz,bpSize cy,bpSize cx,const uint8_t* bytes,size_t size)> PackChunkFn;
 // Call cb for every chunk of a pack, in file order; stops at the first failure (a bad pack or cb's own).

@@ -1,7 +1,9 @@
 #ifndef PARALLEL_IMARIS_MONO_H
 #define PARALLEL_IMARIS_MONO_H
 
-// Single-file ("mono") cluster output for the time-series path: one (timepoint, channel) per job.
+// Single-file ("mono") cluster output: one (timepoint, channel) per job (the time-series path, here), or the tile
+// workers of setup's mono store (parallel.h: single enormous volumes), whose single file monofinish and monostatus
+// also take (see "Tiles" below).
 //
 // Every (t,c) is converted on its own by the single-node converter (one timepoint and one channel per run,
 // any input, cropped or not: a "part"); monoplace copies the part's compressed chunks verbatim into ONE .ims,
@@ -31,6 +33,14 @@
 // A failed or killed monoplace is simply run again: the same part gets the same range and writes the same
 // bytes. monofinish seals the journal (later placements fail), builds the file, checks its chunk index with
 // the stock HDF5 driver against the sidecars, and renames it; until the rename it can be run again.
+//
+// Tiles: in a workdir made by setup with the mono store (the default), every tile worker writes its tile's chunks
+// straight into output.ims.partial at a range it claims (owner L<r>_C<c>_T<t>_<tile>), then its histogram
+// chunks/h_L<r>_C<c>_T<t>_<tile>.hist and its sidecar chunks/L<r>_C<c>_T<t>_<tile>.idx (the commit point); the
+// coarser levels read the finer levels' chunks back from the file. monofinish (which monitor runs once every
+// sidecar exists) then works as for parts, with the geometry from the manifest (setup lays the blocks out for all
+// nT timepoints, so no level is re-chunked) and each dataset's histogram summed from its tiles'. A workdir takes
+// parts or tiles, never both.
 //
 // Every step is also a function here: it returns a Status (no exit, no printing; the command line prints the
 // results), takes its thread count as an argument, and holds the library's HDF5 mutex only around its HDF5
@@ -89,13 +99,16 @@ Status monoPlace(const MonoPlaceOptions& options, MonoPlaceResult* result = null
 
 struct MonoProgress {
     int timepoints = 0, channels = 0;
-    std::vector<std::string> placed, missing;   // owners P_C<c>_T<t>, in (t, c) order
+    bool tiles = false;                         // a tile workdir (setup's mono store); levels: its levels
+    int levels = 0;
+    std::vector<std::string> placed, missing;   // owners P_C<c>_T<t>, in (t, c) order; tiles: L<r>_C<c>_T<t>_<tile>,
+                                                // in (level, t, c, tile) order
     bool sealed = false;                        // monofinish has started: no more placements
     bool finished = false;                      // ... and renamed the file to finishedFile
     std::string finishedFile;
     uint64_t claimedBytes = 0;                  // end of the claimed raw region
 };
-// Which parts have their sidecar. Does not change anything.
+// Which parts (or tiles) have their sidecar. Does not change anything.
 Status monoStatus(const std::string& workdir, MonoProgress& progress) noexcept;
 
 struct MonoFinishOptions {
@@ -107,10 +120,10 @@ struct MonoFinishOptions {
 };
 struct MonoFinishResult {
     std::string outputFile;
-    std::vector<std::string> missing;   // owners without a sidecar: then the Status is NotFound
+    std::vector<std::string> missing;   // owners (parts or tiles) without a sidecar: then the Status is NotFound
     bool alreadyFinished = false;       // an earlier run renamed the file (nothing was done)
     int timepoints = 0, channels = 0, levels = 0;
-    uint64_t chunks = 0;                // chunks placed by the parts
+    uint64_t chunks = 0;                // chunks placed by the parts (or tiles)
     std::vector<int> rechunkedLevels;   // levels laid out for nT timepoints (see monoFinish)
     uint64_t rechunkedChunks = 0;       // chunks written for them
     std::string note;                   // set when no level could be re-chunked
@@ -122,12 +135,13 @@ struct MonoFinishResult {
     double verifySeconds = 0;
     double totalSeconds = 0;
 };
-// Builds the file and renames it. ImarisWriter's block layout depends on the timepoint count: a single-node
-// conversion of nT timepoints gives some small levels smaller chunks (a block spanning timepoints pads less)
-// than the 1-timepoint parts have. Those levels (the real 167-timepoint series: levels 5 and 6, at most a few
-// million voxels per part) are decoded from the placed chunks, cut into the nT-timepoint chunks, encoded again
-// (the same bytes ImarisWriter writes) and stored after the raw region, so the whole file equals the
-// single-node conversion; their placed chunks stay unused in the raw region.
+// Builds the file and renames it (parts or tiles, whichever the workdir holds). ImarisWriter's block layout
+// depends on the timepoint count: a single-node conversion of nT timepoints gives some small levels smaller
+// chunks (a block spanning timepoints pads less) than the 1-timepoint parts have. Those levels (the real
+// 167-timepoint series: levels 5 and 6, at most a few million voxels per part) are decoded from the placed
+// chunks, cut into the nT-timepoint chunks, encoded again (the same bytes ImarisWriter writes) and stored after
+// the raw region, so the whole file equals the single-node conversion; their placed chunks stay unused in the
+// raw region. Tiles are already laid out for nT timepoints.
 Status monoFinish(const MonoFinishOptions& options, MonoFinishResult* result = nullptr) noexcept;
 
 }  // namespace piw
