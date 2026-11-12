@@ -372,13 +372,11 @@ static piw::ImsInfo infoOf(const fs::path& f, bool checksums = true){
     return info;
 }
 
-// The histograms of resolution levels 1 and up (the Histogram/Histogram1024 datasets and the
-// HistogramMin/HistogramMax attributes of their groups) are left out of the comparisons below:
-// ImarisWriter (b128e6e, bpMultiresolutionImsImage::FinishWriteDataBlocks) stops waiting once its
-// resample counter is 0, while the last resample's copy into the lower level -- which queues that
-// level's histogram jobs -- can still be pending on its compute thread. The lower level's histogram
-// is then still empty and is not written: about 1 test run in 10 here, the voxels always complete.
-// Pass lowerHistograms = true to compare them too.
+// ImarisWriter's histograms of 32-bit samples (uint32, float32) are adaptive: their bin range grows
+// as the values arrive. At resolution levels 1 and up the values arrive in the order the resampling
+// threads finish, so the same data can give bins shifted by one (other HistogramMin/Max; 12 and 7 of
+// 200 writes of one 130x70x67 volume). Only their presence is compared below (that each level has
+// its HistogramMin/Max); level 0, and every level of uint8 and uint16 (exact bins), are compared.
 static bool isLowerLevelHistogramAttribute(const std::string& key){
     const std::string prefix = "/DataSet/ResolutionLevel ";
     if(key.compare(0, prefix.size(), prefix) != 0 || key.compare(prefix.size(), 2, "0/") == 0) return false;
@@ -387,7 +385,7 @@ static bool isLowerLevelHistogramAttribute(const std::string& key){
 }
 
 // Everything imsInfo reports, compared; why names the first difference.
-static bool sameInfo(const piw::ImsInfo& a, const piw::ImsInfo& b, std::string& why, bool lowerHistograms = false){
+static bool sameInfo(const piw::ImsInfo& a, const piw::ImsInfo& b, std::string& why){
     auto differ = [&](const std::string& what){ why = what; return false; };
     for(int i = 0; i < 3; ++i){
         if(a.size[i] != b.size[i]) return differ("size");
@@ -399,6 +397,7 @@ static bool sameInfo(const piw::ImsInfo& a, const piw::ImsInfo& b, std::string& 
     if(a.channelNames != b.channelNames || a.channelColors != b.channelColors || a.timePoints != b.timePoints) return differ("channel names/colors/time points");
     if(a.datasets.size() != b.datasets.size()) return differ("dataset count");
     if(a.datasets.empty()) return differ("no datasets");
+    const bool lowerHistograms = a.dataType != piw::DataType::UInt32 && a.dataType != piw::DataType::Float32;
     for(size_t i = 0; i < a.datasets.size(); ++i){
         const piw::ImsDataset &x = a.datasets[i], &y = b.datasets[i];
         const std::string at = " of level " + std::to_string(x.level) + " time point " + std::to_string(x.timepoint) +
@@ -409,9 +408,12 @@ static bool sameInfo(const piw::ImsInfo& a, const piw::ImsInfo& b, std::string& 
         if(x.crc != y.crc) return differ("data CRC" + at);
         if((x.level == 0 || lowerHistograms) && x.histogramCrc != y.histogramCrc) return differ("histogram/attribute CRC" + at);
     }
-    std::vector<std::pair<std::string, std::string>> aa, ba;
-    for(const auto& kv : a.attributes) if(lowerHistograms || !isLowerLevelHistogramAttribute(kv.first)) aa.push_back(kv);
-    for(const auto& kv : b.attributes) if(lowerHistograms || !isLowerLevelHistogramAttribute(kv.first)) ba.push_back(kv);
+    auto compared = [&](const std::vector<std::pair<std::string, std::string>>& in){
+        std::vector<std::pair<std::string, std::string>> out = in;
+        if(!lowerHistograms) for(auto& kv : out) if(isLowerLevelHistogramAttribute(kv.first)) kv.second = "(present)";
+        return out;
+    };
+    const std::vector<std::pair<std::string, std::string>> aa = compared(a.attributes), ba = compared(b.attributes);
     if(aa.size() != ba.size()) return differ("attribute count " + std::to_string(aa.size()) + " vs " + std::to_string(ba.size()));
     for(size_t i = 0; i < aa.size(); ++i)
         if(aa[i] != ba[i])

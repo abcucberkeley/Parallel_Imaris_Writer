@@ -137,8 +137,12 @@ FetchContent_Declare(imariswriter
 )
 FetchContent_MakeAvailable(imariswriter)
 
-set(IW_DIR "${imariswriter_SOURCE_DIR}")
-file(GLOB IW_SRCS "${IW_DIR}/c/*.cxx" "${IW_DIR}/writer/*.cxx")
+# A few ImarisWriter files are replaced by modified copies kept in third_party/imariswriter/
+# (a failed write ends the conversion with an error instead of hanging it; the README there
+# lists every change). ImarisWriter is compiled from a copy of the fetched tree with those
+# files in place; configuring stops if a fetched file is not the one its override was made from.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/imariswriter_overrides.cmake)
+piw_imariswriter_tree("${imariswriter_SOURCE_DIR}" IW_DIR IW_SRCS)
 
 add_library(ImarisWriter_static STATIC ${IW_SRCS})
 # ImarisWriter is C++14; keep it isolated from the C++11 used for the rest.
@@ -411,4 +415,12 @@ if(PIW_BUILD_TESTS)
     # same storage order; restart and failure cases. Reports "skipped" on Windows.
     piw_add_test(mono tests/monotest.cpp LIBS cppZarr_shared)
     set_tests_properties(mono PROPERTIES SKIP_RETURN_CODE 77)
+
+    # An output that cannot be written (file-size limit, a directory in the way) ends the
+    # conversion with exit code 1 and an error, not a hang. POSIX only (setrlimit, fork).
+    # Each run is killed after 30 s and counted as a hang; the timeout only backs that up.
+    if(NOT WIN32)
+        piw_add_test(failtest tests/failtest.cpp LIBS cppZarr_shared)
+        set_tests_properties(failtest PROPERTIES TIMEOUT 300)
+    endif()
 endif()

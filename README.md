@@ -15,7 +15,7 @@ Prebuilt release folders for Linux, Mac, and Windows are available from the [rel
 The converter is built with the CMakeLists.txt file.
 
 ### Prerequisites
-1. All dependencies (cpp-tiff, cpp-zarr, the ImarisWriter, HDF5, LZ4, zlib, and nlohmann/json) are fetched automatically at configure time via CMake FetchContent, so an internet connection is required for the first configure. On Linux and Mac, libuuid is built from the tarball included with cpp-zarr.
+1. All dependencies (cpp-tiff, cpp-zarr, the ImarisWriter, HDF5, LZ4, zlib, and nlohmann/json) are fetched automatically at configure time via CMake FetchContent, so an internet connection is required for the first configure. On Linux and Mac, libuuid is built from the tarball included with cpp-zarr. A few ImarisWriter files are replaced by modified copies kept in `third_party/imariswriter/` (so that a failed write, for example on a full disk, ends the conversion with an error instead of hanging it); its README lists the changes.
 2. Currently the only officially supported compiler is gcc on Linux and Mac and MinGW on Windows but others may work. On Mac, use Homebrew gcc (Apple Clang does not support OpenMP).
 
 ### Download and Install

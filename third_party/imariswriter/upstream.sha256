@@ -1,0 +1,12 @@
+# SHA-256 of the upstream ImarisWriter files that overrides/ replaces, at the commit pinned in
+# CMakeLists.txt (b128e6e7d1a147261e9d5caf24ebc6b5c9c63779), in `sha256sum` format (paths relative
+# to the ImarisWriter source tree). Configuring checks every fetched file against its line here
+# (line endings normalized to LF) and stops if one differs; see README.md.
+44ee79808286255e920cfa61f5ab1565295657f22aafa3db4e46946754b3ca52  writer/bpMultiresolutionImsImage.cxx
+ba0793b7a225f48b0d9cae809cb5575477ea41d43c729955fb22c95f5149c1d6  writer/bpMultiresolutionImsImage.h
+62cc9293bd43a4c69bdd1de99d4ed9fac5008cab51e827765d4e3f7e248d7a57  writer/bpWriterCompressor.cxx
+4e84004d7868a68c08c5d4d47afb567d7119839493bc50855886a41d1a7b3953  writer/bpWriterCompressor.h
+1daf53ece03967215a518db9ac39e67847981c5583abfcee69838672b136754b  writer/bpWriter.h
+7773695746175c45c4a016dac0826601de0c7486c3f26b19cc2302ed4de52126  writer/bpWriterHDF5.cxx
+5bb9e1205e805ab4313452bb58cd3c73a0923be3555a983238fd7b189764c988  writer/bpWriterHDF5.h
+cbad4faf71cd51d2bff3b4b892ceee51f609dfc6d78683f3cd12cb8ca82696f4  writer/bpWriterThreads.cxx

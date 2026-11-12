@@ -86,16 +86,15 @@ void MessageCallback(const char* aText, void*)
     if(!strncmp(aText, "Current File: ", 14)) fflush(stdout);
 }
 
-// Status -> output and exit code. Kept as the original converter behaved; the cases that print
-// and return 0 are the ones A-3 turns into errors.
+// Status -> output and exit code. Kept as the original converter behaved, except that a failed
+// write is reported on stderr like a failed read (it was printed on stdout without a newline);
+// the cases that print and return 0 are the ones A-3 turns into errors.
 int cliExitCode(const piw::Status& aStatus)
 {
     switch(aStatus.code){
         case piw::Code::Ok:
             return 0;
-        case piw::Code::WriteFailed:            // ImarisWriter's message, as CheckErrors printed it
-            printf("%s", aStatus.message.c_str());
-            return 1;
+        case piw::Code::WriteFailed:            // ImarisWriter's message (a failed write, the file not created)
         case piw::Code::ReadFailed:
             fprintf(stderr, "Error: %s\n", aStatus.message.c_str());
             return 1;

@@ -1,0 +1,4 @@
+The files in overrides/ are modified copies of files of ImarisWriter
+(https://github.com/imaris/ImarisWriter), Copyright (c) 2020-present Bitplane AG Zuerich,
+licensed under the Apache License, Version 2.0 (see LICENSE at the top of this repository).
+They were modified for Parallel_Imaris_Writer; README.md in this directory lists the changes.
