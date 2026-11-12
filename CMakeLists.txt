@@ -285,88 +285,70 @@ add_custom_target(release ${RELEASE_CMDS}
     VERBATIM)
 
 # ---------------------------------------------------------------------------
-# Round-trip smoke test (CTest): a per-platform "does the shipped binary actually
-# run" check. tests/roundtrip.cpp generates a tiny TIFF and a tiny zstd/F-order
-# Zarr on the fly (no committed test data), runs the executable on each, and
-# verifies a valid Imaris/HDF5 file comes out. Enable with -DPIW_BUILD_TESTS=ON:
+# Tests (CTest). Each test program generates its inputs on the fly (no committed
+# test data), runs the shipped executable on them and checks the .ims it writes with
+# tests/imsutil.h (header-only .ims decoder and comparison; HDF5 + lz4). Enable with
+# -DPIW_BUILD_TESTS=ON:
 #     cmake --build <build>
 #     ctest --test-dir <build> --output-on-failure
 # A project-specific option name avoids clashing with dependencies' BUILD_TESTS.
 # ---------------------------------------------------------------------------
-option(PIW_BUILD_TESTS "Build and register the round-trip smoke + block-equivalence tests" OFF)
+option(PIW_BUILD_TESTS "Build and register the round-trip, block- and parallel-equivalence tests" OFF)
 if(PIW_BUILD_TESTS)
     enable_testing()
-
-    # Links the reader libraries to generate the inputs on the fly.
-    add_executable(roundtripTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/roundtrip.cpp)
-    set_target_properties(roundtripTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    target_include_directories(roundtripTest PRIVATE
-        ${cpptiff_SOURCE_DIR}/src ${cppzarr_SOURCE_DIR}/src)
-    target_link_libraries(roundtripTest PRIVATE
-        cppTiff_shared cppZarr_shared nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX)
-    add_dependencies(release roundtripTest)
-
-    # Block-equivalence test: additionally links (static) HDF5 so it can compare the
-    # raw compressed chunks of the -C output against the whole-timepoint output
-    # (the .ims voxel data must be identical). Portable -- no h5py / HDF5 tools.
-    add_executable(blockTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/blocktest.cpp)
-    set_target_properties(blockTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    target_include_directories(blockTest PRIVATE
-        ${cpptiff_SOURCE_DIR}/src ${cppzarr_SOURCE_DIR}/src
-        ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src)
-    target_link_libraries(blockTest PRIVATE
-        cppTiff_shared cppZarr_shared nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX
-        hdf5-static Threads::Threads ${CMAKE_DL_LIBS})
-    add_dependencies(release blockTest)
-
-    # Parallel-equivalence test: the same static-HDF5 raw-chunk comparison, but it
-    # drives the cluster subcommands (setup/worker/combine) as independent processes
-    # and checks the assembled .ims has byte-identical voxel data to the monolithic
-    # conversion. Zarr-only (the parallel path reads Zarr), so no cpp-tiff link.
-    add_executable(parallelTest ${CMAKE_CURRENT_SOURCE_DIR}/tests/paralleltest.cpp)
-    set_target_properties(parallelTest PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
-    target_include_directories(parallelTest PRIVATE
-        ${cppzarr_SOURCE_DIR}/src
-        ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src)
-    target_link_libraries(parallelTest PRIVATE
-        cppZarr_shared nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX
-        hdf5-static Threads::Threads ${CMAKE_DL_LIBS})
-    add_dependencies(release parallelTest)
 
     # The test binary and the executable it spawns both need the shared libs
     # co-located ($ORIGIN / @loader_path / same-dir), which the build-tree binaries
     # can't satisfy (libs live under _deps/). The setup fixture assembles the
-    # pristine release folder, then mirrors it -- plus the test binary -- into a
-    # separate staging dir, so the test runs self-contained WITHOUT leaking the test
+    # pristine release folder, then mirrors it -- plus the test binaries -- into a
+    # separate staging dir, so the tests run self-contained WITHOUT leaking a test
     # binary into the shipped release.
     set(ROUNDTRIP_STAGE "${CMAKE_BINARY_DIR}/roundtrip_stage")
+    add_custom_target(piw_tests)   # holds the list of test binaries to stage (PIW_TEST_FILES)
+
+    # piw_add_test(<name> <source> [LIBS <lib>...])
+    # Builds <source> into <name>Test and registers the CTest test <name>, run from the
+    # staging dir as `<name>Test <staged parallelimariswriter> <build>/<name>_work`.
+    # Every test gets HDF5, lz4 (tests/imsutil.h), nlohmann_json and OpenMP, and the
+    # cpp-tiff and cpp-zarr headers; LIBS adds the reader libraries it needs.
+    function(piw_add_test name source)
+        cmake_parse_arguments(PIW_T "" "" "LIBS" ${ARGN})
+        set(tgt ${name}Test)
+        add_executable(${tgt} ${source})
+        set_target_properties(${tgt} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+        # cpp-tiff before cpp-zarr: both ship a helperfunctions.h (see the executable).
+        target_include_directories(${tgt} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests
+            ${cpptiff_SOURCE_DIR}/src ${cppzarr_SOURCE_DIR}/src
+            ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src
+            ${LZ4_INCLUDE_DIR})
+        target_link_libraries(${tgt} PRIVATE
+            ${PIW_T_LIBS} nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX
+            hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
+        add_dependencies(release ${tgt})
+        set_property(TARGET piw_tests APPEND PROPERTY PIW_TEST_FILES "$<TARGET_FILE:${tgt}>")
+        add_test(NAME ${name}
+            COMMAND "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:${tgt}>"
+                    "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
+                    "${CMAKE_CURRENT_BINARY_DIR}/${name}_work")
+        set_tests_properties(${name} PROPERTIES FIXTURES_REQUIRED piw_release)
+    endfunction()
+
+    # Stages the release folder and every test binary added with piw_add_test (the
+    # list is read at generate time, so tests may be added below this line too).
     add_test(NAME roundtrip_setup COMMAND ${CMAKE_COMMAND}
         -DRELEASE_DIR=${RELEASE_DIR} -DSTAGE_DIR=${ROUNDTRIP_STAGE}
-        -DTEST_EXE=$<TARGET_FILE:roundtripTest>
-        -DTEST_EXE_2=$<TARGET_FILE:blockTest>
-        -DTEST_EXE_3=$<TARGET_FILE:parallelTest>
+        "-DTEST_EXES=$<JOIN:$<TARGET_GENEX_EVAL:piw_tests,$<TARGET_PROPERTY:piw_tests,PIW_TEST_FILES>>,|>"
         -DBUILD_DIR=${CMAKE_BINARY_DIR} -DCFG=$<CONFIG>
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/stage_roundtrip.cmake)
     set_tests_properties(roundtrip_setup PROPERTIES FIXTURES_SETUP piw_release)
 
-    add_test(NAME roundtrip
-        COMMAND "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:roundtripTest>"
-                "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
-                "${CMAKE_CURRENT_BINARY_DIR}/roundtrip_work")
-    set_tests_properties(roundtrip PROPERTIES FIXTURES_REQUIRED piw_release)
-
-    # Verifies -C block processing yields byte-identical voxel data to a whole read.
-    add_test(NAME blockEquivalence
-        COMMAND "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:blockTest>"
-                "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
-                "${CMAKE_CURRENT_BINARY_DIR}/blocktest_work")
-    set_tests_properties(blockEquivalence PROPERTIES FIXTURES_REQUIRED piw_release)
-
-    # Verifies the cluster subcommands assemble a single .ims with voxel data
-    # byte-identical to the monolithic conversion.
-    add_test(NAME parallelEquivalence
-        COMMAND "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelTest>"
-                "${ROUNDTRIP_STAGE}/$<TARGET_FILE_NAME:parallelimariswriter>"
-                "${CMAKE_CURRENT_BINARY_DIR}/paralleltest_work")
-    set_tests_properties(parallelEquivalence PROPERTIES FIXTURES_REQUIRED piw_release)
+    # Voxels out == voxels in (TIFF/Zarr x uint8/uint16/float32), level 1 == box
+    # average of level 0, extents, histogram, 2 channels x 3 timepoints, imsCompare self-test.
+    piw_add_test(roundtrip tests/roundtrip.cpp LIBS cppTiff_shared cppZarr_shared)
+    # -C block processing yields the same .ims as a whole-timepoint read.
+    piw_add_test(blockEquivalence tests/blocktest.cpp LIBS cppTiff_shared cppZarr_shared)
+    # The cluster subcommands assemble a single .ims with the same data as the
+    # monolithic conversion. Zarr-only (the parallel path reads Zarr).
+    piw_add_test(parallelEquivalence tests/paralleltest.cpp LIBS cppZarr_shared)
 endif()

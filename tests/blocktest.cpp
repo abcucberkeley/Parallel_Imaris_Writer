@@ -5,11 +5,10 @@
 // This generates a deliberately NON-chunk-aligned volume (100x70x200 uint16) as a
 // TIFF and a zstd/F-order Zarr (no committed data), runs the shipped executable
 // with and without -C on each, and compares the actual voxel data in the two .ims
-// files. The Imaris .ims is HDF5 with a custom (LZ4-shuffle) filter, so instead of
-// decompressing we compare each Data dataset's RAW compressed chunks by chunk
-// coordinate -- the compressor is deterministic, so identical voxels => identical
-// chunk bytes, while ignoring non-deterministic file-level metadata (timestamps,
-// chunk ordering) that defeats a plain byte compare.
+// files with imsCompare (tests/imsutil.h): every dataset's RAW compressed chunks by
+// chunk coordinate -- the compressor is deterministic, so identical voxels =>
+// identical chunk bytes -- plus histograms and attributes, ignoring the file layout
+// (chunk addresses and order) that defeats a plain byte compare.
 //   usage: blockTest <path-to-parallelimariswriter> [workdir]
 #include <cstdint>
 #include <cstdio>
@@ -22,7 +21,7 @@
 #include "parallelwritetiff.h"   // cpp-tiff
 #include "zarr.h"                // cpp-zarr
 #include "parallelwritezarr.h"
-#include "hdf5.h"                // core HDF5 (statically linked)
+#include "imsutil.h"             // .ims comparison (HDF5 + lz4)
 
 namespace fs = std::filesystem;
 
@@ -60,58 +59,16 @@ static bool runExe(const std::string& exe, const std::string& reader,
     return true;
 }
 
-// Compare the raw compressed chunks of every Imaris Data dataset in two .ims files.
-// Returns true on identical voxel data. Walks the known Imaris layout
-// (/DataSet/ResolutionLevel r/TimePoint 0/Channel c/Data) so it needs only the
-// stable H5D chunk APIs -- no object-visit call whose signature changes by version.
-static bool sameData(const fs::path& fa, const fs::path& fb){
-    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
-    hid_t a = H5Fopen(fa.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    hid_t b = H5Fopen(fb.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    if(a < 0 || b < 0){ std::printf("  FAIL: cannot open .ims\n"); return false; }
-    bool ok = true; int ndsets = 0; long nchunks = 0;
-    for(int r=0; ok; ++r){
-        bool foundLevel = false;
-        for(int c=0; ok; ++c){
-            char path[512];
-            std::snprintf(path, sizeof(path),
-                "/DataSet/ResolutionLevel %d/TimePoint 0/Channel %d/Data", r, c);
-            hid_t da = H5Dopen2(a, path, H5P_DEFAULT);
-            if(da < 0) break;                 // no more channels at this resolution level
-            foundLevel = true; ++ndsets;
-            hid_t db = H5Dopen2(b, path, H5P_DEFAULT);
-            if(db < 0){ std::printf("  DIFFERS: %s missing in second file\n", path); ok=false; H5Dclose(da); break; }
-            hid_t sa = H5Dget_space(da);
-            hsize_t nch = 0; H5Dget_num_chunks(da, sa, &nch);
-            for(hsize_t i=0; i<nch && ok; ++i){
-                hsize_t off[8]; unsigned fma; haddr_t addra; hsize_t sza;
-                H5Dget_chunk_info(da, sa, i, off, &fma, &addra, &sza);
-                hsize_t szb; unsigned fmb; haddr_t addrb;
-                if(H5Dget_chunk_info_by_coord(db, off, &fmb, &addrb, &szb) < 0 || szb != sza){
-                    std::printf("  DIFFERS: %s chunk %llu size/coord\n", path, (unsigned long long)i); ok=false; break;
-                }
-                std::vector<char> ba(sza), bb(szb); unsigned fm;
-                H5Dread_chunk(da, H5P_DEFAULT, off, &fm, ba.data());
-                H5Dread_chunk(db, H5P_DEFAULT, off, &fm, bb.data());
-                if(ba != bb){ std::printf("  DIFFERS: %s chunk %llu bytes\n", path, (unsigned long long)i); ok=false; break; }
-                ++nchunks;
-            }
-            H5Sclose(sa); H5Dclose(da); H5Dclose(db);
-        }
-        if(!foundLevel) break;                // no such resolution level -> done
-    }
-    H5Fclose(a); H5Fclose(b);
-    if(ok) std::printf("  identical (%d Data dsets, %ld chunks)\n", ndsets, nchunks);
-    return ok && ndsets > 0;
-}
-
 static bool checkCase(const std::string& exe, const std::string& reader,
                       const fs::path& indir, const fs::path& work, const std::string& blockArg){
     fs::path whole = work/(reader+"_whole"), block = work/(reader+"_block");
     if(!runExe(exe, reader, indir, whole, ""))       return false;
     if(!runExe(exe, reader, indir, block, blockArg)) return false;
     std::printf("[%s] whole vs -C %s:\n", reader.c_str(), blockArg.c_str());
-    return sameData(whole/"output.ims", block/"output.ims");
+    ImsCompareReport report;
+    bool same = imsCompare(whole/"output.ims", block/"output.ims", report);
+    imsPrintReport(report);
+    return same;
 }
 
 int main(int argc, char** argv){

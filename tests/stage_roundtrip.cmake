@@ -1,12 +1,17 @@
-# Assemble a self-contained folder to run the round-trip smoke test from.
+# Assemble a self-contained folder to run the tests from.
 #
-# The test binary and the executable it spawns both need their shared libraries
+# The test binaries and the executable they spawn all need their shared libraries
 # co-located (the build-tree binaries resolve libs via $ORIGIN / @loader_path and
 # can't reach _deps/). So: build the pristine release folder, then mirror it --
-# plus the test binary -- into a separate staging dir. This keeps the shipped
+# plus the test binaries -- into a separate staging dir. This keeps the shipped
 # release folder to exactly its runtime files (nothing test-related leaks in).
 #
-# Required -D args: RELEASE_DIR, STAGE_DIR, TEST_EXE, BUILD_DIR, CFG
+# Required -D args: RELEASE_DIR, STAGE_DIR, BUILD_DIR, CFG, and TEST_EXES (the test
+# binaries, separated by "|" because a ";" would split the ctest argument).
+
+if(NOT TEST_EXES)
+    message(FATAL_ERROR "no test binaries given (TEST_EXES is empty)")
+endif()
 
 execute_process(
     COMMAND ${CMAKE_COMMAND} --build "${BUILD_DIR}" --config "${CFG}" --target release
@@ -19,10 +24,9 @@ file(REMOVE_RECURSE "${STAGE_DIR}")
 file(MAKE_DIRECTORY "${STAGE_DIR}")
 file(GLOB _release_files "${RELEASE_DIR}/*")
 file(COPY ${_release_files} DESTINATION "${STAGE_DIR}")   # executable + shared libs
-file(COPY "${TEST_EXE}"     DESTINATION "${STAGE_DIR}")   # the smoke-test binary
-if(DEFINED TEST_EXE_2 AND NOT TEST_EXE_2 STREQUAL "")
-    file(COPY "${TEST_EXE_2}" DESTINATION "${STAGE_DIR}") # the block-equivalence test binary
-endif()
-if(DEFINED TEST_EXE_3 AND NOT TEST_EXE_3 STREQUAL "")
-    file(COPY "${TEST_EXE_3}" DESTINATION "${STAGE_DIR}") # the parallel-equivalence test binary
-endif()
+string(REPLACE "|" ";" _test_exes "${TEST_EXES}")
+foreach(_exe IN LISTS _test_exes)
+    if(NOT _exe STREQUAL "")
+        file(COPY "${_exe}" DESTINATION "${STAGE_DIR}")   # one test binary
+    endif()
+endforeach()

@@ -10,8 +10,9 @@
 // two channels exercise the multi-channel assembly + per-channel color/histogram.
 // It converts the Zarrs twice -- (a) monolithically (-P CamA,CamB), (b) via `setup`
 // + one `worker` process per (channel, timepoint, level, chunk-index) + `combine` --
-// and compares the raw compressed Data chunks of every channel plus the per-channel
-// DataSetInfo (color, auto-adjusted ColorRange, name). Same determinism argument as
+// and compares the two with imsCompare (tests/imsutil.h): the raw compressed Data
+// chunks of every channel, the histograms and the attributes, including the
+// per-channel DataSetInfo (color, auto-adjusted ColorRange, name). Same determinism argument as
 // blocktest.cpp; here the two producers are the parallel scatter/gather and the
 // monolithic writer.
 //   usage: parallelTest <path-to-parallelimariswriter> [workdir]
@@ -26,7 +27,7 @@
 
 #include "zarr.h"                // cpp-zarr (also pulls in nlohmann::json)
 #include "parallelwritezarr.h"
-#include "hdf5.h"                // core HDF5 (statically linked)
+#include "imsutil.h"             // .ims comparison (HDF5 + lz4)
 
 namespace fs = std::filesystem;
 
@@ -81,89 +82,6 @@ static bool readManifest(const fs::path& mf, int& nC, int& nT, std::vector<long>
     return nC > 0 && nT > 0 && !jobsPerLevel.empty();
 }
 
-// --- Data-chunk comparison (walks the known Imaris layout with the stable H5D chunk
-// APIs and compares raw compressed chunk bytes across every resolution/channel). ---
-static bool sameData(const fs::path& fa, const fs::path& fb){
-    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
-    hid_t a = H5Fopen(fa.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    hid_t b = H5Fopen(fb.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    if(a < 0 || b < 0){ std::printf("  FAIL: cannot open .ims\n"); return false; }
-    bool ok = true; int ndsets = 0; long nchunks = 0;
-    for(int r=0; ok; ++r){
-        bool foundLevel = false;
-        for(int c=0; ok; ++c){
-            char path[512];
-            std::snprintf(path, sizeof(path),
-                "/DataSet/ResolutionLevel %d/TimePoint 0/Channel %d/Data", r, c);
-            hid_t da = H5Dopen2(a, path, H5P_DEFAULT);
-            if(da < 0) break;                 // no more channels at this resolution level
-            foundLevel = true; ++ndsets;
-            hid_t db = H5Dopen2(b, path, H5P_DEFAULT);
-            if(db < 0){ std::printf("  DIFFERS: %s missing in second file\n", path); ok=false; H5Dclose(da); break; }
-            hid_t sa = H5Dget_space(da);
-            hsize_t nch = 0; H5Dget_num_chunks(da, sa, &nch);
-            for(hsize_t i=0; i<nch && ok; ++i){
-                hsize_t off[8]; unsigned fma; haddr_t addra; hsize_t sza;
-                H5Dget_chunk_info(da, sa, i, off, &fma, &addra, &sza);
-                hsize_t szb; unsigned fmb; haddr_t addrb;
-                if(H5Dget_chunk_info_by_coord(db, off, &fmb, &addrb, &szb) < 0 || szb != sza){
-                    std::printf("  DIFFERS: %s chunk %llu size/coord\n", path, (unsigned long long)i); ok=false; break;
-                }
-                std::vector<char> ba(sza), bb(szb); unsigned fm;
-                H5Dread_chunk(da, H5P_DEFAULT, off, &fm, ba.data());
-                H5Dread_chunk(db, H5P_DEFAULT, off, &fm, bb.data());
-                if(ba != bb){ std::printf("  DIFFERS: %s chunk %llu bytes\n", path, (unsigned long long)i); ok=false; break; }
-                ++nchunks;
-            }
-            H5Sclose(sa); H5Dclose(da); H5Dclose(db);
-        }
-        if(!foundLevel) break;                // no such resolution level -> done
-    }
-    H5Fclose(a); H5Fclose(b);
-    if(ok) std::printf("  identical (%d Data dsets, %ld chunks)\n", ndsets, nchunks);
-    return ok && ndsets > 0;
-}
-
-// Read an .ims string attribute. They are stored as a 1-D array of H5T_C_S1 (size-1)
-// elements (no NUL), so the length is the dataspace element count, not the type size.
-static std::string readStrAttr(hid_t grp, const char* name){
-    if(H5Aexists(grp, name) <= 0) return "<absent>";
-    hid_t at = H5Aopen(grp, name, H5P_DEFAULT);
-    hid_t tp = H5Aget_type(at); hid_t sp = H5Aget_space(at);
-    hssize_t n = H5Sget_simple_extent_npoints(sp); if(n < 0) n = 0;
-    size_t bytes = (size_t)n * H5Tget_size(tp);
-    std::vector<char> buf(bytes + 1, 0);
-    H5Aread(at, tp, buf.data());
-    H5Sclose(sp); H5Tclose(tp); H5Aclose(at);
-    return std::string(buf.data(), bytes);
-}
-
-// Compare the per-channel DataSetInfo (color, auto-adjusted ColorRange, name, ...).
-static bool sameChannelInfo(const fs::path& fa, const fs::path& fb){
-    hid_t a = H5Fopen(fa.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    hid_t b = H5Fopen(fb.string().c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
-    if(a < 0 || b < 0){ std::printf("  FAIL: cannot open .ims\n"); return false; }
-    static const char* KEYS[] = {"Name","Description","ColorMode","Color","ColorRange",
-        "ColorOpacity","GammaCorrection","LSMEmissionWavelength","OtherChannelParameter"};
-    bool ok = true; int c = 0;
-    for(;;){
-        std::string g = "/DataSetInfo/Channel " + std::to_string(c);
-        htri_t ea = H5Lexists(a, g.c_str(), H5P_DEFAULT), eb = H5Lexists(b, g.c_str(), H5P_DEFAULT);
-        if(ea <= 0 && eb <= 0) break;
-        if(ea <= 0 || eb <= 0){ std::printf("  DIFFERS: Channel %d present in only one file\n", c); ok=false; break; }
-        hid_t ga = H5Gopen2(a, g.c_str(), H5P_DEFAULT), gb = H5Gopen2(b, g.c_str(), H5P_DEFAULT);
-        for(const char* k : KEYS){
-            std::string va = readStrAttr(ga, k), vb = readStrAttr(gb, k);
-            if(va != vb){ std::printf("  DIFFERS: Channel %d %s: mono=%s par=%s\n", c, k, va.c_str(), vb.c_str()); ok=false; }
-        }
-        std::printf("  Channel %d: Color=%s ColorRange=%s Name=%s\n", c,
-            readStrAttr(gb,"Color").c_str(), readStrAttr(gb,"ColorRange").c_str(), readStrAttr(gb,"Name").c_str());
-        H5Gclose(ga); H5Gclose(gb); ++c;
-    }
-    H5Fclose(a); H5Fclose(b);
-    return ok && c > 0;
-}
-
 int main(int argc, char** argv){
     if(argc < 2){ std::fprintf(stderr, "usage: %s <parallelimariswriter> [workdir]\n", argv[0]); return 2; }
     const std::string exe = argv[1];
@@ -205,12 +123,14 @@ int main(int argc, char** argv){
     if(runCmd(q(exe)+" monitor "+q(wd)+" "+q(parIms)) != 0 || !fs::exists(parIms)){
         std::printf("paralleltest FAILED: monitor produced no .ims\n"); return 1; }
 
-    // --- compare voxel data (all channels) + per-channel DataSetInfo ---
-    std::printf("[compare] data chunks (monolithic vs parallel):\n");
-    bool dataOk = sameData(monoDir/"output.ims", parIms);
-    std::printf("[compare] per-channel DataSetInfo:\n");
-    bool metaOk = sameChannelInfo(monoDir/"output.ims", parIms);
-    if(dataOk && metaOk){
+    // --- compare voxel data (all channels), histograms and attributes; the cluster
+    // output has no /Thumbnail yet, so its presence is not compared ---
+    std::printf("[compare] monolithic vs parallel:\n");
+    ImsCompareOptions opt; opt.thumbnail = false;
+    ImsCompareReport report;
+    bool same = imsCompare(monoDir/"output.ims", parIms, report, opt);
+    imsPrintReport(report);
+    if(same){
         std::printf("paralleltest PASSED (parallel scatter/gather == monolithic, %d channels)\n", nC); return 0; }
     std::printf("paralleltest FAILED\n"); return 1;
 }
