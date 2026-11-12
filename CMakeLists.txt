@@ -22,6 +22,18 @@ project(
 include(GNUInstallDirs)
 include(FetchContent)
 
+# Sanitizer builds, for testing only (off by default). -DPIW_SANITIZE=address (AddressSanitizer,
+# with LeakSanitizer) or -DPIW_SANITIZE=thread (ThreadSanitizer) compiles and links everything built
+# here -- this project, ImarisWriter and the fetched dependencies, C and C++ -- with
+# -fsanitize=<value>, frame pointers and debug info. Use a fresh build directory and
+# CMAKE_BUILD_TYPE=RelWithDebInfo, then build and run ctest as usual; never ship such a build.
+set(PIW_SANITIZE "" CACHE STRING "Build with -fsanitize=<value> (address or thread) for testing; empty: off")
+if(PIW_SANITIZE)
+  add_compile_options(-fsanitize=${PIW_SANITIZE} -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=${PIW_SANITIZE})
+  message(STATUS "PIW_SANITIZE: building everything with -fsanitize=${PIW_SANITIZE} (testing only)")
+endif()
+
 # Build the fetched static deps with position-independent code so they can be
 # linked into our (shared) libraries and the executable.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

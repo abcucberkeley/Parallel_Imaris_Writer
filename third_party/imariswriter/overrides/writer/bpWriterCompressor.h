@@ -13,7 +13,8 @@
  *   See the License for the specific language governing permissions and   *
  *   limitations under the License.                                        *
  ***************************************************************************/
-// Modified for Parallel_Imaris_Writer (see third_party/imariswriter/README.md): adds Close().
+// Modified for Parallel_Imaris_Writer (see third_party/imariswriter/README.md): adds Close(); the threads
+// are declared last.
 #ifndef __BP_WRITER_COMPRESSOR__
 #define __BP_WRITER_COMPRESSOR__
 
@@ -74,12 +75,15 @@ private:
 
   bpSharedPtr<bpWriter> mWriter;
 
-  bpUniquePtr<bpWriterThreads> mThreads;
-  bpUniquePtr<bpThreadPool> mCallbackThread;
   bpConverterTypes::tProgressCallback mProgressCallback;
   bpSize mNumberOfBlocks;
   bpSize mNumberOfIncrements;
   bpUInt64 mTotalBytesWritten;
+
+  // The threads last, so that they are joined before the members their tasks use are destroyed; the writer
+  // thread queues the progress callbacks, so it is joined before the callback thread.
+  bpUniquePtr<bpThreadPool> mCallbackThread;
+  bpUniquePtr<bpWriterThreads> mThreads;
 };
 
 #endif // __BP_WRITER_COMPRESSOR__

@@ -15,7 +15,8 @@
  ***************************************************************************/
 // Modified for Parallel_Imaris_Writer (see third_party/imariswriter/README.md): the first failed write or
 // compression is kept and thrown by every later StartWrite and by FinishWrite, later writes are skipped,
-// the memory of a block whose compression failed is returned, and the free-memory count is atomic.
+// the memory of a block whose compression failed is returned, the free-memory count is atomic, and the
+// threads are joined before the members their tasks use are destroyed.
 #include "bpWriterThreads.h"
 #include "bpMemoryManager.h"
 #include "bpThreadPool.h"
@@ -46,10 +47,10 @@ class bpWriterThreads::cImpl
 {
 public:
   cImpl(bpSize aMaxBufferSizeMB, bpSize aNumberOfThreads, bpCompressionAlgorithm::tPtr aCompressionAlgorithm)
-    : mCompressionThreads(aNumberOfThreads),
+    : mFreeMemory(aMaxBufferSizeMB * 1024 * 1024),
+      mCompressionAlgorithm(std::move(aCompressionAlgorithm)),
       mWriterThread(1),
-      mFreeMemory(aMaxBufferSizeMB * 1024 * 1024),
-      mCompressionAlgorithm(std::move(aCompressionAlgorithm))
+      mCompressionThreads(aNumberOfThreads)
   {
   }
 
@@ -175,12 +176,16 @@ private:
   mutable std::mutex mFailureMutex;
   bpString mFailureMessage;
 
-  bpThreadPool mCompressionThreads;
-  bpThreadPool mWriterThread;
   // returned by the finished callbacks, which several threads call (the histogram threads write too)
   std::atomic<bpInt64> mFreeMemory;
   bpMemoryManager<bpUInt8> mManager;
   bpCompressionAlgorithm::tPtr mCompressionAlgorithm;
+
+  // The threads last, so that they are joined (and the tasks still queued destroyed) before what their tasks
+  // use is destroyed: the memory manager, whose blocks the tasks hold, and the compression algorithm (the
+  // threads were declared first). The compression threads queue the writes: they are joined first.
+  bpThreadPool mWriterThread;
+  bpThreadPool mCompressionThreads;
 };
 
 

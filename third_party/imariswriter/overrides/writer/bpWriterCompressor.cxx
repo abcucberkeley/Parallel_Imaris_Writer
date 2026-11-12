@@ -13,8 +13,9 @@
  *   See the License for the specific language governing permissions and   *
  *   limitations under the License.                                        *
  ***************************************************************************/
-// Modified for Parallel_Imaris_Writer (see third_party/imariswriter/README.md): adds Close(), and reports
-// a file that could not be created instead of dereferencing the missing writer.
+// Modified for Parallel_Imaris_Writer (see third_party/imariswriter/README.md): adds Close(), creates the
+// HDF5 writer in the constructor (not in the writer thread, where a block's write could come first), and
+// creates the threads after the members they use (they are declared last).
 #include "bpWriterCompressor.h"
 #include "bpWriterThreads.h"
 #include "bpThreadPool.h"
@@ -27,12 +28,12 @@ bpWriterCompressor::bpWriterCompressor(
   bpConverterTypes::tCompressionAlgorithmType aCompressionAlgorithmType,
   bpSize aNumberOfCompressionThreads,
   bpConverterTypes::tProgressCallback aProgressCallback)
-: mThreads(std::make_unique<bpWriterThreads>(aNumberOfCompressionThreads * 3 + 32, aNumberOfCompressionThreads, std::make_shared<bpCompressionAlgorithmFactory>(), aCompressionAlgorithmType, aImageLayout.GetDataType())),
-  mCallbackThread(std::make_unique<bpThreadPool>(1)),
-  mProgressCallback(std::move(aProgressCallback)),
+: mProgressCallback(std::move(aProgressCallback)),
   mNumberOfBlocks(0),
   mNumberOfIncrements(0),
-  mTotalBytesWritten(0)
+  mTotalBytesWritten(0),
+  mCallbackThread(std::make_unique<bpThreadPool>(1)),
+  mThreads(std::make_unique<bpWriterThreads>(aNumberOfCompressionThreads * 3 + 32, aNumberOfCompressionThreads, std::make_shared<bpCompressionAlgorithmFactory>(), aCompressionAlgorithmType, aImageLayout.GetDataType()))
 {
   if (mProgressCallback) {
     for (bpSize vIndex = 0; vIndex < aImageLayout.GetNumberOfResolutionLevels(); vIndex++) {
@@ -42,10 +43,11 @@ bpWriterCompressor::bpWriterCompressor(
     mNumberOfBlocks *= aImageLayout.GetNumberOfChannels() * aImageLayout.GetNumberOfTimePoints();
   }
 
-  auto vInit = [this, aWriterFactory, aFilename, aImageLayout, aCompressionAlgorithmType] {
-    mWriter = aWriterFactory->CreateWriter(aFilename, aImageLayout, aCompressionAlgorithmType);
-  };
-  RunInWriteThread(std::move(vInit));
+  // The HDF5 writer is created here, before any block can be written, and a file that cannot be created is
+  // reported by the constructor. It was created by a task queued through the compression threads to the
+  // writer thread: when the first block's compression finished before that task's, the block's write found
+  // no writer (in this copy, the error "the output file was not created"; upstream, a null dereference).
+  mWriter = aWriterFactory->CreateWriter(aFilename, aImageLayout, aCompressionAlgorithmType);
 }
 
 
@@ -61,7 +63,7 @@ bpWriterCompressor::~bpWriterCompressor()
 
 static void CheckWriterCreated(const bpSharedPtr<bpWriter>& aWriter)
 {
-  // the HDF5 writer is created in the writer thread; its error is reported by FinishWriteDataBlocks
+  // the constructor creates the HDF5 writer or throws: a guard only
   if (!aWriter) {
     throw bpError("bpWriterCompressor: the output file was not created");
   }

@@ -26,6 +26,8 @@ the new upstream file, and record the new upstream file's hash.
 
 ## Changes
 
+### A failed write ends the conversion
+
 A failed write used to hang the conversion forever: the error of `H5Dwrite_chunk` (disk full, quota,
 file-size limit, I/O error) was re-thrown in a compute-thread task and dropped by the thread pool,
 the resample closures of the blocks that were never submitted were never run, and
@@ -70,3 +72,49 @@ call) and `bpImageConverterC_Finish` report it through `bpImageConverterC_GetLas
   - The messages of a failed write, a failed dataset creation, a failed close and a file that
     cannot be created end with the reason from HDF5's error stack (for a failed system call only
     the system's message, such as "No space left on device").
+
+### Destroy at any point
+
+`bpImageConverterC_Destroy` may be called at any time: before the first block, part-way (the
+converter stops so after a read error, a cancel, Python's Ctrl-C or a failed write), after the last
+block without `bpImageConverterC_Finish`, or after it. It returns once every thread of the converter
+has stopped. Without `Finish` it stops the conversion, and the file it leaves is not a usable .ims:
+
+- the blocks that were already handed to the compression threads are compressed and written; the
+  compute tasks and resamplings still queued are skipped, so lower resolution levels are partial;
+- no histograms, no `/DataSetInfo` (metadata) and no `/Thumbnail` are written;
+- the HDF5 file is closed: a well-formed HDF5 file with the root attributes and the data written so
+  far. The converter (`src/converter.cpp`) deletes it.
+
+Destroying a converter without `Finish` used to corrupt the heap now and then ("free(): corrupted
+unsorted chunks"; in about half of the test-suite runs, which stop a few conversions early), which is
+why the converter called `Finish` before `Destroy` even for a file it was about to delete. A worker
+of `bpThreadPool` destroyed a finished task's function, and the memory blocks it had captured, only
+after counting the task as finished and waking the waiting threads. The destructor of
+`bpWriterThreads` had just waited for its writer thread that way, freed its memory manager, and the
+writer thread then returned its last task's blocks to the freed manager (AddressSanitizer:
+heap-use-after-free in `bpMemoryManager::ReturnMemory`, from `bpThreadPool::TreadLoop`).
+
+- `writer/bpThreadPool.cxx`
+  - A worker destroys a task's function, with everything it captured, before the task counts as
+    finished: a thread that waits for the pool (`WaitAll`, `WaitSome`, `WaitOne`) may destroy what
+    the captures refer to as soon as it returns.
+  - A finished task wakes every waiting thread (`notify_all`, was `notify_one`): several threads can
+    wait on one pool at a time (the histogram threads, for instance, wait for the writer thread's
+    buffer memory while `Finish` writes the histograms), and a single notification could wake one
+    whose condition did not hold and leave the others waiting.
+- `writer/bpWriterThreads.cxx`, `writer/bpWriterCompressor.h`, `.cxx`
+  - The thread pools are declared last, so that they are joined, and the tasks still queued are
+    destroyed, before the members their tasks use: the memory manager and the compression algorithm
+    of `bpWriterThreads`, the progress callback and counters of `bpWriterCompressor`. Threads that
+    queue work for others are joined first: compression, then writer, then progress callback.
+
+### The output file exists before the first write
+
+- `writer/bpWriterCompressor.cxx`
+  - The constructor creates the HDF5 writer, and with it the file, on the calling thread. It was
+    created by a task queued through the compression threads to the writer thread, so when the first
+    block's compression finished before that task's, the block's write came first and found no
+    writer: the conversion failed with "the output file was not created" (seen for volumes of one
+    block, about once in 40 runs of the test suite; upstream dereferences the missing writer). A file
+    that cannot be created is now reported by `bpImageConverterC_Create`.

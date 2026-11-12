@@ -15,7 +15,7 @@ Prebuilt release folders for Linux, Mac, and Windows are available from the [rel
 The converter is built with the CMakeLists.txt file.
 
 ### Prerequisites
-1. All dependencies (cpp-tiff, cpp-zarr, the ImarisWriter, HDF5, LZ4, zlib, and nlohmann/json) are fetched automatically at configure time via CMake FetchContent, so an internet connection is required for the first configure. On Linux and Mac, libuuid is built from the tarball included with cpp-zarr. A few ImarisWriter files are replaced by modified copies kept in `third_party/imariswriter/` (so that a failed write, for example on a full disk, ends the conversion with an error instead of hanging it); its README lists the changes.
+1. All dependencies (cpp-tiff, cpp-zarr, the ImarisWriter, HDF5, LZ4, zlib, and nlohmann/json) are fetched automatically at configure time via CMake FetchContent, so an internet connection is required for the first configure. On Linux and Mac, libuuid is built from the tarball included with cpp-zarr. A few ImarisWriter files are replaced by modified copies kept in `third_party/imariswriter/` (so that a failed write, for example on a full disk, ends the conversion with an error instead of hanging it, and a conversion can be stopped safely at any point); its README lists the changes.
 2. Currently the only officially supported compiler is gcc on Linux and Mac and MinGW on Windows but others may work. On Mac, use Homebrew gcc (Apple Clang does not support OpenMP).
 
 ### Download and Install
@@ -27,6 +27,9 @@ cmake --build build -j
 cmake --build build --target release
 ````
 The `release` target assembles a self-contained folder, `build/Parallel_Imaris_Writer/`, containing the `parallelimariswriter` executable and its shared libraries, ready to run in place. The executable links its own C++ runtime, LZ4 and zlib statically (on Linux it uses the system's `libgcc_s`), and the `libcppTiff` and `libcppZarr` built with it keep theirs private, so the folder can be copied anywhere; the `runtimeIsolation` test checks this.
+
+### Tests
+Configure with `-DPIW_BUILD_TESTS=ON`, build, then run `ctest --test-dir build --output-on-failure`; the tests generate their own input data. For testing only, `-DPIW_SANITIZE=address` (AddressSanitizer and LeakSanitizer) or `-DPIW_SANITIZE=thread` (ThreadSanitizer) builds everything, the fetched dependencies included, with that sanitizer; use a fresh build directory and `-DCMAKE_BUILD_TYPE=RelWithDebInfo`. ThreadSanitizer reports races inside OpenMP parallel regions that are not real (GCC's OpenMP runtime is not instrumented, so its barriers are invisible to it).
 
 ## Usage
 

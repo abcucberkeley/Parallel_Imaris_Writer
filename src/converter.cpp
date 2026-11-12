@@ -474,7 +474,7 @@ bool validDataType(DataType aType){
 class ImsWriter {
 public:
     explicit ImsWriter(const Callbacks& aCallbacks)
-        : mCallbacks(aCallbacks), mConverter(NULL), mDataType(DataType::UInt16), mBuffer(NULL), mFinished(false), mWriterFailed(false) {}
+        : mCallbacks(aCallbacks), mConverter(NULL), mDataType(DataType::UInt16), mBuffer(NULL), mFinished(false) {}
     ~ImsWriter();
 
     Status open(DataType aDataType, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
@@ -504,16 +504,12 @@ private:
     std::string mOutputFile;
     void* mBuffer;
     bool mFinished;
-    bool mWriterFailed;
 };
 
 ImsWriter::~ImsWriter(){
     if(!mConverter) return;
-    if(!mFinished && !mWriterFailed){
-        // Destroying the writer while it still processes blocks is not safe: let it finish what
-        // it holds first (the file is removed below anyway).
-        try{ writeMetadata(); } catch(...){}
-    }
+    // Without a successful finish, destroying the writer stops it (third_party/imariswriter/README.md):
+    // no histograms, metadata or thumbnail are written, and the incomplete file is removed below.
     bpImageConverterC_Destroy(mConverter);
     free(mBuffer);
     if(!mFinished) removeOutput(mOutputFile);
@@ -527,7 +523,6 @@ void ImsWriter::onProgress(bpConverterTypesC_Float aProgress, bpConverterTypesC_
 Status ImsWriter::checkErrors(){
     const char* vException = bpImageConverterC_GetLastException(mConverter);
     if(!vException) return Status();
-    mWriterFailed = true;
     return Status(Code::WriteFailed, vException);
 }
 

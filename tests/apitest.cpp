@@ -11,6 +11,10 @@
 //     sizes (refused before any output), channels with different numbers of files, a pattern
 //     without a match; the command line exits 1 (not a crash) for the cases that used to crash
 //   - cancel after a few polls; progress never decreasing and ending at 1
+//   - ImarisWriter's C interface destroyed without Finish (what the converter does when it stops early)
+//     before the first block, after a few, part-way, after the last one, after a failed write and with
+//     an output folder that does not exist, many times: Destroy returns, the file has no /DataSetInfo
+//     and no histograms; after Finish it is complete
 //   - two conversions one after the other, two at once from two threads, numThreads (and the
 //     caller's OpenMP setting restored), piw::runCli twice in one process
 //   - metadata (A-10): every /DataSetInfo attribute with the defaults (names "Channel c", R/G/B,
@@ -46,11 +50,14 @@
 #include <fstream>
 #include <iterator>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
 #ifndef _WIN32
+#include <signal.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #endif
 
@@ -66,6 +73,8 @@
 #include "zarr.h"                // cpp-zarr
 #include "parallelwritezarr.h"
 #include "hdf5.h"                // core HDF5 (statically linked)
+#include "bpImageConverterInterfaceC.h"   // ImarisWriter's C interface (destroyTests)
+#include "bpThreadPool.h"                 // ImarisWriter's thread pool (destroyTests)
 
 namespace fs = std::filesystem;
 
@@ -1033,6 +1042,208 @@ static void metadataTests(const std::string& exe, const fs::path& work, const fs
     }
 }
 
+// --- ImarisWriter's C interface, destroyed at any point ---
+// bpImageConverterC_Destroy without bpImageConverterC_Finish stops the converter: the converter does it
+// after a read error, a cancel (Python's Ctrl-C too) or a failed write, and the C++ side of ImarisWriter
+// must stay sound however far the conversion got. Destroy returns; the file is closed with part of the
+// image data, but without /DataSetInfo and without histograms (third_party/imariswriter/README.md).
+// Each point is repeated: a teardown race of ImarisWriter's thread pool used to corrupt the heap in a few
+// of these stops, which ended the process ("free(): corrupted unsorted chunks").
+
+template<typename T> struct CApi;
+template<> struct CApi<uint16_t>{
+    static bpConverterTypesC_DataType type(){ return bpConverterTypesC_UInt16Type; }
+    static void copy(bpImageConverterCPtr c, uint16_t* b, bpConverterTypesC_Index5D* i){ bpImageConverterC_CopyBlockUInt16(c, b, i); }
+};
+template<> struct CApi<float>{
+    static bpConverterTypesC_DataType type(){ return bpConverterTypesC_FloatType; }
+    static void copy(bpImageConverterCPtr c, float* b, bpConverterTypesC_Index5D* i){ bpImageConverterC_CopyBlockFloat(c, b, i); }
+};
+
+// Whether every link of an absolute HDF5 path exists.
+static bool h5Exists(hid_t f, const std::string& path){
+    for(size_t i = 1; i <= path.size(); ){
+        size_t j = path.find('/', i);
+        if(j == std::string::npos) j = path.size();
+        if(H5Lexists(f, path.substr(0, j).c_str(), H5P_DEFAULT) <= 0) return false;
+        i = j + 1;
+    }
+    return true;
+}
+
+// One converter for a d.x x d.y x d.z image with nt time points, fed blocks of blk voxels in (x, y, z, t)
+// order: Destroy after aStop blocks, or (aStop < 0) after all of them and Finish. Returns the first error
+// the converter reported ("" if none); aCopied is the number of blocks copied.
+template<typename T>
+static std::string destroyRun(const fs::path& out, const Dims& d, unsigned nt, const unsigned blk[3], long aStop,
+                              bool aRandom, long& aCopied){
+    bpConverterTypesC_Size5D size = {(unsigned)d.x, (unsigned)d.y, (unsigned)d.z, 1, nt};
+    bpConverterTypesC_Size5D sampling = {1, 1, 1, 1, 1};
+    bpConverterTypesC_Size5D block = {blk[0], blk[1], blk[2], 1, 1};
+    bpConverterTypesC_DimensionSequence5D order = {bpConverterTypesC_DimensionX, bpConverterTypesC_DimensionY,
+        bpConverterTypesC_DimensionZ, bpConverterTypesC_DimensionC, bpConverterTypesC_DimensionT};
+    bpConverterTypesC_Options opt;
+    opt.mThumbnailSizeXY = 256;
+    opt.mFlipDimensionX = opt.mFlipDimensionY = opt.mFlipDimensionZ = false;
+    opt.mForceFileBlockSizeZ1 = false;
+    opt.mEnableLogProgress = false;
+    opt.mNumberOfThreads = (unsigned)std::max(4, omp_get_max_threads());
+    opt.mCompressionAlgorithmType = eCompressionAlgorithmLShuffleLZ4;
+    const std::string file = native(out);
+    bpImageConverterCPtr c = bpImageConverterC_Create(CApi<T>::type(), &size, &sampling, &order, &block, file.c_str(), &opt,
+                                                      "apiTest", "1.0", NULL, NULL);
+    std::string err;
+    auto failed = [&]{
+        const char* e = bpImageConverterC_GetLastException(c);
+        if(e && err.empty()) err = e;
+        return e != NULL;
+    };
+    const uint64_t nb[3] = {(d.x + blk[0] - 1) / blk[0], (d.y + blk[1] - 1) / blk[1], (d.z + blk[2] - 1) / blk[2]};
+    const long total = (long)(nb[0] * nb[1] * nb[2] * nt);
+    std::vector<T> buf((size_t)blk[0] * blk[1] * blk[2]);
+    std::mt19937 rng(12345);
+    aCopied = 0;
+    bool stopped = failed();
+    for(long i = 0; i < total && !stopped && (aStop < 0 || i < aStop); ++i){
+        const uint64_t bx = i % nb[0], by = (i / nb[0]) % nb[1], bz = (i / (nb[0] * nb[1])) % nb[2];
+        const unsigned t = (unsigned)(i / (nb[0] * nb[1] * nb[2]));
+        size_t k = 0;
+        for(uint64_t z = bz * blk[2]; z < (bz + 1) * blk[2]; ++z)
+            for(uint64_t y = by * blk[1]; y < (by + 1) * blk[1]; ++y)
+                for(uint64_t x = bx * blk[0]; x < (bx + 1) * blk[0]; ++x, ++k)
+                    buf[k] = (x >= d.x || y >= d.y || z >= d.z) ? (T)0 : aRandom ? (T)(rng() & 0xffff) : sample<T>(x, y, z, (int)t);
+        bpConverterTypesC_Index5D idx = {(unsigned)bx, (unsigned)by, (unsigned)bz, 0, t};
+        CApi<T>::copy(c, buf.data(), &idx);
+        ++aCopied;
+        stopped = failed();
+    }
+    if(aStop < 0 && !stopped){
+        bpConverterTypesC_ImageExtent extent = {0, 0, 0, (float)d.x, (float)d.y, (float)d.z};
+        bpConverterTypesC_Parameter unit = {"Unit", "um"};
+        bpConverterTypesC_ParameterSection image = {"Image", &unit, 1};
+        bpConverterTypesC_Parameters parameters = {&image, 1};
+        std::vector<bpConverterTypesC_TimeInfo> times(nt);
+        for(unsigned t = 0; t < nt; ++t){ times[t].mJulianDay = 2459000; times[t].mNanosecondsOfDay = t * 1000000000ULL; }
+        bpConverterTypesC_TimeInfos timeInfos = {times.data(), nt};
+        bpConverterTypesC_ColorInfo color = {true, {1, 1, 1, 1}, NULL, 0, 0, 0, 255, 1};
+        bpConverterTypesC_ColorInfos colors = {&color, 1};
+        bpImageConverterC_Finish(c, &extent, &parameters, &timeInfos, &colors, true);
+        failed();
+    }
+    bpImageConverterC_Destroy(c);
+    return err;
+}
+
+// What a stopped converter left: an HDF5 file without /DataSetInfo and without histograms ("" if so).
+static std::string stoppedFileProblem(const fs::path& out){
+    H5Eset_auto2(H5E_DEFAULT, NULL, NULL);
+    hid_t f = H5Fopen(native(out).c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    if(f < 0) return "cannot open the file";
+    std::string problem;
+    if(h5Exists(f, "/DataSetInfo")) problem = "has /DataSetInfo";
+    else if(h5Exists(f, "/DataSet/ResolutionLevel 0/TimePoint 0/Channel 0/Histogram")) problem = "has a histogram";
+    H5Fclose(f);
+    return problem;
+}
+
+template<typename T> static void destroyPoints(const fs::path& dir, int reps){
+    const Dims d = {150, 130, 70};
+    const unsigned nt = 2, blk[3] = {64, 64, 16};
+    const long total = 3 * 3 * 5 * (long)nt;
+    for(long stop : {0L, 1L, 7L, total / 2, total, -1L}){
+        bool ok = true;
+        std::string why;
+        const fs::path out = dir/(std::string("destroy_") + typeName<T>() + ".ims");
+        for(int rep = 0; rep < reps && ok; ++rep){
+            long copied = 0;
+            const std::string err = destroyRun<T>(out, d, nt, blk, stop, false, copied);
+            if(!err.empty() || copied != (stop < 0 ? total : stop)){ ok = false; why = "error: " + err; break; }
+            if(stop >= 0){
+                why = stoppedFileProblem(out);
+                ok = why.empty();
+            } else {
+                piw::ImsInfo info;
+                const piw::Status s = piw::imsInfo(native(out), info, true);
+                ok = s.ok() && !info.datasets.empty() && info.datasets[0].histogramCrc != 0;
+                if(!ok) why = "imsInfo: " + s.message;
+            }
+            fs::remove(out);
+        }
+        check(ok, std::string(typeName<T>()) + ": " + (stop < 0 ? "every block and Finish, then Destroy: a complete file" :
+              "Destroy after " + std::to_string(stop) + " of " + std::to_string(total) + " blocks: returns, no metadata or histograms") +
+              " (" + std::to_string(reps) + " times)" + (why.empty() ? "" : " -- " + why));
+    }
+}
+
+// Destroys a captured object slowly, then records that it is gone.
+struct SlowCapture {
+    std::atomic<int>* destroyed;
+    explicit SlowCapture(std::atomic<int>* d) : destroyed(d) {}
+    ~SlowCapture(){
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        destroyed->store(1);
+    }
+};
+
+static void destroyTests(const fs::path& work, int reps){
+    std::printf("[destroy]\n");
+    {
+        // The root of the old teardown race: WaitAll must return only after a finished task's function, and
+        // what it captured, is destroyed (a write task's memory blocks go back to a manager that the waiting
+        // thread destroys next).
+        bool ok = true;
+        for(int rep = 0; rep < 3 && ok; ++rep){
+            std::atomic<int> destroyed{0};
+            bpThreadPool pool(1);
+            {
+                std::shared_ptr<SlowCapture> capture = std::make_shared<SlowCapture>(&destroyed);
+                pool.Run([capture]{});
+            }
+            pool.WaitAll();
+            ok = destroyed.load() == 1;
+        }
+        check(ok, "ImarisWriter's thread pool: WaitAll returns after the task's captures are destroyed");
+    }
+    const fs::path dir = work/"destroy";
+    fs::create_directories(dir);
+    destroyPoints<uint16_t>(dir, reps);
+    destroyPoints<float>(dir, reps);   // float32: the adaptive histograms
+    const Dims d = {150, 130, 70};
+    const unsigned nt = 2, blk[3] = {64, 64, 16};
+    {
+        long copied = 0;
+        const std::string err = destroyRun<uint16_t>(dir/"missing"/"destroy.ims", d, nt, blk, -1, false, copied);
+        check(!err.empty() && !fs::exists(dir/"missing"), "an output folder that does not exist: the error is reported, Destroy returns (" + err + ")");
+    }
+#ifndef _WIN32
+    {
+        // A write that fails part-way: a file-size limit (SIGXFSZ ignored, so the write fails with EFBIG)
+        // well below the size of the file, whose random data does not compress.
+        struct rlimit before;
+        getrlimit(RLIMIT_FSIZE, &before);
+        void (*handler)(int) = signal(SIGXFSZ, SIG_IGN);
+        bool ok = true;
+        std::string err;
+        for(int rep = 0; rep < reps && ok; ++rep){
+            const fs::path out = dir/"destroy_limit.ims";
+            std::fflush(stdout);
+            struct rlimit limit = before;
+            limit.rlim_cur = 1 << 20;
+            setrlimit(RLIMIT_FSIZE, &limit);
+            long copied = 0;
+            err = destroyRun<uint16_t>(out, d, nt, blk, -1, true, copied);
+            setrlimit(RLIMIT_FSIZE, &before);
+            ok = err.find("write") != std::string::npos || err.find("Write") != std::string::npos;
+            fs::remove(out);
+        }
+        signal(SIGXFSZ, handler);
+        check(ok, "a write that fails part-way (file-size limit): the error is reported, Destroy returns (" +
+              std::to_string(reps) + " times; " + err + ")");
+    }
+#endif
+    fs::remove_all(dir);
+}
+
 int main(int argc, char** argv){
     if(argc >= 4 && std::string(argv[1]) == "--tiff") return tiffTiming(argv[2], argv[3], argc > 4 ? argv[4] : nullptr);
     if(argc < 2){ std::fprintf(stderr, "usage: %s <parallelimariswriter> [workdir]\n", argv[0]); return 2; }
@@ -1184,6 +1395,7 @@ int main(int argc, char** argv){
         check(s.code == piw::Code::Cancelled && rec.polls == poll && !fs::exists(out),
               "cancel on poll " + std::to_string(poll) + ": Cancelled, output removed");
     }
+    destroyTests(work, 5);
 
     // --- 4. calls in sequence, at once, with numThreads; runCli twice ---
     std::printf("[calls]\n");

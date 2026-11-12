@@ -4,6 +4,7 @@
 # (line endings normalized to LF) and stops if one differs; see README.md.
 44ee79808286255e920cfa61f5ab1565295657f22aafa3db4e46946754b3ca52  writer/bpMultiresolutionImsImage.cxx
 ba0793b7a225f48b0d9cae809cb5575477ea41d43c729955fb22c95f5149c1d6  writer/bpMultiresolutionImsImage.h
+c5caffc08af15312014b7be66fb67a3970a1da41b131ee136af617c94a28b28c  writer/bpThreadPool.cxx
 62cc9293bd43a4c69bdd1de99d4ed9fac5008cab51e827765d4e3f7e248d7a57  writer/bpWriterCompressor.cxx
 4e84004d7868a68c08c5d4d47afb567d7119839493bc50855886a41d1a7b3953  writer/bpWriterCompressor.h
 1daf53ece03967215a518db9ac39e67847981c5583abfcee69838672b136754b  writer/bpWriter.h
