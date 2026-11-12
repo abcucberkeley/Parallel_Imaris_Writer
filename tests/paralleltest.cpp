@@ -82,6 +82,78 @@ static bool readManifest(const fs::path& mf, int& nC, int& nT, std::vector<long>
     return nC > 0 && nT > 0 && !jobsPerLevel.empty();
 }
 
+// --- Failure cases (B-1): each broken input must give a non-zero exit, and no output file. ---
+static void writeZarrU8(const fs::path& path){
+    std::vector<uint8_t> buf(X*Y*Z); for(size_t i=0; i<buf.size(); i++) buf[i] = (uint8_t)(i % 251);
+    std::vector<uint64_t> shape={X,Y,Z}, chunks={32,32,32};
+    zarr Zw;
+    Zw.set_fileName(path.string());
+    Zw.set_cname("zstd"); Zw.set_clevel(5); Zw.set_order("F");
+    Zw.set_chunks(chunks); Zw.set_dimension_separator("."); Zw.set_dtype("<u1"); Zw.set_shape(shape);
+    Zw.write_zarray();
+    Zw.set_chunkInfo({0,0,0}, shape);
+    if(parallelWriteZarr(Zw, (void*)buf.data(), {0,0,0}, shape, shape, 8, false, false, false)){
+        std::fprintf(stderr,"Zarr write failed: %s\n", Zw.get_errString().c_str()); std::exit(1); }
+}
+static void setEnvVar(const char* k, const char* v){
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+static bool expectFail(const char* what, const std::string& cmd, const fs::path& noOutput = fs::path()){
+    std::printf("[failure case] %s\n", what);
+    int rc = runCmd(cmd);
+    if(rc == 0){ std::printf("  FAIL: exit 0\n"); return false; }
+    if(!noOutput.empty() && fs::exists(noOutput)){ std::printf("  FAIL: %s left behind\n", noOutput.string().c_str()); return false; }
+    std::printf("  ok (exit %d)\n", rc); return true;
+}
+// wd = the finished parallel workdir (manifest + all packs), monoIms = the monolithic 2-channel output.
+static bool failureCases(const std::string& exe, const fs::path& work, const fs::path& wd, const fs::path& monoIms){
+    const std::string E = q(exe); bool ok = true;
+    fs::path none = work/"fc_nomanifest"; fs::create_directories(none);
+    ok &= expectFail("worker without a manifest", E+" worker "+q(none)+" 0 0");
+    ok &= expectFail("monitor without a manifest", E+" monitor "+q(none)+" "+q(none/"out.ims"), none/"out.ims");
+    ok &= expectFail("combineone without a manifest", E+" combineone "+q(none)+" 0 0 "+q(none/"out.ims"), none/"out.ims");
+    ok &= expectFail("link without a manifest", E+" link "+q(none)+" "+q(none/"out.ims")+" parts", none/"out.ims");
+    ok &= expectFail("linkparts without a manifest", E+" linkparts "+q(none)+" "+q(none/"out.ims")+" parts", none/"out.ims");
+
+    // uint8 data: setup records it (linkparts can take it), the uint16-only tile worker refuses it
+    fs::path z8 = work/"fc_zarr_u8"; fs::create_directories(z8); writeZarrU8(z8/"CamA_t0000.zarr");
+    fs::path wd8 = work/"fc_u8";
+    if(runCmd(E+" setup "+q(z8)+" CamA "+q(wd8)+" 64,64,64 1,1,1") != 0){ std::printf("  FAIL: setup on uint8 data\n"); ok = false; }
+    ok &= expectFail("worker on uint8 data", E+" worker "+q(wd8)+" 0 0");
+
+    // chunks/ is a file, so no pack can be created (fails for any user on any platform)
+    fs::path wdw = work/"fc_nowrite"; fs::create_directories(wdw);
+    fs::copy_file(wd/"manifest.json", wdw/"manifest.json"); { std::ofstream f((wdw/"chunks").string()); f << "x"; }
+    ok &= expectFail("worker with an unwritable chunks directory", E+" worker "+q(wdw)+" 0 0");
+
+    ok &= expectFail("monitor writing into a missing directory", E+" monitor "+q(wd)+" "+q(work/"fc_no"/"such"/"out.ims"));
+
+    fs::path wdt = work/"fc_trunc"; fs::copy(wd, wdt, fs::copy_options::recursive);
+    fs::path pk = wdt/"chunks"/"L0_C0_T0_0.pack"; fs::resize_file(pk, fs::file_size(pk) - 100);
+    ok &= expectFail("monitor with a truncated pack", E+" monitor "+q(wdt)+" "+q(work/"fc_trunc.ims"), work/"fc_trunc.ims");
+
+    // one pack missing plus one stale pack: the stale one must not count as the missing one
+    fs::path wds = work/"fc_stale"; fs::copy(wd, wds, fs::copy_options::recursive);
+    fs::remove(wds/"chunks"/"L0_C1_T0_0.pack");
+    fs::copy_file(wds/"chunks"/"L0_C0_T0_0.pack", wds/"chunks"/"L0_C0_T0_999.pack");
+    setEnvVar("PIW_MONITOR_TIMEOUT", "2");
+    ok &= expectFail("monitor with one pack missing and a stale one (2 s timeout)", E+" monitor "+q(wds)+" "+q(work/"fc_stale.ims"), work/"fc_stale.ims");
+    setEnvVar("PIW_MONITOR_TIMEOUT", "");
+
+    // linkparts with a missing part, then with every part present (positive control)
+    fs::path lp = work/"fc_link"; fs::create_directories(lp/"parts");
+    fs::copy_file(monoIms, lp/"parts"/"part_t0_c0.ims");
+    ok &= expectFail("linkparts with a missing part", E+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts", lp/"link.ims");
+    fs::copy_file(monoIms, lp/"parts"/"part_t0_c1.ims");
+    if(runCmd(E+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts") != 0 || !fs::exists(lp/"link.ims")){
+        std::printf("  FAIL: linkparts with every part present\n"); ok = false; }
+    return ok;
+}
+
 int main(int argc, char** argv){
     if(argc < 2){ std::fprintf(stderr, "usage: %s <parallelimariswriter> [workdir]\n", argv[0]); return 2; }
     const std::string exe = argv[1];
@@ -105,7 +177,7 @@ int main(int argc, char** argv){
     fs::path parIms = work/"par.ims";
     std::printf("[parallel] setup\n");
     // small tile (64,64,64) -> multiple spatial tiles per level, exercising sub-division of a volume.
-    if(runCmd(q(exe)+" setup "+q(zdir)+" CamA,CamB "+q(wd)+" 64,64,64") != 0){
+    if(runCmd(q(exe)+" setup "+q(zdir)+" CamA,CamB "+q(wd)+" 64,64,64 1,1,1") != 0){
         std::printf("paralleltest FAILED: setup\n"); return 1; }
 
     int nC = 0, nT = 0; std::vector<long> jobsPerLevel;
@@ -130,7 +202,8 @@ int main(int argc, char** argv){
     ImsCompareReport report;
     bool same = imsCompare(monoDir/"output.ims", parIms, report, opt);
     imsPrintReport(report);
-    if(same){
+    bool failOk = failureCases(exe, work, wd, monoDir/"output.ims");
+    if(same && failOk){
         std::printf("paralleltest PASSED (parallel scatter/gather == monolithic, %d channels)\n", nC); return 0; }
     std::printf("paralleltest FAILED\n"); return 1;
 }
