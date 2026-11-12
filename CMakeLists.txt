@@ -1,26 +1,48 @@
 cmake_minimum_required(VERSION 3.18)
 
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
-
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
-endif()
-
-# -ffp-contract=off: GCC fuses multiply-adds where the CPU has FMA (arm64), which moves the display range
-# ImarisWriter derives from a Gauss-filtered histogram, so an ARM build wrote another ColorRange and thumbnail.
-set(CMAKE_CXX_FLAGS "-Wall -Wextra -ffp-contract=off")
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O3 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-
 project(
   parallel-imaris-writer
   VERSION 1.1.0
   LANGUAGES CXX)
 
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+# Release unless another build type is given. CMAKE_CXX_FLAGS and CMAKE_C_FLAGS are left to the user
+# (-DCMAKE_CXX_FLAGS=... reaches everything built here); the dependencies build with their own flags.
+get_property(PIW_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT CMAKE_BUILD_TYPE AND NOT PIW_MULTI_CONFIG)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type: Release (default), RelWithDebInfo, Debug or MinSizeRel" FORCE)
+endif()
+
 include(GNUInstallDirs)
 include(FetchContent)
+
+# For all C and C++ code built here, the fetched dependencies included (so set before they are added):
+# * -ffp-contract=off: GCC fuses multiply-adds where the CPU has FMA (arm64), which moves the display
+#   range ImarisWriter derives from a Gauss-filtered histogram, so an ARM build wrote another ColorRange
+#   and thumbnail than an x86-64 one.
+# * -ffile-prefix-map: the source and build folders are recorded as "." in __FILE__ (assertions and
+#   messages of HDF5, libtiff, blosc and the like) and in debug information, so the binaries carry no
+#   absolute path of the machine that built them (checked by the releaseFolder test). The build folder
+#   comes last: where it is inside the source folder, its own mapping is the one that applies.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-ffp-contract=off
+                      "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+                      "-ffile-prefix-map=${CMAKE_BINARY_DIR}=.")
+  # (and the dependencies' folder where FETCHCONTENT_BASE_DIR puts it outside the build folder)
+  string(FIND "${FETCHCONTENT_BASE_DIR}/" "${CMAKE_BINARY_DIR}/" PIW_DEPS_IN_BUILD)
+  if(NOT PIW_DEPS_IN_BUILD EQUAL 0)
+    add_compile_options("-ffile-prefix-map=${FETCHCONTENT_BASE_DIR}=.")
+  endif()
+endif()
+
+# Compiler warnings for this project's own code (piw_warnings(<target>)), not for the dependencies.
+function(piw_warnings target)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${target} PRIVATE -Wall -Wextra)
+  endif()
+endfunction()
 
 # Sanitizer builds, for testing only (off by default). -DPIW_SANITIZE=address (AddressSanitizer,
 # with LeakSanitizer) or -DPIW_SANITIZE=thread (ThreadSanitizer) compiles and links everything built
@@ -50,8 +72,9 @@ else()
   set(CMAKE_INSTALL_RPATH "$ORIGIN")
 endif()
 # Bake that RPATH into the binaries as they are built (not only at install time), so
-# the executable/libraries are relocatable straight out of the build tree -- this is
-# what lets the `release` target below just copy them into one folder and run.
+# the executable/libraries are relocatable straight out of the build tree. A compiler can
+# add its own library folder to it (GCC installations that link -rpath <their lib64>);
+# the `release` target below sets the staged copies' RPATH to exactly $ORIGIN / @loader_path.
 set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 
 # OpenMP is required for C++ only (main.cpp and the abc libraries use it; the C
@@ -117,6 +140,25 @@ FetchContent_Declare(hdf5
     URL_HASH SHA256=e4defbac30f50d64e1556374aa49e574417c9e72c6b1de7a4ff88c4b1bea6e9b
 )
 FetchContent_MakeAvailable(hdf5)
+# HDF5 compiles its configure summary into every binary that links it (H5build_settings.c, printed
+# when a program's HDF5 headers and library disagree); the compilers' absolute paths in it are
+# replaced by their file names.
+set(PIW_H5_SETTINGS "${hdf5_BINARY_DIR}/src/H5build_settings.c")
+if(EXISTS "${PIW_H5_SETTINGS}")
+  file(READ "${PIW_H5_SETTINGS}" PIW_TEXT)
+  set(PIW_NEW_TEXT "${PIW_TEXT}")
+  foreach(PIW_C IN ITEMS "${CMAKE_C_COMPILER}" "${CMAKE_CXX_COMPILER}")
+    if(PIW_C)
+      get_filename_component(PIW_NAME "${PIW_C}" NAME)
+      string(REPLACE "${PIW_C}" "${PIW_NAME}" PIW_NEW_TEXT "${PIW_NEW_TEXT}")
+    endif()
+  endforeach()
+  if(NOT PIW_NEW_TEXT STREQUAL PIW_TEXT)
+    file(WRITE "${PIW_H5_SETTINGS}" "${PIW_NEW_TEXT}")
+  endif()
+else()
+  message(WARNING "${PIW_H5_SETTINGS} not found: HDF5's configure summary keeps the compilers' paths")
+endif()
 
 # ---------------------------------------------------------------------------
 # cpp-tiff and cpp-zarr -- your reader libraries, built as libcppTiff/libcppZarr.
@@ -281,6 +323,7 @@ set(PIW_LINK_LIBRARIES
 target_include_directories(piw_core PRIVATE ${PIW_INCLUDE_DIRS})
 target_compile_definitions(piw_core PRIVATE PIW_VERSION="${PROJECT_VERSION}")
 target_link_libraries(piw_core PRIVATE ${PIW_LINK_LIBRARIES})   # usage requirements only (object library)
+piw_warnings(piw_core)
 if(NOT WIN32)
     # The shared library (PIW_BUILD_PYTHON_LIB) then exports only the PIW_API functions of
     # parallelimariswriter.h (MinGW DLLs export everything). The executable works as before; it
@@ -291,6 +334,7 @@ endif()
 add_executable(parallelimariswriter ${SRC_DIR}/main.cpp $<TARGET_OBJECTS:piw_core>)
 target_include_directories(parallelimariswriter PRIVATE ${PIW_INCLUDE_DIRS})
 target_link_libraries(parallelimariswriter PRIVATE ${PIW_LINK_LIBRARIES})
+piw_warnings(parallelimariswriter)
 
 # Each program (and the Python package's library) links its own C++ runtime statically, so the
 # only dynamic dependencies are the three libraries we ship in the folder (libcppTiff, libcppZarr,
@@ -341,14 +385,41 @@ piw_link_like_executable(parallelimariswriter)
 # file name the loader asks for. Bundled only on Linux/macOS (ELF/Mach-O); on Windows
 # the MinGW runtime DLLs (libgomp-1.dll, libwinpthread-1.dll) are resolved from the
 # executable's directory / PATH, as in the previous Windows release.
+# OpenMP_gomp_LIBRARY can be a linker script (a text file naming the real library; GCC toolsets
+# of RHEL-family systems such as manylinux have one): then the compiler's own libgomp is taken.
+function(piw_is_binary file out)
+    set(${out} FALSE PARENT_SCOPE)
+    if(EXISTS "${file}" AND NOT IS_DIRECTORY "${file}")
+        file(READ "${file}" magic LIMIT 4 HEX)
+        # ELF; Mach-O 64-/32-bit (either byte order) and universal
+        if(magic MATCHES "^(7f454c46|cffaedfe|cefaedfe|feedfacf|feedface|cafebabe)$")
+            set(${out} TRUE PARENT_SCOPE)
+        endif()
+    endif()
+endfunction()
 set(BUNDLE_OPENMP FALSE)
 if(NOT WIN32)
     if(OpenMP_gomp_LIBRARY)
-        get_filename_component(OPENMP_RUNTIME "${OpenMP_gomp_LIBRARY}" REALPATH)
         if(APPLE)
             set(OPENMP_RUNTIME_SONAME "libgomp.1.dylib")
         else()
             set(OPENMP_RUNTIME_SONAME "libgomp.so.1")
+        endif()
+        get_filename_component(OPENMP_RUNTIME "${OpenMP_gomp_LIBRARY}" REALPATH)
+        piw_is_binary("${OPENMP_RUNTIME}" PIW_GOMP_OK)
+        if(NOT PIW_GOMP_OK)
+            execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=${OPENMP_RUNTIME_SONAME}
+                            OUTPUT_VARIABLE PIW_GOMP_FILE OUTPUT_STRIP_TRAILING_WHITESPACE)
+            get_filename_component(PIW_GOMP_FILE "${PIW_GOMP_FILE}" REALPATH)
+            piw_is_binary("${PIW_GOMP_FILE}" PIW_GOMP_OK)
+            if(NOT PIW_GOMP_OK)
+                message(FATAL_ERROR "The OpenMP runtime to bundle is not a binary: ${OpenMP_gomp_LIBRARY} "
+                    "(${OPENMP_RUNTIME}) nor what ${CMAKE_CXX_COMPILER} -print-file-name=${OPENMP_RUNTIME_SONAME} "
+                    "names (${PIW_GOMP_FILE})")
+            endif()
+            message(STATUS "OpenMP runtime: ${OPENMP_RUNTIME} is not a binary (a linker script?); "
+                           "bundling ${PIW_GOMP_FILE}")
+            set(OPENMP_RUNTIME "${PIW_GOMP_FILE}")
         endif()
         set(BUNDLE_OPENMP TRUE)
     else()
@@ -359,39 +430,51 @@ endif()
 
 set(RUNTIME_PERMS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 
-# `cmake --install <build> --prefix <dir>` produces a self-contained <dir>/bin.
-install(TARGETS parallelimariswriter RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
-install(FILES $<TARGET_FILE:cppTiff_shared> $<TARGET_FILE:cppZarr_shared>
-        DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
-if(BUNDLE_OPENMP)
-    install(FILES "${OPENMP_RUNTIME}" RENAME "${OPENMP_RUNTIME_SONAME}"
-            DESTINATION ${CMAKE_INSTALL_BINDIR} PERMISSIONS ${RUNTIME_PERMS})
-endif()
-
-# Convenience: `cmake --build <build> --target release` assembles the exact flat
-# folder you ship:  <build>/Parallel_Imaris_Writer/
-#   parallelimariswriter  libcppTiff.so  libcppZarr.so  libgomp.so.1
+# The release folder, the flat folder that is shipped:  <build>/Parallel_Imaris_Writer/
+#   parallelimariswriter  libcppTiff.so  libcppZarr.so  libgomp.so.1     (macOS: .dylib; Windows: .exe,
+#   .dll and no libgomp)
+# assembled by every build (target `release`, part of the default build) from fresh copies of the
+# build tree's files whenever one of them changed: the RPATH of each binary is exactly $ORIGIN
+# (@loader_path on macOS), on macOS they load the bundled libgomp, and in a Release (or MinSizeRel)
+# build they are stripped, keeping the dynamic symbols (cmake/stage_release.cmake; checked by the
+# releaseFolder test). A PIW_SANITIZE build (never shipped) keeps the linker's RPATH, which can be
+# what finds the sanitizer's runtime, and is not stripped.
 set(RELEASE_DIR "${CMAKE_BINARY_DIR}/Parallel_Imaris_Writer")
-set(RELEASE_CMDS
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${RELEASE_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:parallelimariswriter> "${RELEASE_DIR}/"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:cppTiff_shared>       "${RELEASE_DIR}/"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:cppZarr_shared>       "${RELEASE_DIR}/")
+set(RELEASE_EXE "${RELEASE_DIR}/parallelimariswriter${CMAKE_EXECUTABLE_SUFFIX}")
+set(RELEASE_STRIP "")
+if(CMAKE_STRIP AND NOT PIW_SANITIZE AND NOT CMAKE_BUILD_TYPE MATCHES "^(Debug|RelWithDebInfo)$")
+    set(RELEASE_STRIP "${CMAKE_STRIP}")
+endif()
+set(RELEASE_ARGS
+    -DPLATFORM=${CMAKE_SYSTEM_NAME} -DRELEASE_DIR=${RELEASE_DIR}
+    -DEXECUTABLE=$<TARGET_FILE:parallelimariswriter>
+    "-DLIBRARIES=$<TARGET_FILE:cppTiff_shared>|$<TARGET_FILE:cppZarr_shared>"
+    -DSTRIP=${RELEASE_STRIP} -DOBJDUMP=${CMAKE_OBJDUMP})
+if(PIW_SANITIZE)
+    list(APPEND RELEASE_ARGS -DKEEP_RPATH=ON)
+endif()
+set(RELEASE_DEPENDS parallelimariswriter cppTiff_shared cppZarr_shared
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/stage_release.cmake)
 if(BUNDLE_OPENMP)
-    list(APPEND RELEASE_CMDS
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OPENMP_RUNTIME}" "${RELEASE_DIR}/${OPENMP_RUNTIME_SONAME}")
+    list(APPEND RELEASE_ARGS -DOPENMP_RUNTIME=${OPENMP_RUNTIME} -DOPENMP_RUNTIME_SONAME=${OPENMP_RUNTIME_SONAME})
+    list(APPEND RELEASE_DEPENDS ${OPENMP_RUNTIME})
     if(APPLE)
-        # Homebrew's libgomp records an absolute install-name, so repoint the copied
-        # binaries at the bundled copy (@loader_path) -- otherwise the release only runs
-        # on Macs that have Homebrew GCC. (Standard install_name_tool fixup; verify on ARM.)
-        list(APPEND RELEASE_CMDS
-            COMMAND bash "${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos_bundle_openmp.sh" "${RELEASE_DIR}")
+        # Homebrew's libgomp records an absolute install-name, so the copied binaries are
+        # repointed at the bundled copy (@loader_path) -- otherwise the release only runs
+        # on Macs that have Homebrew GCC.
+        list(APPEND RELEASE_ARGS -DMACOS_BUNDLE_OPENMP=${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos_bundle_openmp.sh)
+        list(APPEND RELEASE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/macos_bundle_openmp.sh)
     endif()
 endif()
-add_custom_target(release ${RELEASE_CMDS}
-    DEPENDS parallelimariswriter
+add_custom_command(OUTPUT "${RELEASE_EXE}"
+    COMMAND ${CMAKE_COMMAND} ${RELEASE_ARGS} -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/stage_release.cmake
+    DEPENDS ${RELEASE_DEPENDS}
     COMMENT "Assembling self-contained release in ${RELEASE_DIR}"
     VERBATIM)
+add_custom_target(release ALL DEPENDS "${RELEASE_EXE}")
+
+# `cmake --install <build> --prefix <dir>` installs the release folder's files into <dir>/bin.
+install(DIRECTORY "${RELEASE_DIR}/" DESTINATION ${CMAKE_INSTALL_BINDIR} USE_SOURCE_PERMISSIONS)
 
 # ---------------------------------------------------------------------------
 # libparallelImarisWriter: the converter core as a shared library, for the Python package
@@ -495,6 +578,7 @@ if(PIW_BUILD_TESTS)
             ${PIW_T_LIBS} nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX
             hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
         piw_link_like_executable(${tgt})
+        piw_warnings(${tgt})
         add_dependencies(release ${tgt})
         set_property(TARGET piw_tests APPEND PROPERTY PIW_TEST_FILES "$<TARGET_FILE:${tgt}>")
         add_test(NAME ${name}
@@ -537,6 +621,7 @@ if(PIW_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/tests ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src ${LZ4_INCLUDE_DIR})
     target_link_libraries(imscompare PRIVATE hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
     piw_link_like_executable(imscompare)
+    piw_warnings(imscompare)
     add_dependencies(release imscompare)
     set_property(TARGET piw_tests APPEND PROPERTY PIW_TEST_FILES "$<TARGET_FILE:imscompare>")
     # The tool's exit codes and messages on synthetic files with known differences.
@@ -552,6 +637,7 @@ if(PIW_BUILD_TESTS)
         ${SRC_DIR} ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src ${LZ4_INCLUDE_DIR})
     target_link_libraries(monoCoreTest PRIVATE hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
     piw_link_like_executable(monoCoreTest)
+    piw_warnings(monoCoreTest)
     add_test(NAME monoCore COMMAND monoCoreTest "${CMAKE_CURRENT_BINARY_DIR}/monocore_work")
     set_tests_properties(monoCore PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -596,18 +682,42 @@ if(PIW_BUILD_TESTS)
 
     # Every program and library above brings its own C++ runtime, LZ4 and zlib, none of them bound
     # to libcppTiff's or libcppZarr's, and the two export none of theirs (nm -D on Linux, nm -m on
-    # macOS, objdump -p's import and export tables on Windows; tests/runtime_isolation.cmake).
+    # macOS, objdump -p's import and export tables on Windows; tests/runtime_isolation.cmake). The
+    # executable and the readers are checked as shipped: the release folder's stripped copies.
     if(CMAKE_NM AND CMAKE_OBJDUMP)
-        set(PIW_CHECKED "$<TARGET_FILE:parallelimariswriter>|$<TARGET_FILE:monoCoreTest>")
+        set(PIW_CHECKED "${RELEASE_DIR}/$<TARGET_FILE_NAME:parallelimariswriter>|$<TARGET_FILE:monoCoreTest>")
         string(APPEND PIW_CHECKED "|$<JOIN:$<TARGET_GENEX_EVAL:piw_tests,$<TARGET_PROPERTY:piw_tests,PIW_TEST_FILES>>,|>")
         if(PIW_BUILD_PYTHON_LIB)
             string(APPEND PIW_CHECKED "|$<TARGET_FILE:parallelImarisWriter_shared>")
         endif()
         add_test(NAME runtimeIsolation COMMAND ${CMAKE_COMMAND}
             -DPLATFORM=${CMAKE_SYSTEM_NAME} -DNM=${CMAKE_NM} -DOBJDUMP=${CMAKE_OBJDUMP}
-            "-DREADERS=$<TARGET_FILE:cppTiff_shared>|$<TARGET_FILE:cppZarr_shared>" "-DBINARIES=${PIW_CHECKED}"
+            "-DREADERS=${RELEASE_DIR}/$<TARGET_FILE_NAME:cppTiff_shared>|${RELEASE_DIR}/$<TARGET_FILE_NAME:cppZarr_shared>"
+            "-DBINARIES=${PIW_CHECKED}"
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_isolation.cmake)
+        set_tests_properties(runtimeIsolation PROPERTIES FIXTURES_REQUIRED piw_release)
     else()
         message(WARNING "nm or objdump not found: the runtimeIsolation test is not registered")
+    endif()
+
+    # The release folder as shipped: its files, no absolute path of this build in any of them
+    # (source, build and dependency folders, the compilers), RPATH $ORIGIN / @loader_path alone, a
+    # binary libgomp, stripped (cmake/check_release.cmake). Not for a PIW_SANITIZE build, which is not
+    # shipped (and whose sanitizer records the source files' absolute paths).
+    set(PIW_RELEASE_FILES "$<TARGET_FILE_NAME:parallelimariswriter>|$<TARGET_FILE_NAME:cppTiff_shared>|$<TARGET_FILE_NAME:cppZarr_shared>")
+    if(BUNDLE_OPENMP)
+        string(APPEND PIW_RELEASE_FILES "|${OPENMP_RUNTIME_SONAME}")
+    endif()
+    set(PIW_STRIPPED OFF)
+    if(RELEASE_STRIP)
+        set(PIW_STRIPPED ON)
+    endif()
+    if(NOT PIW_SANITIZE)
+        add_test(NAME releaseFolder COMMAND ${CMAKE_COMMAND}
+            -DPLATFORM=${CMAKE_SYSTEM_NAME} -DRELEASE_DIR=${RELEASE_DIR} "-DEXPECTED=${PIW_RELEASE_FILES}"
+            "-DFORBIDDEN=${CMAKE_SOURCE_DIR}|${CMAKE_BINARY_DIR}|${FETCHCONTENT_BASE_DIR}|${CMAKE_C_COMPILER}|${CMAKE_CXX_COMPILER}"
+            -DOPENMP_RUNTIME=${OPENMP_RUNTIME_SONAME} -DOBJDUMP=${CMAKE_OBJDUMP} -DSTRIPPED=${PIW_STRIPPED}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_release.cmake)
+        set_tests_properties(releaseFolder PROPERTIES FIXTURES_REQUIRED piw_release)
     endif()
 endif()

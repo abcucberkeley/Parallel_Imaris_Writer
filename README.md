@@ -22,14 +22,20 @@ The converter is built with the CMakeLists.txt file.
 ````
 git clone https://github.com/abcucberkeley/Parallel_Imaris_Writer
 cd Parallel_Imaris_Writer
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build
 cmake --build build -j
-cmake --build build --target release
 ````
-The `release` target assembles a self-contained folder, `build/Parallel_Imaris_Writer/`, containing the `parallelimariswriter` executable and its shared libraries, ready to run in place. The executable links its own C++ runtime, LZ4 and zlib statically (on Linux it uses the system's `libgcc_s`), and the `libcppTiff` and `libcppZarr` built with it keep theirs private, so the folder can be copied anywhere; the `runtimeIsolation` test checks this.
+The build type is `Release` unless `-DCMAKE_BUILD_TYPE` says otherwise, and `-DCMAKE_CXX_FLAGS=...` / `-DCMAKE_C_FLAGS=...` reach everything that is built, the fetched dependencies included.
+
+Every build also assembles the self-contained folder that is shipped, `build/Parallel_Imaris_Writer/` (the `release` target, part of the default build): the `parallelimariswriter` executable, `libcppTiff` and `libcppZarr`, and on Linux and Mac the OpenMP runtime (`libgomp`), ready to run in place and to be copied anywhere. `cmake --install build --prefix <dir>` installs the same files into `<dir>/bin`. In that folder:
+- the executable links its own C++ runtime, LZ4 and zlib statically (on Linux it uses the system's `libgcc_s`), and the `libcppTiff` and `libcppZarr` built with it keep theirs private (the `runtimeIsolation` test checks this);
+- the binaries find each other through an RPATH of exactly `$ORIGIN` (`@loader_path` on Mac), whatever library folders the compiler added at link time;
+- in a `Release` (or `MinSizeRel`) build they are stripped (no static symbol table or debug information; the dynamic symbols stay), and no file records the source or build folder: everything is compiled with `-ffile-prefix-map` (the `releaseFolder` test checks both).
+
+All C and C++ code, the dependencies included, is compiled with `-ffp-contract=off`, so that arm64 and x86-64 builds compute the same display ranges and thumbnails.
 
 ### Tests
-Configure with `-DPIW_BUILD_TESTS=ON`, build, then run `ctest --test-dir build --output-on-failure`; the tests generate their own input data. For testing only, `-DPIW_SANITIZE=address` (AddressSanitizer and LeakSanitizer) or `-DPIW_SANITIZE=thread` (ThreadSanitizer) builds everything, the fetched dependencies included, with that sanitizer; use a fresh build directory and `-DCMAKE_BUILD_TYPE=RelWithDebInfo`. ThreadSanitizer reports races inside OpenMP parallel regions that are not real (GCC's OpenMP runtime is not instrumented, so its barriers are invisible to it).
+Configure with `-DPIW_BUILD_TESTS=ON`, build, then run `ctest --test-dir build --output-on-failure`; the tests generate their own input data and run the release folder's files. For testing only, `-DPIW_SANITIZE=address` (AddressSanitizer and LeakSanitizer) or `-DPIW_SANITIZE=thread` (ThreadSanitizer) builds everything, the fetched dependencies included, with that sanitizer; use a fresh build directory and `-DCMAKE_BUILD_TYPE=RelWithDebInfo`. ThreadSanitizer reports races inside OpenMP parallel regions that are not real (GCC's OpenMP runtime is not instrumented, so its barriers are invisible to it).
 
 ## Usage
 
