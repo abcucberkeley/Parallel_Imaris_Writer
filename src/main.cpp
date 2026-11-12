@@ -33,6 +33,10 @@ gcc -I. -L. -o bpImarisWriter96TestProgram.exe bpImarisWriter96TestProgram.c -lb
 #include <stdint.h>
 #include <sys/stat.h>
 #include <omp.h>
+#include <algorithm>
+#include <thread>
+#include <atomic>
+#include <vector>
 
 #ifndef _WIN32
 #include <wordexp.h>
@@ -135,6 +139,10 @@ void CheckErrors(bpImageConverterCPtr aConverter)
 // src==NULL (a pure zero-pad read-block) yields all zeros. Indexing reduces to the
 // whole-image indices when there is a single read-block (x0=y0=z0=0, xN=shapeX,
 // yN=shapeY).
+// No OpenMP here: an OpenMP region per block (thousands per volume) kept the idle
+// workers spinning between regions for the whole conversion, on the cores that
+// ImarisWriter's compression threads need. Blocks of 8 MiB or more are copied by
+// threads that live only for this call; smaller ones on the caller's thread.
 template<typename T>
 static void fillBlock(T* buf, const T* src,
         uint64_t vX, uint64_t vY, uint64_t vZ,
@@ -144,9 +152,10 @@ static void fillBlock(T* buf, const T* src,
     const uint64_t gxBase = vX*bx, gyBase = vY*by, gzBase = vZ*bz;
     const uint64_t avail  = (gxBase < shapeX) ? (shapeX - gxBase) : 0;
     const uint64_t xValid = !src ? 0 : (avail < bx ? avail : bx);   // in-image cols of this block
-    #pragma omp parallel for collapse(2)
-    for(uint64_t z = 0; z < bz; ++z){
-        for(uint64_t y = 0; y < by; ++y){
+    const uint64_t nRows  = by*bz;
+    auto fillRows = [&](uint64_t r0, uint64_t r1){                  // rows r = y + z*by
+        for(uint64_t r = r0; r < r1; ++r){
+            const uint64_t z = r / by, y = r % by;
             T* brow = buf + y*bx + z*bx*by;
             const uint64_t gy = gyBase + y, gz = gzBase + z;
             if(xValid == 0 || gy >= shapeY || gz >= shapeZ){
@@ -157,7 +166,26 @@ static void fillBlock(T* buf, const T* src,
                 if(xValid < bx) memset(brow + xValid, 0, (bx - xValid)*sizeof(T));  // zero-pad tail
             }
         }
+    };
+    const int nThreads = std::min(omp_get_max_threads(), 16);
+    if(nRows*bx*sizeof(T) < (8ull << 20) || nThreads <= 1){
+        fillRows(0, nRows);
+        return;
     }
+    const uint64_t rowsPerChunk = 64;
+    std::atomic<uint64_t> next(0);
+    auto worker = [&](){
+        for(;;){
+            const uint64_t r0 = next.fetch_add(rowsPerChunk);
+            if(r0 >= nRows) break;
+            fillRows(r0, std::min(r0 + rowsPerChunk, nRows));
+        }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve(nThreads - 1);
+    for(int i = 0; i < nThreads - 1; ++i) threads.emplace_back(worker);
+    worker();
+    for(auto& t : threads) t.join();
 }
 
 void convertToImaris(int argc, char **argv)
