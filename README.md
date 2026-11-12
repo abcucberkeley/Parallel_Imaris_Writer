@@ -101,7 +101,7 @@ Requirements and limits: the workdir and the output must be on one shared POSIX 
 
 When each `(timepoint, channel)` volume can be converted by one node (stream it with `-C`), convert each one independently and move it into the single file:
 
-1. **`setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--channel-names ... --start-time ...]`** — finds the `(channel, timepoint)` → `.zarr` inputs and writes `<workdir>/manifest.json`, with the metadata (channel names, colors, wavelengths, timepoint times) the converter would write for the same inputs and options. It takes the converter's metadata options (see [Metadata](#metadata)); every output made from the workdir carries that metadata. For any other input (TIFF, cropped with `-B`, ...) write the manifest with **`monoinit <workdir> <nT> <nC> <vx,vy,vz> [out.ims]`** instead.
+1. **`setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--channel-names ... --start-time ...]`** — finds the `(channel, timepoint)` → `.zarr` inputs and writes `<workdir>/manifest.json`, with the metadata (channel names, colors, wavelengths, timepoint times) the converter would write for the same inputs and options. It takes the converter's metadata options (see [Metadata](#metadata)); every output made from the workdir carries that metadata. For any other input (TIFF, cropped with `-B`, ...) write the manifest with **`monoinit <workdir> <nT> <nC> <vx,vy,vz> [out.ims] [--channel-names ... --start-time ...]`** instead; it takes the same metadata options, but it has no input files to take names and times from: the channels are named `Channel 0`, `Channel 1`, ... unless `--channel-names` is given, and the timepoints are 1 s (or `--time-interval`) apart from `--start-time`, or else from the time `monoinit` runs (give `--start-time` to get the times a single-node conversion writes).
 2. For each `(timepoint, channel)` — all at once, e.g. one array task each:
    - run the **normal converter** on that one volume into a part file (`-c 1 -t 1`, same options for every part);
    - **`monoplace <workdir> <t> <c> <part.ims> [--threads N]`** copies the part's compressed chunks into the single file and writes its sidecar (the task's commit point);
@@ -134,21 +134,36 @@ parallelimariswriter monofinish /path/to/workdir /path/to/out.ims --verify --thr
 
 ### Single huge volume: spatial tiling
 
-When even one `(timepoint, channel)` is too large for a node, tile it spatially. Work is divided by `(channel, timepoint, spatial tile)` at every pyramid level; because each coarser level downsamples the one below it, the levels run **in order**.
+When even one `(timepoint, channel)` is too large for a node, tile it spatially (Zarr input). Work is divided by `(channel, timepoint, spatial tile)` at every pyramid level; because each coarser level downsamples the one below it, the levels run **in order**. By default the tile workers write their chunks straight into the single file, as `monoplace` does (setup's **mono store**).
 
-1. **`setup ... <cx,cy,cz> ...`** — plans into `manifest.json`; `jobsPerLevel[]` gives the worker count per level. Output chunk size comes from the `PIW_CHUNK_BYTES` env var (bytes, default 1 MiB, which matches the single-node converter's chunking).
-2. **`worker <workdir> <level> <index>`** — builds one tile of one level (`index` runs `0..jobsPerLevel[level]-1`). Level 0 reads the Zarr; coarser levels downsample the finer level's tiles, so **level r+1 must run after level r** (e.g. via `--dependency=afterok`). Writes atomically (temp file + rename); safe to re-run.
-3. Assemble the tiles into the `.ims`, either as one file or in parallel:
-   - **`monitor <workdir> [out.ims]`** — one HDF5 writer reads all tiles and writes a single self-contained `.ims` (one write stream: the slowest step for large data).
-   - or **`combineone <workdir> <t> <c> <out.ims>`** per `(timepoint, channel)` into its own `.ims`, then **`link <workdir> <out.ims> <parts>`** to stitch them with external links (same as `linkparts`, but sourced from the tiled chunk files).
+1. **`setup <folder> <patterns> <workdir> <cx,cy,cz> [vx,vy,vz] [--store mono|packs] [--channel-names ... --start-time ...]`** — plans tiles of `cx,cy,cz` voxels into `manifest.json` (`jobsPerLevel[]` gives the worker count per level), with the chunks laid out as a single-node conversion of all the timepoints lays them out and the metadata as above. Output chunk size comes from the `PIW_CHUNK_BYTES` env var (bytes, default 1 MiB, which matches the single-node converter's chunking). `--store` (default: the `PIW_STORE` env var, else `mono`) chooses where the workers put the chunks: `mono` into the single file, `packs` into one `.pack` file per tile (see below). On Windows the default is `packs`, and `mono` is refused.
+2. **`worker <workdir> <level> <index> [count]`** — builds tiles `index` to `index+count-1` (default: one tile) of one level; `index` runs `0..jobsPerLevel[level]-1`, and `count` keeps the number of jobs for a huge volume within the scheduler's limits. Level 0 reads the Zarr; coarser levels read the finer level's chunks back and average them down, so **level r+1 must run after level r** (e.g. via `--dependency=afterok`). In the mono store a worker claims its tile's byte range of the file, writes the chunks there, then the tile's histogram and its sidecar `chunks/L<r>_C<c>_T<t>_<tile>.idx` (the tile's commit point). `OMP_NUM_THREADS` sets the threads for encoding and decoding, and each tile prints one timing line. Safe to re-run: the tile claims the same range again and writes the same bytes.
+3. **`monitor <workdir> [out.ims] [--verify] [--threads N]`** — waits until every tile is done (`PIW_MONITOR_TIMEOUT=<seconds>` gives up after that long and names the missing tiles), then runs `monofinish` on the workdir with these options: it checks every sidecar, builds the index, the histograms (summed from the tiles'), the metadata and the thumbnail over the chunks already in the file, and renames it to `out.ims` (default `<workdir>/output.ims`, on the workdir's file system). **`monostatus <workdir>`** lists the placed and the missing tiles; `monofinish <workdir> [out.ims]` can also be run on its own.
 
-**Memory:** the binding constraint is the **coarse levels**, not level 0 — a level>0 worker loads the finer level's region (up to ~8× its own tile) in order to downsample it, needing several times the level-0 footprint. On ~5000×22000×350 data a 2048³ tile fits in ~21 GB at every level; 3072³ OOMs level 1 even at 48 GB.
+Example (SLURM; `<...>` are your own values; one array per level, each after the one before):
+````
+parallelimariswriter setup /path/to/zarrs CamA /path/to/workdir 2048,2048,512 0.108,0.108,0.25
+sbatch --array=0-<jobsPerLevel[0]-1> -c 8 --wrap 'PIW_CLAIM=fcntl OMP_NUM_THREADS=8 parallelimariswriter worker /path/to/workdir 0 $SLURM_ARRAY_TASK_ID'
+sbatch --dependency=afterok:<level 0 array> --array=0-<jobsPerLevel[1]-1> -c 8 --wrap '... worker /path/to/workdir 1 $SLURM_ARRAY_TASK_ID'
+...
+sbatch --dependency=afterok:<last level's array> -c 16 --wrap 'parallelimariswriter monitor /path/to/workdir /path/to/out.ims --verify --threads 16'
+````
+
+**Restarting.** Run the worker of a failed tile again, then the levels after it; `monitor` and `monostatus` name a missing tile `L<r>_C<c>_T<t>_<tile>` (its index at level `r` is `(c*nT + t)*n + tile`, with `n = jobsPerLevel[r] / (nC*nT)` tiles per volume). Once the finish has started, the journal is sealed and later workers fail instead of changing the file. A workdir takes either tiles or parts (`monoplace`), never both.
+
+**Claims at scale.** A huge volume has thousands of tiles, and many workers claim at once: there `PIW_CLAIM=fcntl` (see Claims above; only where `fcntl` locks work across nodes) is faster than the default `link()` journal, whose claims retry under contention.
+
+**Memory.** A level>0 worker averages the finer level's chunks straight into its own tile, so every level needs about what level 0 needs: the tile, its compressed chunks, and read buffers of up to 64 MB per thread. On ~5000×22000×350 data a 2048,2048,512 tile peaks at about 6 GB at every level. (Only a block layout whose averaging boxes cross chunk boundaries, with an odd block size along a halved axis, first assembles the finer region under the tile, up to 8× its size.)
+
+**Packs store (`setup --store packs`).** The workers write one `.pack` file per tile (atomically: temp file + rename) instead of writing into the single file, and the packs are assembled afterwards:
+- **`monitor <workdir> [out.ims]`** — one HDF5 writer reads all packs and writes a single self-contained `.ims` (one write stream: the slowest step for large data);
+- or **`combineone <workdir> <t> <c> <out.ims>`** per `(timepoint, channel)` into its own `.ims`, then **`link <workdir> <out.ims> <parts>`** to stitch them with external links (same as `linkparts`, but sourced from the packs). `combineone` and `link` refuse a mono-store workdir.
 
 ### Notes
 
 - **Throughput.** The parallel steps are limited by the shared file system's write bandwidth into one file; `monofinish` is serial but writes only metadata (minutes even for millions of chunks). Splitting one HDF5 array across processes with MPI-IO does **not** help (HDF5's collective compressed writes are slower than a single writer).
-- **Chunk size.** Keep the converter's default chunking for the per-(timepoint, channel) path; for the tiled `monitor` path, `PIW_CHUNK_BYTES=8388608` (8 MiB) speeds the single-writer combine at some cost to Imaris interactive-read speed, and changes the chunking from the single-node converter's.
-- **Thumbnail and metadata.** All cluster outputs carry the same `/Thumbnail` preview image as the single-node converter. The single-file output's `ColorRange` comes from the histograms of every timepoint, as in a single-node conversion; the `linkparts` output takes each channel's range from its timepoint-0 part. The normal single-process converter (above) handles all supported readers and bit depths.
+- **Chunk size.** Keep the default chunking: it matches the single-node converter's. Only the packs store's `monitor` (one writer) gets faster with fewer, bigger chunks — `PIW_CHUNK_BYTES=8388608` (8 MiB) — at some cost to Imaris' interactive-read speed, and its output is then chunked differently from a single-node conversion.
+- **Thumbnail and metadata.** All cluster outputs carry the same `/Thumbnail` preview image as the single-node converter, coloured with the channel colors, and the metadata (names, colors, wavelengths, times) that `setup` or `monoinit` resolved into the manifest. The single-file output's `ColorRange` comes from the histograms of every timepoint, as in a single-node conversion; the `linkparts` output takes each channel's range from its timepoint-0 part. The normal single-process converter (above) handles all supported readers and bit depths.
 
 ## Reference
 
