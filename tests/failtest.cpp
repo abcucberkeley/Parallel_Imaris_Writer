@@ -21,8 +21,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -77,6 +75,18 @@ static bool writeZarr(const fs::path& dir, const std::string& name, const std::v
         return false;
     }
     return true;
+}
+
+// C stdio, not iostreams: on macOS this binary binds part of the C++ runtime to the copy bundled (and
+// exported) by libcppZarr, and iostream calls that mix the two copies abort.
+static std::string readText(const fs::path& p){
+    std::string b;
+    FILE* f = std::fopen(p.string().c_str(), "rb");
+    if(!f) return b;
+    char buf[1 << 16]; size_t n;
+    while((n = std::fread(buf, 1, sizeof buf, f)) > 0) b.append(buf, n);
+    std::fclose(f);
+    return b;
 }
 
 struct RunResult {
@@ -149,17 +159,20 @@ static RunResult run(const std::string& exe, const std::vector<std::string>& arg
     r.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if(!r.timedOut && WIFEXITED(status)) r.exitCode = WEXITSTATUS(status);
     else if(WIFSIGNALED(status)) r.signal = WTERMSIG(status);
-    std::ifstream in(log);
-    std::stringstream ss; ss << in.rdbuf();
-    r.output = ss.str();
+    r.output = readText(log);
     return r;
 }
 
 // The output's last lines that are not progress lines.
 static std::string tail(const std::string& output){
     std::vector<std::string> lines;
-    std::stringstream ss(output);
-    for(std::string l; std::getline(ss, l);) if(l.rfind("Progress", 0) != 0) lines.push_back(l);
+    for(size_t b = 0; b < output.size();){
+        size_t e = output.find('\n', b);
+        if(e == std::string::npos) e = output.size();
+        const std::string l = output.substr(b, e - b);
+        if(l.rfind("Progress", 0) != 0) lines.push_back(l);
+        b = e + 1;
+    }
     std::string t;
     for(size_t i = lines.size() > 3 ? lines.size() - 3 : 0; i < lines.size(); i++) t += "    | " + lines[i] + "\n";
     return t;
