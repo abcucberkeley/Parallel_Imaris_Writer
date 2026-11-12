@@ -95,6 +95,9 @@ set(HDF5_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
 set(HDF5_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(HDF5_BUILD_UTILS    OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING       OFF CACHE BOOL "" FORCE)
+# HDF5's _Float16 support uses FLT16_MAX, which GCC 15's MinGW headers don't define
+# (the HDF5 build fails); the .ims files never store 16-bit floats.
+set(HDF5_ENABLE_NONSTANDARD_FEATURE_FLOAT16 OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(hdf5
     URL      https://github.com/HDFGroup/hdf5/releases/download/hdf5_1.14.6/hdf5-1.14.6.tar.gz
     URL_HASH SHA256=e4defbac30f50d64e1556374aa49e574417c9e72c6b1de7a4ff88c4b1bea6e9b
