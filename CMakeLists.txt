@@ -7,7 +7,9 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS "-Wall -Wextra")
+# -ffp-contract=off: GCC fuses multiply-adds where the CPU has FMA (arm64), which moves the display range
+# ImarisWriter derives from a Gauss-filtered histogram, so an ARM build wrote another ColorRange and thumbnail.
+set(CMAKE_CXX_FLAGS "-Wall -Wextra -ffp-contract=off")
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O3 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
