@@ -79,6 +79,20 @@ template<class T> static void writeZarr(const fs::path& path, const std::vector<
 }
 
 static std::string q(const fs::path& p){ return "\"" + p.string() + "\""; }
+// C stdio, not iostreams or std::filesystem copies: on macOS this binary binds part of the C++ runtime
+// to the copy bundled (and exported) by libcppZarr, and iostream calls that mix the two copies abort.
+static bool readBytes(const fs::path& p, std::string& b){
+    FILE* f = std::fopen(p.string().c_str(), "rb"); if(!f) return false;
+    b.clear(); char buf[1 << 16]; size_t n;
+    while((n = std::fread(buf, 1, sizeof buf, f)) > 0) b.append(buf, n);
+    const bool ok = !std::ferror(f); std::fclose(f); return ok;
+}
+static bool copyFile(const fs::path& from, const fs::path& to){
+    std::string b; if(!readBytes(from, b)) return false;
+    FILE* f = std::fopen(to.string().c_str(), "wb"); if(!f) return false;
+    const bool ok = std::fwrite(b.data(), 1, b.size(), f) == b.size();
+    return std::fclose(f) == 0 && ok;
+}
 // Runs a shell command; its exit code (-1 if it did not exit normally). out: its stdout + stderr.
 static int run(const std::string& cmd, std::string* out = nullptr, const fs::path& log = fs::path()){
     std::printf("  $ %s\n", cmd.c_str()); std::fflush(stdout);
@@ -86,20 +100,10 @@ static int run(const std::string& cmd, std::string* out = nullptr, const fs::pat
     if(out) full = "(" + cmd + ") > " + q(log) + " 2>&1";
     int rc = std::system(full.c_str());
     if(out){
-        std::ifstream in(log); std::stringstream ss; ss << in.rdbuf(); *out = ss.str();
+        readBytes(log, *out);
         std::printf("%s", out->c_str());
     }
     return WIFEXITED(rc) ? WEXITSTATUS(rc) : -1;
-}
-static bool readBytes(const fs::path& p, std::string& b){
-    std::ifstream in(p, std::ios::binary); if(!in) return false;
-    std::stringstream ss; ss << in.rdbuf(); b = ss.str(); return true;
-}
-// Plain stream copy: std::filesystem::copy_file aborts on macOS with GCC 13.
-static bool copyFile(const fs::path& from, const fs::path& to){
-    std::string b; if(!readBytes(from, b)) return false;
-    std::ofstream out(to, std::ios::binary | std::ios::trunc); out.write(b.data(), (std::streamsize)b.size());
-    return (bool)out;
 }
 static uint64_t fileSize(const fs::path& p){ struct stat st; return stat(p.c_str(), &st) == 0 ? (uint64_t)st.st_size : 0; }
 
