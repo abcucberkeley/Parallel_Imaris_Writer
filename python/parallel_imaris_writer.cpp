@@ -1,35 +1,52 @@
 // Python bindings of the Parallel Imaris Writer library (src/parallelimariswriter.h). The
 // functions are named pybind11_*; the Python API is parallel_imaris_writer_wrappers.py.
 //
-// Every call that converts or runs the command line does so on a worker thread of its own while
-// the calling thread waits without the GIL (callOnWorker): other Python threads keep running,
-// Ctrl-C can stop a conversion, and the OpenMP threads belong to a thread that ends with the call
+// Every call into the library runs on a worker thread of its own while the calling thread waits
+// without the GIL (callOnWorker): other Python threads keep running, Ctrl-C (or an exception
+// raised by a progress callback) stops a write, and the OpenMP threads belong to a thread that
+// ends with the call, so a call's thread count changes no other thread's OpenMP setting
 // (measured: a child made by fork() after a conversion on the calling thread hung in its first
-// conversion; after conversions on worker threads it ran).
+// conversion; after conversions on worker threads it ran). No Python call ever happens on a
+// worker thread: the library's callbacks only store into the call's CallState, and the waiting
+// thread passes that on to Python.
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <exception>
-#include <future>
-#include <memory>
+#include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <string>
-#include <thread>
+#include <utility>
 #include <vector>
+#if defined(_WIN32)
+#include <thread>
+#else
+#include <pthread.h>
+#endif
 #include "parallelimariswriter.h"
 
 namespace {
 
 // What a call's worker shares with the waiting thread. The library's callbacks run on the worker
-// (and the Imaris writer's thread), so they only touch this; the waiting thread, holding the GIL,
-// passes it on to Python.
+// (and on the Imaris writer's thread), so they only touch this; the waiting thread, holding the
+// GIL, passes it on to Python.
 struct CallState {
     std::atomic<bool> cancel{false};
     bool verbose = false;
     std::mutex textMutex;
-    std::string text;          // the command line's messages, not printed yet (verbose)
+    std::string text;                              // the command line's messages, not printed yet (verbose)
+    std::atomic<float> fraction{-1.0f};            // the library's last progress (-1: none yet)
+    std::atomic<unsigned long long> bytes{0};
+    pybind11::object progress;                     // unset or None, or progress(fraction, bytes_written)
+    float reported = -1.0f;                        // the last fraction progress was called with
+    std::chrono::steady_clock::time_point reportedAt;
+    bool hasProgress() const { return progress && !progress.is_none(); }
 };
 
 void messageCallback(const char* aText, void* aUser)
@@ -38,6 +55,13 @@ void messageCallback(const char* aText, void* aUser)
     if(!vState->verbose) return;
     std::lock_guard<std::mutex> vLock(vState->textMutex);
     vState->text += aText;
+}
+
+void progressCallback(float aFraction, unsigned long long aBytes, void* aUser)
+{
+    CallState* vState = static_cast<CallState*>(aUser);
+    vState->bytes = aBytes;
+    vState->fraction = aFraction;
 }
 
 int cancelCallback(void* aUser)
@@ -50,6 +74,7 @@ piw::Callbacks callbacksFor(CallState& aState)
     piw::Callbacks vCallbacks;
     vCallbacks.message = messageCallback;
     vCallbacks.cancel = cancelCallback;
+    if(aState.hasProgress()) vCallbacks.progress = progressCallback;
     vCallbacks.user = &aState;
     return vCallbacks;
 }
@@ -68,40 +93,134 @@ void printQueued(CallState& aState)
     vStdout.attr("flush")();
 }
 
+// Calls the progress callback (GIL held) when the library's fraction grew, at most every 100 ms.
+// Values below 1 only: aFinal (the call has succeeded) calls it once with 1.
+void reportProgress(CallState& aState, bool aFinal)
+{
+    if(!aState.hasProgress() || aState.reported >= 1.0f) return;
+    const std::chrono::steady_clock::time_point vNow = std::chrono::steady_clock::now();
+    float vFraction = 1.0f;
+    if(!aFinal){
+        vFraction = aState.fraction.load();
+        if(!(vFraction > aState.reported) || vFraction >= 1.0f) return;
+        if(aState.reported >= 0.0f && vNow - aState.reportedAt < std::chrono::milliseconds(100)) return;
+    }
+    aState.reported = vFraction;
+    aState.reportedAt = vNow;
+    aState.progress(vFraction, aState.bytes.load());
+}
+
+// One call's worker thread: runs the work, keeps its result (or what it threw) and signals the
+// end. On Linux and macOS it gets an 8 MiB stack, as the command line's main thread has (macOS
+// gives other threads 512 KiB).
+template <class Result>
+class Worker {
+public:
+    explicit Worker(std::function<Result()> aWork) : mWork(std::move(aWork)) {}
+    void start(){
+        #if defined(_WIN32)
+        mThread = std::thread(&Worker::body, this);
+        #else
+        pthread_attr_t vAttr;
+        pthread_attr_init(&vAttr);
+        pthread_attr_setstacksize(&vAttr, (size_t)8 << 20);
+        const int vError = pthread_create(&mThread, &vAttr, &Worker::run, this);
+        pthread_attr_destroy(&vAttr);
+        if(vError) throw std::runtime_error("Could not start a thread for the call.");
+        #endif
+    }
+    // True when the work has ended (waits at most aTime).
+    bool waitFor(std::chrono::milliseconds aTime){
+        std::unique_lock<std::mutex> vLock(mMutex);
+        return mCondition.wait_for(vLock, aTime, [this]() { return mDone; });
+    }
+    void join(){
+        #if defined(_WIN32)
+        mThread.join();
+        #else
+        pthread_join(mThread, NULL);
+        #endif
+    }
+    // After join: the work's result, or what it threw.
+    Result result(){
+        if(mError) std::rethrow_exception(mError);
+        return std::move(mResult);
+    }
+private:
+    #if !defined(_WIN32)
+    static void* run(void* aSelf){ static_cast<Worker*>(aSelf)->body(); return NULL; }
+    #endif
+    void body(){
+        try{ mResult = mWork(); }
+        catch(...){ mError = std::current_exception(); }
+        std::lock_guard<std::mutex> vLock(mMutex);
+        mDone = true;
+        mCondition.notify_all();
+    }
+    std::function<Result()> mWork;
+    Result mResult;
+    std::exception_ptr mError;
+    std::mutex mMutex;
+    std::condition_variable mCondition;
+    bool mDone = false;
+    #if defined(_WIN32)
+    std::thread mThread;
+    #else
+    pthread_t mThread;
+    #endif
+};
+
 // Runs aWork() on a new thread and returns its result; the calling thread (GIL held on entry and
-// on return) waits without the GIL. With aState, the waiting thread looks every 50 ms for a
-// signal (Ctrl-C) or another Python error: it then asks the work to stop (aState->cancel), waits
-// for it and raises that error. Without aState the work cannot be stopped, and a signal is
-// handled by Python once the call has returned.
+// on return) waits without the GIL. With aState, the waiting thread wakes every 50 ms to look for
+// a signal (Ctrl-C), print the queued messages and call the progress callback; a Python error
+// from any of these asks the work to stop (aState->cancel), and once the work has ended that
+// first error is raised (later ones, such as a second Ctrl-C, are dropped). Without aState the
+// work cannot be stopped, and a signal is handled by Python once the call has returned.
 template <class Work>
 auto callOnWorker(Work aWork, CallState* aState) -> decltype(aWork())
 {
     typedef decltype(aWork()) Result;
-    std::packaged_task<Result()> vTask(aWork);
-    std::future<Result> vDone = vTask.get_future();
-    std::thread vWorker(std::move(vTask));
-    std::unique_ptr<pybind11::error_already_set> vError;   // the first Python error while waiting
-    for(;;){
-        std::future_status vWait;
+    Worker<Result> vWorker{std::function<Result()>(aWork)};
+    vWorker.start();
+    std::exception_ptr vError;
+    for(bool vDone = false; !vDone; ){
         {
             pybind11::gil_scoped_release vRelease;
-            vWait = vDone.wait_for(std::chrono::milliseconds(50));
+            vDone = vWorker.waitFor(std::chrono::milliseconds(50));
         }
-        if(aState){
-            try{
-                if(!vError && PyErr_CheckSignals() != 0) throw pybind11::error_already_set();
-                if(aState->verbose) printQueued(*aState);
-            }
-            catch(pybind11::error_already_set& vPythonError){
-                if(!vError) vError.reset(new pybind11::error_already_set(vPythonError));
-                aState->cancel = true;
-            }
+        if(!aState) continue;
+        try{
+            if(PyErr_CheckSignals() != 0) throw pybind11::error_already_set();
+            if(aState->verbose) printQueued(*aState);
+            if(!vError) reportProgress(*aState, false);
         }
-        if(vWait == std::future_status::ready) break;
+        catch(...){
+            if(!vError) vError = std::current_exception();
+            aState->cancel = true;
+        }
     }
     vWorker.join();
-    if(vError) throw *vError;
-    return vDone.get();   // rethrows what the work threw
+    if(vError) std::rethrow_exception(vError);
+    return vWorker.result();   // rethrows what the work threw
+}
+
+// Text from the library (file names, attribute values) as str: UTF-8, other bytes kept as
+// surrogates (as os.fsdecode does).
+pybind11::str text(const std::string& aText)
+{
+    PyObject* vText = PyUnicode_DecodeUTF8(aText.data(), (Py_ssize_t)aText.size(), "surrogateescape");
+    if(!vText) throw pybind11::error_already_set();
+    return pybind11::reinterpret_steal<pybind11::str>(vText);
+}
+
+[[noreturn]] void raise(PyObject* aType, const std::string& aMessage)
+{
+    PyObject* vText = PyUnicode_DecodeUTF8(aMessage.data(), (Py_ssize_t)aMessage.size(), "replace");
+    if(vText){
+        PyErr_SetObject(aType, vText);
+        Py_DECREF(vText);
+    }
+    throw pybind11::error_already_set();
 }
 
 // A failed Status as the Python exception for it.
@@ -112,15 +231,14 @@ void throwIfFailed(const piw::Status& aStatus)
             return;
         case piw::Code::InvalidArgument:
         case piw::Code::Unsupported:
-            throw pybind11::value_error(aStatus.message);
+            raise(PyExc_ValueError, aStatus.message);
         case piw::Code::NotFound:
-            PyErr_SetString(PyExc_FileNotFoundError, aStatus.message.c_str());
-            throw pybind11::error_already_set();
+            raise(PyExc_FileNotFoundError, aStatus.message);
         case piw::Code::Cancelled:
-            PyErr_SetString(PyExc_KeyboardInterrupt, aStatus.message.c_str());
-            throw pybind11::error_already_set();
+            // (a cancel the waiting thread asked for raises its own error before this)
+            raise(PyExc_KeyboardInterrupt, aStatus.message);
         default:
-            throw std::runtime_error(aStatus.message);
+            raise(PyExc_RuntimeError, aStatus.message);
     }
 }
 
@@ -132,6 +250,50 @@ bool optionalSizes(const pybind11::object& aValues, const char* aName, uint64_t 
     if(vValues.size() != N) throw pybind11::value_error(std::string(aName) + " needs " + std::to_string(N) + " values");
     for(size_t i = 0; i < N; ++i) aOut[i] = vValues[i];
     return true;
+}
+
+const char* dataTypeName(piw::DataType aType)
+{
+    switch(aType){
+        case piw::DataType::UInt8: return "uint8";
+        case piw::DataType::UInt16: return "uint16";
+        case piw::DataType::UInt32: return "uint32";
+        case piw::DataType::Float32: return "float32";
+    }
+    return "unknown";
+}
+
+// The library's sample type of a NumPy data type in this machine's byte order (false: none).
+bool dataTypeOf(const pybind11::dtype& aType, piw::DataType& aOut)
+{
+    if(!aType.attr("isnative").cast<bool>()) return false;
+    const char vKind = aType.kind();
+    const pybind11::ssize_t vSize = aType.itemsize();
+    if(vKind == 'u' && vSize == 1) aOut = piw::DataType::UInt8;
+    else if(vKind == 'u' && vSize == 2) aOut = piw::DataType::UInt16;
+    else if(vKind == 'u' && vSize == 4) aOut = piw::DataType::UInt32;
+    else if(vKind == 'f' && vSize == 4) aOut = piw::DataType::Float32;
+    else return false;
+    return true;
+}
+
+// The element strides of a 3-D array along Imaris X, Y, Z (its axes 0, 1, 2), checked for the
+// library: positive multiples of the element size, aligned data (an axis of one element may have
+// any stride).
+void elementStrides(const pybind11::array& aArray, const char* aName, int64_t aStride[3])
+{
+    const pybind11::ssize_t vSize = aArray.itemsize();
+    if(reinterpret_cast<uintptr_t>(aArray.data()) % (uintptr_t)vSize != 0){
+        throw pybind11::value_error(std::string(aName) + " is not aligned to its element size");
+    }
+    for(int i = 0; i < 3; ++i){
+        const pybind11::ssize_t vStride = aArray.strides(i);
+        if(aArray.shape(i) == 1){ aStride[i] = 1; continue; }
+        if(vStride <= 0 || vStride % vSize != 0){
+            throw pybind11::value_error(std::string(aName) + " needs positive strides that are multiples of its element size");
+        }
+        aStride[i] = (int64_t)(vStride / vSize);
+    }
 }
 
 // The whole command line (args without the program name); returns its exit code.
@@ -149,6 +311,24 @@ int pybind11_run_cli(const std::vector<std::string>& aArgs)
     }, nullptr);
 }
 
+// The metadata options of piw::ConvertOptions and piw::WriteOptions (same names).
+template <class Options>
+void setMetadata(Options& aOptions, const std::vector<std::string>& aChannelNames,
+                 const std::vector<std::array<float, 3> >& aChannelColors,
+                 const std::vector<float>& aEmissionWavelengths, const std::vector<float>& aExcitationWavelengths,
+                 double aTimeInterval, const std::string& aStartTime)
+{
+    aOptions.channelNames = aChannelNames;
+    for(size_t i = 0; i < aChannelColors.size(); ++i){
+        piw::Color vColor = {aChannelColors[i][0], aChannelColors[i][1], aChannelColors[i][2]};
+        aOptions.channelColors.push_back(vColor);
+    }
+    aOptions.emissionWavelengths = aEmissionWavelengths;
+    aOptions.excitationWavelengths = aExcitationWavelengths;
+    aOptions.timeInterval = aTimeInterval;
+    aOptions.startTime = aStartTime;
+}
+
 // piw::convert with every field of piw::ConvertOptions; sizes, voxel sizes and the box along the
 // input's axes 0, 1, 2 (Imaris X, Y, Z; with aXOnImarisX axis 1 is Imaris X and axis 0 Imaris Y).
 // None for a size or the box: not given.
@@ -160,7 +340,8 @@ void pybind11_convert(const std::string& aReader, const std::vector<std::vector<
                       const std::vector<std::array<float, 3> >& aChannelColors,
                       const std::vector<float>& aEmissionWavelengths,
                       const std::vector<float>& aExcitationWavelengths,
-                      double aTimeInterval, const std::string& aStartTime, bool aVerbose)
+                      double aTimeInterval, const std::string& aStartTime, bool aVerbose,
+                      const pybind11::object& aProgress)
 {
     piw::ConvertOptions vOptions;
     vOptions.reader = aReader;
@@ -172,21 +353,169 @@ void pybind11_convert(const std::string& aReader, const std::vector<std::vector<
     vOptions.hasProcessBlock = optionalSizes(aProcessBlock, "process_block", vOptions.processBlock);
     vOptions.numThreads = aNumThreads;
     vOptions.xOnImarisX = aXOnImarisX;
-    vOptions.channelNames = aChannelNames;
-    for(size_t i = 0; i < aChannelColors.size(); ++i){
-        piw::Color vColor = {aChannelColors[i][0], aChannelColors[i][1], aChannelColors[i][2]};
-        vOptions.channelColors.push_back(vColor);
-    }
-    vOptions.emissionWavelengths = aEmissionWavelengths;
-    vOptions.excitationWavelengths = aExcitationWavelengths;
-    vOptions.timeInterval = aTimeInterval;
-    vOptions.startTime = aStartTime;
+    setMetadata(vOptions, aChannelNames, aChannelColors, aEmissionWavelengths, aExcitationWavelengths,
+                aTimeInterval, aStartTime);
 
     CallState vState;
     vState.verbose = aVerbose;
+    vState.progress = aProgress;
     const piw::Callbacks vCallbacks = callbacksFor(vState);
     piw::Status vStatus = callOnWorker([&]() { return piw::convert(vOptions, vCallbacks); }, &vState);
     throwIfFailed(vStatus);
+    reportProgress(vState, true);
+}
+
+// piw::writeVolumes: aVolumes[channel*timepoints + timepoint] are 3-D arrays along Imaris X, Y, Z
+// (any positive strides; the wrapper gives views of the caller's arrays), all of one shape and
+// type; they are read in place.
+void pybind11_write_ims(const std::string& aOutputFile, const std::vector<pybind11::array>& aVolumes,
+                        unsigned aChannels, unsigned aTimepoints, const std::array<float, 3>& aVoxelSize,
+                        const pybind11::object& aBlockSize, int aNumThreads,
+                        const std::vector<std::string>& aChannelNames,
+                        const std::vector<std::array<float, 3> >& aChannelColors,
+                        const std::vector<float>& aEmissionWavelengths,
+                        const std::vector<float>& aExcitationWavelengths,
+                        double aTimeInterval, const std::string& aStartTime, bool aVerbose,
+                        const pybind11::object& aProgress)
+{
+    if(aVolumes.empty()) throw pybind11::value_error("No volumes were given");
+    piw::WriteOptions vOptions;
+    vOptions.outputFile = aOutputFile;
+    std::vector<piw::Volume> vVolumes(aVolumes.size());
+    for(size_t vI = 0; vI < aVolumes.size(); ++vI){
+        const pybind11::array& vArray = aVolumes[vI];
+        const std::string vName = "volume " + std::to_string(vI);
+        if(vArray.ndim() != 3) throw pybind11::value_error(vName + " is not 3-D");
+        piw::DataType vType;
+        if(!dataTypeOf(vArray.dtype(), vType)){
+            throw pybind11::type_error(vName + " is not uint8, uint16, uint32 or float32 in this machine's byte order");
+        }
+        if(!vI) vOptions.dataType = vType;
+        else if(vType != vOptions.dataType) throw pybind11::type_error("The volumes have different data types");
+        for(int i = 0; i < 3; ++i){
+            const uint64_t vSize = (uint64_t)vArray.shape(i);
+            if(!vI) vOptions.size[i] = vSize;
+            else if(vSize != vOptions.size[i]) throw pybind11::value_error("The volumes have different shapes");
+        }
+        elementStrides(vArray, vName.c_str(), vVolumes[vI].stride);
+        vVolumes[vI].data = vArray.data();
+    }
+    vOptions.channels = aChannels;
+    vOptions.timepoints = aTimepoints;
+    for(int i = 0; i < 3; ++i) vOptions.voxelSize[i] = aVoxelSize[i];
+    vOptions.hasBlockSize = optionalSizes(aBlockSize, "block_size", vOptions.blockSize);
+    vOptions.numThreads = aNumThreads;
+    setMetadata(vOptions, aChannelNames, aChannelColors, aEmissionWavelengths, aExcitationWavelengths,
+                aTimeInterval, aStartTime);
+
+    CallState vState;
+    vState.verbose = aVerbose;
+    vState.progress = aProgress;
+    const piw::Callbacks vCallbacks = callbacksFor(vState);
+    piw::Status vStatus = callOnWorker([&]() { return piw::writeVolumes(vOptions, vVolumes, vCallbacks); }, &vState);
+    throwIfFailed(vStatus);
+    reportProgress(vState, true);
+}
+
+// piw::readIms of the region [aStart, aEnd) (Imaris X, Y, Z) into aOut, a writeable 3-D array of
+// the region's shape along X, Y, Z (any positive strides) and the file's type.
+void pybind11_read_ims(const std::string& aFile, unsigned aLevel, unsigned aTimepoint, unsigned aChannel,
+                       const std::array<uint64_t, 3>& aStart, const std::array<uint64_t, 3>& aEnd,
+                       pybind11::array aOut, int aNumThreads)
+{
+    if(aOut.ndim() != 3) throw pybind11::value_error("out is not 3-D");
+    if(!aOut.writeable()) throw pybind11::value_error("out is not writeable");
+    piw::DataType vType;
+    if(!dataTypeOf(aOut.dtype(), vType)){
+        throw pybind11::type_error("out is not uint8, uint16, uint32 or float32 in this machine's byte order");
+    }
+    for(int i = 0; i < 3; ++i){
+        if(aEnd[i] > aStart[i] && (uint64_t)aOut.shape(i) != aEnd[i] - aStart[i]){
+            throw pybind11::value_error("out does not have the region's shape");
+        }
+    }
+    int64_t vStride[3];
+    elementStrides(aOut, "out", vStride);
+    void* vOut = aOut.mutable_data();
+    CallState vState;
+    piw::Status vStatus = callOnWorker([&]() {
+        return piw::readIms(aFile, aLevel, aTimepoint, aChannel, aStart.data(), aEnd.data(), vType, vOut, vStride,
+                            aNumThreads);
+    }, &vState);
+    throwIfFailed(vStatus);
+}
+
+pybind11::tuple triple(const uint64_t aValues[3])
+{
+    return pybind11::make_tuple(aValues[0], aValues[1], aValues[2]);
+}
+
+pybind11::tuple triple(const float aValues[3])
+{
+    return pybind11::make_tuple(aValues[0], aValues[1], aValues[2]);
+}
+
+// piw::imsInfo as a dict; sizes and extents along Imaris X, Y, Z; CRCs None without aChecksums.
+pybind11::dict pybind11_ims_info(const std::string& aFile, bool aChecksums)
+{
+    CallState vState;
+    std::pair<piw::Status, piw::ImsInfo> vResult = callOnWorker([&]() {
+        std::pair<piw::Status, piw::ImsInfo> vInfo;
+        vInfo.first = piw::imsInfo(aFile, vInfo.second, aChecksums);
+        return vInfo;
+    }, &vState);
+    throwIfFailed(vResult.first);
+    const piw::ImsInfo& vInfo = vResult.second;
+    pybind11::object vNone = pybind11::none();
+    pybind11::dict vDict;
+    vDict["size"] = triple(vInfo.size);
+    vDict["channels"] = vInfo.channels;
+    vDict["timepoints"] = vInfo.timepoints;
+    vDict["levels"] = vInfo.levels;
+    vDict["data_type"] = dataTypeName(vInfo.dataType);
+    vDict["extent_min"] = triple(vInfo.extentMin);
+    vDict["extent_max"] = triple(vInfo.extentMax);
+    vDict["voxel_size"] = triple(vInfo.voxelSize);
+    pybind11::list vNames, vColors, vTimes, vDatasets, vAttributes;
+    for(size_t i = 0; i < vInfo.channelNames.size(); ++i) vNames.append(text(vInfo.channelNames[i]));
+    for(size_t i = 0; i < vInfo.channelColors.size(); ++i) vColors.append(text(vInfo.channelColors[i]));
+    for(size_t i = 0; i < vInfo.timePoints.size(); ++i) vTimes.append(text(vInfo.timePoints[i]));
+    vDict["channel_names"] = vNames;
+    vDict["channel_colors"] = vColors;
+    vDict["time_points"] = vTimes;
+    vDict["thumbnail_crc"] = aChecksums ? pybind11::object(pybind11::int_(vInfo.thumbnailCrc)) : vNone;
+    for(size_t i = 0; i < vInfo.datasets.size(); ++i){
+        const piw::ImsDataset& vSet = vInfo.datasets[i];
+        pybind11::dict vEntry;
+        vEntry["level"] = vSet.level;
+        vEntry["timepoint"] = vSet.timepoint;
+        vEntry["channel"] = vSet.channel;
+        vEntry["size"] = triple(vSet.size);
+        vEntry["chunk"] = triple(vSet.chunk);
+        vEntry["chunks"] = vSet.chunks;
+        vEntry["crc"] = aChecksums ? pybind11::object(pybind11::int_(vSet.crc)) : vNone;
+        vEntry["histogram_crc"] = aChecksums ? pybind11::object(pybind11::int_(vSet.histogramCrc)) : vNone;
+        vDatasets.append(vEntry);
+    }
+    vDict["datasets"] = vDatasets;
+    for(size_t i = 0; i < vInfo.attributes.size(); ++i){
+        vAttributes.append(pybind11::make_tuple(text(vInfo.attributes[i].first), text(vInfo.attributes[i].second)));
+    }
+    vDict["attributes"] = vAttributes;
+    return vDict;
+}
+
+// piw::imsDataset: (size along Imaris X, Y, Z, type name) of one dataset.
+pybind11::tuple pybind11_ims_dataset(const std::string& aFile, unsigned aLevel, unsigned aTimepoint, unsigned aChannel)
+{
+    uint64_t vSize[3] = {0, 0, 0};
+    piw::DataType vType = piw::DataType::UInt16;
+    CallState vState;
+    piw::Status vStatus = callOnWorker([&]() {
+        return piw::imsDataset(aFile, aLevel, aTimepoint, aChannel, vSize, vType);
+    }, &vState);
+    throwIfFailed(vStatus);
+    return pybind11::make_tuple(triple(vSize), dataTypeName(vType));
 }
 
 std::vector<std::vector<std::string> > pybind11_find_input_files(const std::vector<std::string>& aFolders,
@@ -227,8 +556,33 @@ PYBIND11_MODULE(parallel_imaris_writer, m) {
           pybind11::arg("emission_wavelengths") = std::vector<float>(),
           pybind11::arg("excitation_wavelengths") = std::vector<float>(),
           pybind11::arg("time_interval") = 0.0, pybind11::arg("start_time") = std::string(),
-          pybind11::arg("verbose") = false,
+          pybind11::arg("verbose") = false, pybind11::arg("progress") = pybind11::none(),
           "Convert files[channel][timepoint] to one .ims (piw::convert; sizes along the input's axes 0, 1, 2)");
+
+    m.def("pybind11_write_ims", &pybind11_write_ims, pybind11::arg("output_file"), pybind11::arg("volumes"),
+          pybind11::arg("channels"), pybind11::arg("timepoints"), pybind11::arg("voxel_size"),
+          pybind11::arg("block_size") = pybind11::none(), pybind11::arg("num_threads") = 0,
+          pybind11::arg("channel_names") = std::vector<std::string>(),
+          pybind11::arg("channel_colors") = std::vector<std::array<float, 3> >(),
+          pybind11::arg("emission_wavelengths") = std::vector<float>(),
+          pybind11::arg("excitation_wavelengths") = std::vector<float>(),
+          pybind11::arg("time_interval") = 0.0, pybind11::arg("start_time") = std::string(),
+          pybind11::arg("verbose") = false, pybind11::arg("progress") = pybind11::none(),
+          "Write volumes[channel*timepoints + timepoint] (3-D arrays along Imaris X, Y, Z) to one .ims "
+          "(piw::writeVolumes)");
+
+    m.def("pybind11_read_ims", &pybind11_read_ims, pybind11::arg("file"), pybind11::arg("level"),
+          pybind11::arg("timepoint"), pybind11::arg("channel"), pybind11::arg("start"), pybind11::arg("end"),
+          pybind11::arg("out"), pybind11::arg("num_threads") = 0,
+          "Read the region [start, end) (Imaris X, Y, Z) of one dataset into out, viewed along X, Y, Z "
+          "(piw::readIms)");
+
+    m.def("pybind11_ims_info", &pybind11_ims_info, pybind11::arg("file"), pybind11::arg("checksums") = false,
+          "The sizes, datasets and attributes of an .ims file, along Imaris X, Y, Z (piw::imsInfo)");
+
+    m.def("pybind11_ims_dataset", &pybind11_ims_dataset, pybind11::arg("file"), pybind11::arg("level"),
+          pybind11::arg("timepoint"), pybind11::arg("channel"),
+          "(size along Imaris X, Y, Z, data type name) of one dataset, without listing chunks (piw::imsDataset)");
 
     m.def("pybind11_find_input_files", &pybind11_find_input_files, pybind11::arg("folders"), pybind11::arg("patterns"),
           "The command line's input files: files[channel][timepoint]");

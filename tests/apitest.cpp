@@ -19,13 +19,14 @@
 //     names; the same options as command-line flags, or given to writeVolumes with the same data,
 //     give the same file; writeVolumes without a start time takes the current time; bad metadata
 //     options are refused before any output; imsmeta.h's time and color helpers
-//   - piw::writeVolumes and the read-back (piw::imsInfo, piw::readIms): uint8, uint16, uint32
-//     and float32 volumes of odd sizes, one plane and smaller than a block read back equal to
-//     the source at every level (and equal to tests/imsutil.h's independent decoder); the same
-//     data in other memory layouts ((z, y, x) C order, z fastest, gaps) and with other block
-//     sizes gives the same file (CRCs, histograms, attributes, thumbnail); writeVolumes equals
-//     convert of Zarrs of the same data (2 channels x 2 time points); level 1 is the 2x2x2 mean;
-//     region reads into strided outputs; error returns
+//   - piw::writeVolumes and the read-back (piw::imsInfo, piw::imsDataset, piw::readIms): uint8,
+//     uint16, uint32 and float32 volumes of odd sizes, one plane and smaller than a block read
+//     back equal to the source at every level (and equal to tests/imsutil.h's independent
+//     decoder); imsDataset gives imsInfo's size and type at every level; the same data in other
+//     memory layouts ((z, y, x) C order, z fastest, gaps) and with other block sizes gives the
+//     same file (CRCs, histograms, attributes, thumbnail); writeVolumes equals convert of Zarrs of
+//     the same data (2 channels x 2 time points); level 1 is the 2x2x2 mean; region reads into
+//     strided outputs; error returns
 //   - xOnImarisX: the image's x on Imaris X, for Zarr and TIFF, equals writeVolumes of the
 //     transposed data
 //   - bounding boxes on TIFF input (-B, through the API and the executable, whole and with -C)
@@ -490,6 +491,15 @@ template<typename T> static void volumeRoundTrip(const fs::path& work, const Dim
         }
     }
     check(levelsOk, "readIms: level 0 equals the source; every level equals imsReadVolume");
+    bool datasetsOk = true;
+    for(const piw::ImsDataset& ds : info.datasets){
+        uint64_t size[3] = {0, 0, 0};
+        piw::DataType type = piw::DataType::UInt8;
+        const piw::Status ss = piw::imsDataset(native(a), ds.level, 0, 0, size, type);
+        datasetsOk = datasetsOk && ss.ok() && type == typeOf<T>() && size[0] == ds.size[0] && size[1] == ds.size[1] &&
+                     size[2] == ds.size[2];
+    }
+    check(datasetsOk, "imsDataset: the size and type imsInfo gives, at every level");
     if(!layouts) return;
 
     // The same voxels in other layouts: the file does not change.
@@ -647,6 +657,14 @@ static void testVolumes(const fs::path& work, const fs::path& mdir){
         { std::ofstream(work/"not_hdf5.ims") << "not an hdf5 file"; }
         s = piw::imsInfo(native(work/"not_hdf5.ims"), info);
         check(s.code == piw::Code::ReadFailed, "imsInfo of a text file: ReadFailed (" + s.message + ")");
+        uint64_t size[3];
+        piw::DataType type;
+        s = piw::imsDataset(native(out), 9, 0, 0, size, type);
+        check(s.code == piw::Code::InvalidArgument, "imsDataset of a missing level: InvalidArgument (" + s.message + ")");
+        s = piw::imsDataset(native(work/"no_such.ims"), 0, 0, 0, size, type);
+        check(s.code == piw::Code::NotFound, "imsDataset of a missing file: NotFound (" + s.message + ")");
+        s = piw::imsDataset(native(work/"not_hdf5.ims"), 0, 0, 0, size, type);
+        check(s.code == piw::Code::ReadFailed, "imsDataset of a text file: ReadFailed (" + s.message + ")");
     }
 }
 

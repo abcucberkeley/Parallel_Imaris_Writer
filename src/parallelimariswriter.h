@@ -172,6 +172,11 @@ struct ImsInfo {
 
 PIW_API Status imsInfo(const std::string& file, ImsInfo& info, bool checksums = false) noexcept;
 
+// The size (ImageSizeX/Y/Z) and sample type of one dataset, cheap for a file of any size (imsInfo
+// counts the chunks of every dataset). InvalidArgument when the file has no such dataset.
+PIW_API Status imsDataset(const std::string& file, unsigned level, unsigned timepoint, unsigned channel,
+                          uint64_t size[3], DataType& dataType) noexcept;
+
 // Reads the region [start, end) of one dataset into out: element (x, y, z) of the region goes to
 // out[(x - start[0])*stride[0] + (y - start[1])*stride[1] + (z - start[2])*stride[2]] (strides
 // positive, in elements). dataType must be the file's. numThreads > 0 sets the number of decoding

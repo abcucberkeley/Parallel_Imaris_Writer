@@ -1,4 +1,4 @@
-// Reading back .ims files: piw::imsInfo and piw::readIms (src/parallelimariswriter.h).
+// Reading back .ims files: piw::imsInfo, piw::imsDataset and piw::readIms (src/parallelimariswriter.h).
 //
 // An Imaris 5.5 .ims file is HDF5: /DataSet/ResolutionLevel l/TimePoint t/Channel c holds a
 // chunked 3-D Data dataset (dims z, y, x) next to its Histogram datasets, and /DataSetInfo holds
@@ -586,6 +586,23 @@ Status infoLocked(const std::string& aFile, ImsInfo& aInfo, bool aChecksums){
     return Status();
 }
 
+Status datasetLocked(const std::string& aFile, unsigned aLevel, unsigned aTimepoint, unsigned aChannel,
+                     uint64_t aSize[3], DataType& aType){
+    Hid vFile;
+    Status vStatus = openFile(aFile, vFile);
+    if(!vStatus.ok()) return vStatus;
+    if(!pathExists(vFile, datasetGroup(0, 0, 0))){
+        return Status(Code::ReadFailed, aFile + " is not an .ims file (it has no " + datasetGroup(0, 0, 0) + ").");
+    }
+    const std::string vGroup = datasetGroup(aLevel, aTimepoint, aChannel), vPath = vGroup + "/Data";
+    if(!pathExists(vFile, vPath)) return Status(Code::InvalidArgument, aFile + " has no " + vPath + ".");
+    vStatus = imageSize(vFile, vGroup, aSize);
+    if(!vStatus.ok()) return vStatus;
+    Hid vData(H5Dopen2(vFile, vPath.c_str(), H5P_DEFAULT), H5Dclose);
+    if(!vData.valid()) return Status(Code::ReadFailed, "could not open " + vPath);
+    return dataTypeOf(vData, vPath, aType);
+}
+
 Status readLocked(const std::string& aFile, unsigned aLevel, unsigned aTimepoint, unsigned aChannel,
                   const uint64_t aStart[3], const uint64_t aEnd[3], DataType aType, void* aOut,
                   const int64_t aStride[3], int aThreads){
@@ -694,6 +711,18 @@ Status imsInfo(const std::string& file, ImsInfo& info, bool checksums) noexcept{
         std::lock_guard<std::mutex> vLock(detail::libraryMutex());
         QuietErrors vQuiet;
         return infoLocked(file, info, checksums);
+    }
+    catch(const std::exception& vError){ return internalError(vError.what()); }
+    catch(...){ return internalError("unknown exception"); }
+}
+
+Status imsDataset(const std::string& file, unsigned level, unsigned timepoint, unsigned channel,
+                  uint64_t size[3], DataType& dataType) noexcept{
+    try{
+        if(!size) return Status(Code::InvalidArgument, "imsDataset needs an output for the size.");
+        std::lock_guard<std::mutex> vLock(detail::libraryMutex());
+        QuietErrors vQuiet;
+        return datasetLocked(file, level, timepoint, channel, size, dataType);
     }
     catch(const std::exception& vError){ return internalError(vError.what()); }
     catch(...){ return internalError("unknown exception"); }
