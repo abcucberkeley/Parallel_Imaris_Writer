@@ -134,9 +134,12 @@ static void registerLz4Stub(){
     H5Zregister(&c);
 }
 
+// A plain stream copy: std::filesystem::copy_file aborts the process on macOS (GCC 13).
 static fs::path copyOf(const fs::path& src, const std::string& name){
     fs::path dst = gWork/(name + ".ims");
-    fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
+    std::ifstream in(src, std::ios::binary); std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+    if(!in || !out){ std::fprintf(stderr, "cannot copy %s\n", src.string().c_str()); std::exit(1); }
+    out << in.rdbuf();
     return dst;
 }
 static Hid openRW(const fs::path& p){ return Hid(H5Fopen(p.string().c_str(), H5F_ACC_RDWR, H5P_DEFAULT), H5Fclose); }
