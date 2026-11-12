@@ -15,6 +15,9 @@
 //     before the first block, after a few, part-way, after the last one, after a failed write and with
 //     an output folder that does not exist, many times: Destroy returns, the file has no /DataSetInfo
 //     and no histograms; after Finish it is complete
+//   - the early writeback (Linux): its helper thread runs while a file is written and is gone, with its
+//     descriptor of the output, when the call returns -- after the file is written, a cancel, a failed
+//     read and a failed write; the timing callback (once, only for a written file) and PIW_TIMING=1
 //   - two conversions one after the other, two at once from two threads, numThreads (and the
 //     caller's OpenMP setting restored), piw::runCli twice in one process
 //   - metadata (A-10): every /DataSetInfo attribute with the defaults (names "Channel c", R/G/B,
@@ -1244,6 +1247,175 @@ static void destroyTests(const fs::path& work, int reps){
     fs::remove_all(dir);
 }
 
+// --- The early writeback (src/converter.cpp's Writeback) and the timing callback ---
+// On Linux a helper thread named "piw-writeback" holds a descriptor of the output while it is written. It
+// must be joined, and the descriptor closed, before convert or writeVolumes returns: when the file is
+// written, and on every early stop (a cancel, which is also what Python's Ctrl-C does; a failed read; a
+// failed write), before the partial file is removed.
+
+struct Timed {
+    std::atomic<int> polls{0};
+    int cancelAt = 0;          // 0: never
+    int sleepMs = 0;           // per poll, so that the conversion lasts long enough for the helper to run
+    bool sawHelper = false;
+    int timingCalls = 0;
+    double read = -1, feed = -1, finish = -1;
+};
+
+#if defined(__linux__)
+static int helperThreads(){
+    int n = 0;
+    std::error_code ec;
+    for(const auto& e : fs::directory_iterator("/proc/self/task", ec)){
+        std::string comm = readText(e.path()/"comm");
+        while(!comm.empty() && (comm.back() == '\n' || comm.back() == '\r')) comm.pop_back();
+        if(comm == "piw-writeback") ++n;
+    }
+    return n;
+}
+
+// The process's descriptors of the file (also once it is removed: "<path> (deleted)").
+static int openDescriptors(const fs::path& file){
+    std::error_code ec;
+    const std::string path = (fs::canonical(fs::absolute(file).parent_path(), ec)/file.filename()).string();
+    int n = 0;
+    for(const auto& e : fs::directory_iterator("/proc/self/fd", ec)){
+        std::error_code ec2;
+        const std::string target = fs::read_symlink(e.path(), ec2).string();
+        if(!ec2 && (target == path || target == path + " (deleted)")) ++n;
+    }
+    return n;
+}
+#else
+static int helperThreads(){ return 0; }
+static int openDescriptors(const fs::path&){ return 0; }
+#endif
+
+static int onTimedCancel(void* user){
+    Timed* t = (Timed*)user;
+    const int n = ++t->polls;
+    if(t->sleepMs) std::this_thread::sleep_for(std::chrono::milliseconds(t->sleepMs));
+    if(helperThreads() > 0) t->sawHelper = true;
+    return t->cancelAt > 0 && n >= t->cancelAt;
+}
+static void onTiming(double read, double feed, double finish, void* user){
+    Timed* t = (Timed*)user;
+    ++t->timingCalls; t->read = read; t->feed = feed; t->finish = finish;
+}
+static piw::Callbacks timedCallbacks(Timed& t){
+    piw::Callbacks cb;
+    cb.cancel = onTimedCancel; cb.timing = onTiming; cb.user = &t;
+    return cb;
+}
+
+static void writebackTests(const std::string& exe, const fs::path& work, const fs::path& zdir, const fs::path& trunc){
+    std::printf("[writeback and timing]\n");
+#if defined(__linux__)
+    const bool onLinux = true;
+#else
+    const bool onLinux = false;
+#endif
+    // 256 x 256 x 128 uint16 in 64^3 blocks: 32 blocks, a poll after each (and one before the volume)
+    const Dims d = {256, 256, 128};
+    const std::vector<uint16_t> v = makeTyped<uint16_t>(d, 3);
+    const int64_t st[3] = {1, (int64_t)d.x, (int64_t)(d.x*d.y)};
+    piw::Volume vol; vol.data = v.data(); vol.stride[0] = st[0]; vol.stride[1] = st[1]; vol.stride[2] = st[2];
+    // the call returned: no descriptor of the output, and no helper thread. join() returns when the kernel
+    // clears the thread's id, a moment before the thread leaves /proc/self/task: a joined thread is gone
+    // within that wait, a helper that was not stopped would still be listed (it runs until stopped).
+    auto released = [&](const fs::path& out){
+        const int fds = openDescriptors(out);
+        int threads = helperThreads();
+        for(int i = 0; i < 100 && threads; ++i){
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            threads = helperThreads();
+        }
+        return std::string(threads ? std::to_string(threads) + " helper thread(s) left; " : "") +
+               (fds ? std::to_string(fds) + " descriptor(s) of the output left" : "");
+    };
+    {
+        const fs::path out = work/"wb_written.ims";
+        Timed t; t.sleepMs = 40;   // about 1.3 s of feeding: the helper asks for the writeback twice
+        const piw::Status s = piw::writeVolumes(writeOptions(out, piw::DataType::UInt16, d), {vol}, timedCallbacks(t));
+        const std::string left = released(out);
+        check(s.ok() && fs::exists(out) && infoOf(out).datasets.size() > 1, "written: ok, a complete file (" + s.message + ")");
+        check(!onLinux || t.sawHelper, "written: the helper thread ran while the file was written");
+        check(left.empty(), "written: the helper is joined and its descriptor closed when the call returns " + left);
+        check(t.timingCalls == 1 && t.read == 0 && t.feed >= 1.2 && t.finish >= 0 && t.finish < 60,
+              "written: the timing callback once (read " + std::to_string(t.read) + " s, feed " + std::to_string(t.feed) +
+              " s, finish " + std::to_string(t.finish) + " s)");
+        fs::remove(out);
+    }
+    for(int rep = 0; rep < 2; ++rep){
+        const fs::path out = work/"wb_cancel.ims";
+        Timed t; t.sleepMs = 40; t.cancelAt = 20;   // after 0.8 s
+        const piw::Status s = piw::writeVolumes(writeOptions(out, piw::DataType::UInt16, d), {vol}, timedCallbacks(t));
+        const std::string left = released(out);
+        check(s.code == piw::Code::Cancelled && !fs::exists(out) && (!onLinux || t.sawHelper) && left.empty() && t.timingCalls == 0,
+              "cancel part-way: Cancelled, the helper (seen running) joined and its descriptor closed, output removed, "
+              "no timing " + left);
+    }
+    {
+        // a truncated chunk: the read fails after the writer (and its helper) started
+        const fs::path out = work/"wb_trunc.ims";
+        Timed t;
+        piw::ConvertOptions o = optionsFor("zarr", findFiles(trunc, {"CamA"}), out, "");
+        const piw::Status s = piw::convert(o, timedCallbacks(t));
+        const std::string left = released(out);
+        check(s.code == piw::Code::ReadFailed && !fs::exists(out) && (!onLinux || t.sawHelper) && left.empty() && t.timingCalls == 0,
+              "failed read: ReadFailed, the helper joined and its descriptor closed, output removed " + left);
+    }
+#ifndef _WIN32
+    {
+        // a failed write: a file-size limit (SIGXFSZ ignored, so the write fails with EFBIG) below the size of
+        // the file, whose random data does not compress
+        std::vector<uint16_t> noise(d.n());
+        std::mt19937 rng(7);
+        for(auto& x : noise) x = (uint16_t)(rng() & 0xffff);
+        piw::Volume nv = vol; nv.data = noise.data();
+        const fs::path out = work/"wb_limit.ims";
+        Timed t; t.sleepMs = 5;
+        struct rlimit before;
+        getrlimit(RLIMIT_FSIZE, &before);
+        void (*handler)(int) = signal(SIGXFSZ, SIG_IGN);
+        std::fflush(stdout);
+        struct rlimit limit = before;
+        limit.rlim_cur = 1 << 20;
+        setrlimit(RLIMIT_FSIZE, &limit);
+        const piw::Status s = piw::writeVolumes(writeOptions(out, piw::DataType::UInt16, d), {nv}, timedCallbacks(t));
+        setrlimit(RLIMIT_FSIZE, &before);
+        signal(SIGXFSZ, handler);
+        const std::string left = released(out);
+        check(s.code == piw::Code::WriteFailed && !fs::exists(out) && (!onLinux || t.sawHelper) && left.empty() && t.timingCalls == 0,
+              "failed write (file-size limit): WriteFailed, the helper joined and its descriptor closed, output removed (" +
+              s.message + ") " + left);
+    }
+#endif
+    {
+        // the command line prints the timing line on stderr with PIW_TIMING=1 only
+        const fs::path od = work/"wb_cli"; fs::create_directories(od);
+        const std::string args = "-P CamA -F \"" + native(zdir) + "\" -o \"" + native(od) + "\" -r zarr -v 1,1,1";
+#ifdef _WIN32
+        _putenv_s("PIW_TIMING", "1");
+#else
+        setenv("PIW_TIMING", "1", 1);
+#endif
+        const int rc = runExe(exe, args, work/"wb_cli_timing.log");
+#ifdef _WIN32
+        _putenv_s("PIW_TIMING", "");
+#else
+        unsetenv("PIW_TIMING");
+#endif
+        const std::string withTiming = readText(work/"wb_cli_timing.log");
+        const int rc2 = runExe(exe, args, work/"wb_cli_plain.log");
+        const std::string plain = readText(work/"wb_cli_plain.log");
+        check(rc == 0 && countLines(withTiming, "Timing: read ") == 1 && withTiming.find(" s, finish and close ") != std::string::npos,
+              "PIW_TIMING=1: one timing line");
+        check(rc2 == 0 && plain.find("Timing:") == std::string::npos, "without PIW_TIMING: no timing line");
+        fs::remove_all(od);
+    }
+}
+
 int main(int argc, char** argv){
     if(argc >= 4 && std::string(argv[1]) == "--tiff") return tiffTiming(argv[2], argv[3], argc > 4 ? argv[4] : nullptr);
     if(argc < 2){ std::fprintf(stderr, "usage: %s <parallelimariswriter> [workdir]\n", argv[0]); return 2; }
@@ -1396,6 +1568,7 @@ int main(int argc, char** argv){
               "cancel on poll " + std::to_string(poll) + ": Cancelled, output removed");
     }
     destroyTests(work, 5);
+    writebackTests(exe, work, zdir, trunc);
 
     // --- 4. calls in sequence, at once, with numThreads; runCli twice ---
     std::printf("[calls]\n");

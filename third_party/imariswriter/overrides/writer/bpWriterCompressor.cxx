@@ -14,11 +14,22 @@
  *   limitations under the License.                                        *
  ***************************************************************************/
 // Modified for Parallel_Imaris_Writer (see third_party/imariswriter/README.md): adds Close(), creates the
-// HDF5 writer in the constructor (not in the writer thread, where a block's write could come first), and
-// creates the threads after the members they use (they are declared last).
+// HDF5 writer in the constructor (not in the writer thread, where a block's write could come first),
+// creates the threads after the members they use (they are declared last), and gives the blocks between
+// compressed and written an in-flight budget of at least 2 GB.
 #include "bpWriterCompressor.h"
 #include "bpWriterThreads.h"
 #include "bpThreadPool.h"
+
+#include <algorithm>
+
+
+// The memory (MB) for the blocks that are complete but not written yet (raw and compressed). Upstream it
+// is threads*3 + 32 (56 MB at 8 threads, about 27 blocks): every stall of the HDF5 writer thread, which
+// shares the file with the kernel's writeback, then stopped the compression threads at once. The budget
+// bounds the memory, it does not allocate it: memory is taken only while blocks wait for the writer (and
+// kept for reuse until the converter is destroyed).
+static const bpSize kMinInFlightBufferMB = 2048;
 
 
 bpWriterCompressor::bpWriterCompressor(
@@ -33,7 +44,7 @@ bpWriterCompressor::bpWriterCompressor(
   mNumberOfIncrements(0),
   mTotalBytesWritten(0),
   mCallbackThread(std::make_unique<bpThreadPool>(1)),
-  mThreads(std::make_unique<bpWriterThreads>(aNumberOfCompressionThreads * 3 + 32, aNumberOfCompressionThreads, std::make_shared<bpCompressionAlgorithmFactory>(), aCompressionAlgorithmType, aImageLayout.GetDataType()))
+  mThreads(std::make_unique<bpWriterThreads>(std::max<bpSize>(aNumberOfCompressionThreads * 3 + 32, kMinInFlightBufferMB), aNumberOfCompressionThreads, std::make_shared<bpCompressionAlgorithmFactory>(), aCompressionAlgorithmType, aImageLayout.GetDataType()))
 {
   if (mProgressCallback) {
     for (bpSize vIndex = 0; vIndex < aImageLayout.GetNumberOfResolutionLevels(); vIndex++) {

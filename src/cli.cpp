@@ -71,6 +71,12 @@ void MessageCallback(const char* aText, void*)
     if(!strncmp(aText, "Current File: ", 14)) fflush(stdout);
 }
 
+// PIW_TIMING=1: one line on stderr when the file is written.
+void TimingCallback(double aReadSeconds, double aFeedSeconds, double aFinishSeconds, void*)
+{
+    fprintf(stderr, "Timing: read %.2f s, feed %.2f s, finish and close %.2f s\n", aReadSeconds, aFeedSeconds, aFinishSeconds);
+}
+
 int cliError(const std::string& aText)
 {
     fprintf(stderr, "ERROR: %s\n", aText.c_str());
@@ -482,6 +488,8 @@ int convertToImaris(int argc, char **argv)
     vCallbacks.message = MessageCallback;
     vCallbacks.progress = ProgressCallback;
     vCallbacks.user = &aCallbackUserData;
+    const char* vTiming = getenv("PIW_TIMING");
+    if(vTiming && !strcmp(vTiming, "1")) vCallbacks.timing = TimingCallback;
 
     return cliExitCode(piw::convert(vOptions, vCallbacks));
 }

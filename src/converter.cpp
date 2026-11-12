@@ -38,9 +38,16 @@
 #if defined(__SSE2__)
 #include <emmintrin.h>
 #endif
+#if defined(__linux__)
+#include <fcntl.h>
+#include <pthread.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <exception>
 #include <mutex>
 #include <thread>
@@ -295,6 +302,84 @@ void removeOutput(const std::string& aFile){
     if(stat(aFile.c_str(), &vInfo) == 0 && (vInfo.st_mode & S_IFMT) == S_IFREG) remove(aFile.c_str());
 }
 
+typedef std::chrono::steady_clock Clock;
+
+double secondsSince(Clock::time_point aStart){
+    return std::chrono::duration<double>(Clock::now() - aStart).count();
+}
+
+// Starts the kernel's writeback of the output while it is being written (Linux; elsewhere a no-op).
+// The kernel writes a file back only after about 30 s or when dirty memory passes a share of the
+// RAM (tens of GB on a large node), so most of a big output was still in memory when the Imaris
+// writer closed the file, and the close then blocked for 14-39 s per 43 GB on a network file
+// system. A helper thread asks for the writeback of the dirty pages every 500 ms
+// (sync_file_range, SYNC_FILE_RANGE_WRITE: it starts the writes and changes no byte); a file
+// system that rejects the call is left alone. stop() joins the thread and closes its descriptor:
+// ImsWriter calls it when Finish has returned, and on every early stop (a cancel, a read or write
+// failure) before it destroys the Imaris writer and removes the partial file.
+class Writeback {
+public:
+    Writeback() : mStop(false) {}
+    ~Writeback(){ stop(); }
+    void start(const std::string& aFile);
+    void stop();
+private:
+    Writeback(const Writeback&);
+    Writeback& operator=(const Writeback&);
+    void run(int aFd);
+
+    std::mutex mMutex;
+    std::condition_variable mWake;
+    bool mStop;
+    std::thread mThread;
+};
+
+#if defined(__linux__)
+void Writeback::start(const std::string& aFile){
+    if(mThread.joinable()) return;
+    const int vFd = open(aFile.c_str(), O_RDONLY | O_CLOEXEC);
+    if(vFd < 0) return;
+    {
+        std::lock_guard<std::mutex> vLock(mMutex);
+        mStop = false;
+    }
+    try{
+        mThread = std::thread(&Writeback::run, this, vFd);
+    }
+    catch(...){
+        close(vFd);   // no thread: the conversion runs without the early writeback
+        return;
+    }
+    pthread_setname_np(mThread.native_handle(), "piw-writeback");   // named before start returns
+}
+
+void Writeback::run(int aFd){
+    std::unique_lock<std::mutex> vLock(mMutex);
+    bool vSupported = true;
+    while(vSupported && !mWake.wait_for(vLock, std::chrono::milliseconds(500), [this]{ return mStop; })){
+        vLock.unlock();
+        vSupported = sync_file_range(aFd, 0, 0, SYNC_FILE_RANGE_WRITE) == 0 || errno == EINTR;
+        vLock.lock();
+    }
+    vLock.unlock();
+    close(aFd);
+}
+
+void Writeback::stop(){
+    if(!mThread.joinable()) return;
+    {
+        std::lock_guard<std::mutex> vLock(mMutex);
+        mStop = true;
+    }
+    mWake.notify_all();
+    mThread.join();
+}
+#else
+void Writeback::start(const std::string&){}
+void Writeback::run(int){}
+void Writeback::stop(){}
+#endif
+
 // Owns a buffer the readers allocated with malloc.
 class ReadBuffer {
 public:
@@ -474,7 +559,8 @@ bool validDataType(DataType aType){
 class ImsWriter {
 public:
     explicit ImsWriter(const Callbacks& aCallbacks)
-        : mCallbacks(aCallbacks), mConverter(NULL), mDataType(DataType::UInt16), mBuffer(NULL), mFinished(false) {}
+        : mCallbacks(aCallbacks), mConverter(NULL), mDataType(DataType::UInt16), mBuffer(NULL), mFinished(false),
+          mFeedSeconds(0), mFinishSeconds(0) {}
     ~ImsWriter();
 
     Status open(DataType aDataType, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
@@ -484,7 +570,10 @@ public:
     // (NULL: all zero padding).
     Status writeRegion(uint64_t aC, uint64_t aT, const uint64_t aBlockBase[3], const uint64_t aBlockLimit[3],
                        const void* aSrc, uint64_t aX0, uint64_t aY0, uint64_t aZ0, const int64_t aStride[3]);
+    // Finish, then (when that succeeded) destroys the Imaris writer: the file is complete and closed.
     Status finish();
+    double feedSeconds() const { return mFeedSeconds; }       // in writeRegion
+    double finishSeconds() const { return mFinishSeconds; }   // in finish
 
 private:
     ImsWriter(const ImsWriter&);
@@ -504,9 +593,12 @@ private:
     std::string mOutputFile;
     void* mBuffer;
     bool mFinished;
+    double mFeedSeconds, mFinishSeconds;
+    Writeback mWriteback;
 };
 
 ImsWriter::~ImsWriter(){
+    mWriteback.stop();   // joined (and its descriptor closed) before the file is closed or removed
     if(!mConverter) return;
     // Without a successful finish, destroying the writer stops it (third_party/imariswriter/README.md):
     // no histograms, metadata or thumbnail are written, and the incomplete file is removed below.
@@ -573,6 +665,7 @@ Status ImsWriter::open(DataType aDataType, const bpConverterTypesC_Size5D& aImag
                 );
     Status vStatus = checkErrors();
     if(!vStatus.ok()) return vStatus;
+    mWriteback.start(mOutputFile);   // the Imaris writer has created the file
 
     unsigned long long vBlockSize =
             (unsigned long long)mBlockSize.mValueX *
@@ -585,6 +678,11 @@ Status ImsWriter::open(DataType aDataType, const bpConverterTypesC_Size5D& aImag
 
 Status ImsWriter::writeRegion(uint64_t aC, uint64_t aT, const uint64_t aBlockBase[3], const uint64_t aBlockLimit[3],
                               const void* aSrc, uint64_t aX0, uint64_t aY0, uint64_t aZ0, const int64_t aStride[3]){
+    struct AddTime {
+        double& total;
+        Clock::time_point start;
+        ~AddTime(){ total += secondsSince(start); }
+    } vAddTime = {mFeedSeconds, Clock::now()};
     const int64_t sx = aStride[0], sy = aStride[1], sz = aStride[2];
     const uint64_t bx = mBlockSize.mValueX, by = mBlockSize.mValueY, bz = mBlockSize.mValueZ;
     const uint64_t shapeX = mImageSize.mValueX, shapeY = mImageSize.mValueY, shapeZ = mImageSize.mValueZ;
@@ -711,10 +809,23 @@ void ImsWriter::writeMetadata(){
 }
 
 Status ImsWriter::finish(){
-    writeMetadata();
+    const Clock::time_point vStart = Clock::now();
+    writeMetadata();   // bpImageConverterC_Finish closes the file
     Status vStatus = checkErrors();
-    if(vStatus.ok()) mFinished = true;
+    mWriteback.stop();
+    if(vStatus.ok()){
+        bpImageConverterC_Destroy(mConverter);   // joins the writer's threads; nothing is left to write
+        mConverter = NULL;
+        free(mBuffer);
+        mBuffer = NULL;
+        mFinished = true;
+    }
+    mFinishSeconds = secondsSince(vStart);
     return vStatus;
+}
+
+void reportTiming(const Callbacks& aCallbacks, double aRead, const ImsWriter& aWriter){
+    if(aCallbacks.timing) aCallbacks.timing(aRead, aWriter.feedSeconds(), aWriter.finishSeconds(), aCallbacks.user);
 }
 
 uint64_t numBlocks(uint64_t aSize, uint64_t aBlockSize){
@@ -831,6 +942,7 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
         say(aCallbacks, "Processing Block (chunks XYZ): %llu,%llu,%llu\n",
             (unsigned long long)cbX, (unsigned long long)cbY, (unsigned long long)cbZ);
     }
+    double vReadSeconds = 0;
 
     for (uint64_t vC = 0; vC < vNBlocksC; ++vC) {
         for (uint64_t vT = 0; vT < vNBlocksT; ++vT) {
@@ -872,6 +984,7 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
                     inEnd[vAxis[i]] = boundingBox[vAxis[i]] + vEnd[i];
                 }
                 std::string vWhy;
+                const Clock::time_point vReadStart = Clock::now();
                 try{
                     if(vTiff){
                         // whole pages, the region's Z-slab; a read of every page uses the original
@@ -885,6 +998,7 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
                 catch(const std::string& vError){ vWhy = vError; }
                 catch(const std::exception& vError){ vWhy = vError.what(); }
                 catch(...){ vWhy = "unknown error"; }
+                vReadSeconds += secondsSince(vReadStart);
                 // The readers return NULL on failure; don't let it zero-fill like padding.
                 if(!vData) return Status(Code::ReadFailed, "could not read " + vFile + (vWhy.empty() ? "" : ": " + vWhy));
                 // The buffer runs along the input's axes, axis 0 fastest. A TIFF read holds whole
@@ -908,7 +1022,9 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
         }
     }
 
-    return vWriter.finish();
+    vStatus = vWriter.finish();
+    if(vStatus.ok()) reportTiming(aCallbacks, vReadSeconds, vWriter);
+    return vStatus;
 }
 
 Status internalError(const char* aWhat){
@@ -1050,7 +1166,9 @@ Status writeValidated(const WriteOptions& aOptions, const std::vector<Volume>& a
             if(!vStatus.ok()) return vStatus;
         }
     }
-    return vWriter.finish();
+    vStatus = vWriter.finish();
+    if(vStatus.ok()) reportTiming(aCallbacks, 0, vWriter);
+    return vStatus;
 }
 
 }  // namespace

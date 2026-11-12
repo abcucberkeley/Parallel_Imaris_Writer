@@ -70,6 +70,9 @@ The channels are named after their patterns and colored red, green, blue, red, .
 
 `start` is `--start-time`, or else the modification time (local time, whole seconds) of the first input file — of the first channel's first timepoint, a `.zarr` folder's own modification time for Zarr input. Imaris shows these times and uses their spacing as the frame interval.
 
+#### Writing and timing
+On Linux the output is handed to the operating system for writing while the conversion runs (a helper thread asks for the writeback of the file's written pages every 500 ms), so closing the file at the end does not wait for tens of gigabytes still held in memory. The ImarisWriter may hold up to 2 GB of blocks that are compressed and wait to be written, so that a slow write does not stop the compression threads at once. Neither changes the file. With the environment variable `PIW_TIMING=1` the converter prints one line on stderr when the file is written: the seconds spent reading the inputs, handing the blocks to the ImarisWriter, and finishing (histograms, metadata and the close of the file), e.g. `Timing: read 12.31 s, feed 30.02 s, finish and close 0.35 s`. The library (`src/parallelimariswriter.h`) reports the same numbers through `Callbacks::timing`.
+
 ### Examples
 
 Convert a folder of TIFF stacks (files containing "CamA") into `output.ims`:

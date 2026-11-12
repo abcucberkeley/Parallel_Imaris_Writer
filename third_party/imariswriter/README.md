@@ -118,3 +118,16 @@ heap-use-after-free in `bpMemoryManager::ReturnMemory`, from `bpThreadPool::Trea
     writer: the conversion failed with "the output file was not created" (seen for volumes of one
     block, about once in 40 runs of the test suite; upstream dereferences the missing writer). A file
     that cannot be created is now reported by `bpImageConverterC_Create`.
+
+### A larger in-flight budget
+
+- `writer/bpWriterCompressor.cxx`
+  - The memory for the blocks that are compressed but not written yet (raw and compressed bytes,
+    the budget `bpWriterThreads` waits on) is at least 2 GB (`kMinInFlightBufferMB`), upstream
+    `threads*3 + 32` MB (56 MB at 8 threads). With the small budget every stall of the HDF5 writer
+    thread stopped the compression threads at once; the converter's early writeback
+    (`src/converter.cpp`) makes such stalls more frequent, since the writer thread then shares the
+    file with the kernel's writes. Measured on one 43 GB volume at 8 cores, the compute thread's
+    wait for the budget dropped from 19 s to 0.2 s. The budget bounds the memory: it is taken only
+    while blocks wait for the writer (and kept for reuse until the converter is destroyed). The
+    data written is unchanged.

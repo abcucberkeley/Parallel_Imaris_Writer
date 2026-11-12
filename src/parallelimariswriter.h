@@ -31,7 +31,7 @@ struct Status {
     bool ok() const { return code == Code::Ok; }
 };
 
-// All three are optional. message and cancel are called on the thread that called convert();
+// All are optional. message, cancel and timing are called on the thread that called convert();
 // progress on the Imaris writer's own thread, with a fraction that never decreases (1 when all
 // blocks are written).
 struct Callbacks {
@@ -39,6 +39,11 @@ struct Callbacks {
     void (*progress)(float fraction, unsigned long long bytesWritten, void* user) = nullptr;
     int  (*cancel)(void* user) = nullptr;                       // polled between blocks; non-zero stops the conversion
     void* user = nullptr;
+    // Called once when the file is written (not after a failure): the wall-clock seconds spent
+    // reading the inputs (0 for writeVolumes), handing the blocks to the Imaris writer (copying them
+    // and waiting for its queue), and in its finish, which writes the histograms and metadata and
+    // closes the file. The command line prints them with PIW_TIMING=1.
+    void (*timing)(double readSeconds, double feedSeconds, double finishSeconds, void* user) = nullptr;
 };
 
 // A channel's base color: red, green and blue from 0 to 1.
