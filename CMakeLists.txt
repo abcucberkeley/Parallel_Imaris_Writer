@@ -114,13 +114,19 @@ FetchContent_MakeAvailable(hdf5)
 # "zlibstatic" targets collide with the zlib we (and cpp-tiff) fetched above.
 # Point blosc2 at the shared zlib via find_package(ZLIB) instead.
 set(PREFER_EXTERNAL_ZLIB ON CACHE BOOL "" FORCE)
-# PIW_PRIVATE_RUNTIME (the Python wheel): the reader libraries keep their static C++ runtime
-# private (on Linux their exports then hold only their own API), as the cpp-tiff and cpp-zarr
-# wheels' do. Exported, programs that load another C++ runtime after them (Python with PyTorch)
-# bound some of its symbols to these copies. Off by default: the executable takes its C++
-# runtime, LZ4 and zlib from the libraries' exports (v1.7.3 defaults).
-option(PIW_PRIVATE_RUNTIME "Keep the reader libraries' static C++ runtime private (Python wheel)" OFF)
-if(PIW_PRIVATE_RUNTIME)
+# The two libraries link their C++ runtime (libstdc++), LZ4, zlib, blosc, zstd and libtiff
+# statically and, as their releases are built, export all of it. Built here they export only
+# their own API (piw_reader_exports below), and every program and library of this project brings
+# its own runtime, LZ4 and zlib (piw_link_like_executable): none of them binds a symbol of these
+# to a reader library. Bound to the readers' copies, a program ran two C++ runtimes at once (on
+# macOS iostreams, locales and std::filesystem copies aborted silently), and the LZ4 compressing
+# every .ims chunk was whichever one cpp-zarr bundled. tests/runtime_isolation.cmake checks it.
+# CPPZARR_PRIVATE_RUNTIME is cpp-zarr's own switch for this on Linux (--exclude-libs,ALL); left off
+# on macOS, where newer cpp-zarr versions add an unexported-symbols list that our exported-symbols
+# list (piw_reader_exports) already covers.
+if(APPLE)
+  set(CPPZARR_PRIVATE_RUNTIME OFF CACHE BOOL "" FORCE)
+else()
   set(CPPZARR_PRIVATE_RUNTIME ON CACHE BOOL "" FORCE)
 endif()
 FetchContent_Declare(cpptiff
@@ -132,10 +138,39 @@ FetchContent_Declare(cppzarr
     GIT_TAG        v1.7.3
 )
 FetchContent_MakeAvailable(cpptiff cppzarr)
-if(PIW_PRIVATE_RUNTIME AND UNIX AND NOT APPLE)
-  # cpp-tiff has no switch of its own for this (cpp-zarr's is CPPZARR_PRIVATE_RUNTIME above).
-  target_link_options(cppTiff_shared PRIVATE -Wl,--exclude-libs,ALL)
-endif()
+
+# The readers' exports: their API alone, the functions of the global namespace (_Z<length><name>...,
+# all of cpp-tiff's and cpp-zarr's, listed by the length's first digit to keep to plain * patterns)
+# and cpp-zarr's zarr class; the template code of namespace std and
+# nlohmann/json their own objects instantiate is left out too (it keeps default visibility whatever
+# -fvisibility says). Linux: no symbol of a static library exported (--exclude-libs,ALL) and a
+# version script; macOS: an exported-symbols list (Mach-O names have one more leading underscore).
+# Windows (MinGW, which exports every global symbol of a DLL): no symbol of a static library
+# exported; the DLLs' own template instantiations stay exported, but nothing of ours imports them.
+set(PIW_READER_API _Z1* _Z2* _Z3* _Z4* _Z5* _Z6* _Z7* _Z8* _Z9* _ZN4zarr* _ZNK4zarr*)
+function(piw_reader_exports target)
+    if(WIN32)
+        target_link_options(${target} PRIVATE -Wl,--exclude-libs,ALL)
+        return()
+    endif()
+    if(APPLE)
+        list(TRANSFORM PIW_READER_API PREPEND "_" OUTPUT_VARIABLE syms)
+        string(REPLACE ";" "\n" text "${syms}")
+        set(file "${CMAKE_CURRENT_BINARY_DIR}/${target}.exports")
+        file(WRITE "${file}" "${text}\n")
+        target_link_options(${target} PRIVATE "LINKER:-exported_symbols_list,${file}")
+    else()
+        string(REPLACE ";" "; " text "${PIW_READER_API}")
+        set(file "${CMAKE_CURRENT_BINARY_DIR}/${target}.map")
+        file(WRITE "${file}" "{\n  global: ${text};\n  local: *;\n};\n")
+        # (__cxa_pure_virtual: see piw_link_like_executable)
+        target_link_options(${target} PRIVATE -Wl,--exclude-libs,ALL "-Wl,--version-script=${file}"
+                            -Wl,--undefined=__cxa_pure_virtual)
+    endif()
+    set_property(TARGET ${target} APPEND PROPERTY LINK_DEPENDS "${file}")
+endfunction()
+piw_reader_exports(cppTiff_shared)
+piw_reader_exports(cppZarr_shared)
 
 # ---------------------------------------------------------------------------
 # ImarisWriter -- fetched but NOT configured with its own CMakeLists (which does
@@ -243,19 +278,26 @@ add_executable(parallelimariswriter ${SRC_DIR}/main.cpp $<TARGET_OBJECTS:piw_cor
 target_include_directories(parallelimariswriter PRIVATE ${PIW_INCLUDE_DIRS})
 target_link_libraries(parallelimariswriter PRIVATE ${PIW_LINK_LIBRARIES})
 
-# Statically pull in libstdc++/libgcc so the ONLY dynamic dependencies are the
-# three libraries we ship in the folder (libcppTiff, libcppZarr, libgomp) plus the
-# system C libraries. Only valid for GNU; Apple Clang rejects these flags (build on
-# macOS with Homebrew gcc, as before). Also used for the test that links piw_core.
+# Each program (and the Python package's library) links its own C++ runtime statically, so the
+# only dynamic dependencies are the three libraries we ship in the folder (libcppTiff, libcppZarr,
+# libgomp) plus the system's libraries; it takes no runtime symbol from the readers, which keep
+# theirs private (piw_reader_exports). Exceptions the readers throw (std::string, std::exception)
+# are caught across the two runtimes: the unwinder is one for the whole process and the catch
+# compares type names. Linux: the unwinder is the system's libgcc_s, which the readers use too
+# (measured: a caller with a static libgcc of its own aborted when it caught a reader's exception);
+# macOS: it is libSystem's whatever -static-libgcc says (which keeps Homebrew's libgcc_s out);
+# Windows: SEH unwinds through the system, each module with its own static libgcc, as the readers'
+# DLLs have. Only valid for GNU; Apple Clang rejects these flags (build on macOS with Homebrew gcc).
+# Used for the executable and every test program.
 function(piw_link_like_executable target)
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        if(PIW_PRIVATE_RUNTIME AND NOT APPLE AND NOT WIN32)
-            # The libraries then keep their runtime to themselves: the program brings its own
-            # static libstdc++ but unwinds with the shared libgcc_s (measured: a caller with a
-            # static libgcc aborted when it caught a reader's exception).
-            target_link_options(${target} PRIVATE -static-libstdc++)
+        target_link_options(${target} PRIVATE -static-libstdc++)
+        if(APPLE OR WIN32)
+            target_link_options(${target} PRIVATE -static-libgcc)
         else()
-            target_link_options(${target} PRIVATE -static-libstdc++ -static-libgcc)
+            # libstdc++.a refers to __cxa_pure_virtual weakly only: pulled in, it is the program's own
+            # too, not left to whatever other library of the process defines one.
+            target_link_options(${target} PRIVATE -Wl,--undefined=__cxa_pure_virtual)
         endif()
         if(NOT APPLE AND NOT WIN32)
             # Emit DT_RPATH (searched before LD_LIBRARY_PATH) instead of DT_RUNPATH, so the
@@ -264,9 +306,10 @@ function(piw_link_like_executable target)
             target_link_options(${target} PRIVATE -Wl,--disable-new-dtags)
         endif()
         if(WIN32)
-            # libcppTiff.dll / libcppZarr.dll (built with -static-libgcc) re-export libgcc's
-            # unwind symbols, which then clash with this exe's own static libgcc (e.g.
-            # _Unwind_Resume). Same fix cpp-zarr uses for MinGW.
+            # Releases of libcppTiff.dll / libcppZarr.dll (built with -static-libgcc) export libgcc's
+            # unwind symbols, which clashed with the program's own static libgcc (_Unwind_Resume).
+            # Ours export none (piw_reader_exports); kept so that a stray duplicate cannot stop the
+            # Windows build: what a program imports from the readers is checked by runtimeIsolation.
             target_link_options(${target} PRIVATE -Wl,--allow-multiple-definition)
         endif()
     endif()
@@ -338,8 +381,8 @@ add_custom_target(release ${RELEASE_CMDS}
 
 # ---------------------------------------------------------------------------
 # libparallelImarisWriter: the converter core as a shared library, for the Python package
-# (python/setup.py configures with -DPIW_BUILD_PYTHON_LIB=ON -DPIW_PRIVATE_RUNTIME=ON). Its API
-# is src/parallelimariswriter.h. Same objects as the executable; the default build is unchanged.
+# (python/setup.py configures with -DPIW_BUILD_PYTHON_LIB=ON). Its API is
+# src/parallelimariswriter.h. Same objects as the executable; the default build is unchanged.
 #     cmake --build <build> --target parallelImarisWriter_shared
 #     cmake --install <build> --component python     (lib/: the three libraries; include/: the header)
 # ---------------------------------------------------------------------------
@@ -349,27 +392,35 @@ if(PIW_BUILD_PYTHON_LIB)
     set_target_properties(parallelImarisWriter_shared PROPERTIES OUTPUT_NAME parallelImarisWriter)
     target_link_libraries(parallelImarisWriter_shared PRIVATE ${PIW_LINK_LIBRARIES})
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        # Its own static C++ runtime, kept private, like the readers' in the Python wheel.
+        # Its own static C++ runtime, as the executable's (piw_link_like_executable), kept private
+        # like the readers': only the piw:: functions exported (the template instantiations of
+        # namespace std keep default visibility despite -fvisibility=hidden).
         target_link_options(parallelImarisWriter_shared PRIVATE -static-libstdc++)
         if(APPLE OR WIN32)
             target_link_options(parallelImarisWriter_shared PRIVATE -static-libgcc)
+        endif()
+        if(APPLE)
+            # (exported, the runtime's weak definitions would be shared with every other image of
+            # the process that exports the same: macOS's loader merges them)
+            set(PIW_EXPORTS_LIST "${CMAKE_CURRENT_BINARY_DIR}/parallelImarisWriter.exports")
+            file(WRITE "${PIW_EXPORTS_LIST}" "__ZN3piw*\n__ZNK3piw*\n")
+            target_link_options(parallelImarisWriter_shared PRIVATE "LINKER:-exported_symbols_list,${PIW_EXPORTS_LIST}")
+            set_property(TARGET parallelImarisWriter_shared APPEND PROPERTY LINK_DEPENDS "${PIW_EXPORTS_LIST}")
+        elseif(WIN32)
+            # As the executable; no symbol of a static library exported (HDF5, LZ4, zlib, libgcc's
+            # unwinder). And ImarisWriter's dllexport declarations would turn off MinGW's export of
+            # everything, leaving the piw:: functions unexported.
+            target_link_options(parallelImarisWriter_shared PRIVATE
+                -Wl,--allow-multiple-definition -Wl,--exclude-libs,ALL -Wl,--export-all-symbols)
         else()
-            # Static HDF5, LZ4, zlib, ImarisWriter and C++ runtime hidden, and only the piw::
-            # functions exported (the template instantiations of namespace std keep default
-            # visibility despite -fvisibility=hidden). The unwinder is the shared libgcc_s (never
-            # -static-libgcc on Linux: see piw_link_like_executable).
+            # Static HDF5, LZ4, zlib, ImarisWriter and C++ runtime hidden (__cxa_pure_virtual included:
+            # see piw_link_like_executable). The unwinder is the shared libgcc_s (never -static-libgcc
+            # on Linux: see piw_link_like_executable).
             set(PIW_VERSION_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/parallelImarisWriter.map")
             file(WRITE "${PIW_VERSION_SCRIPT}" "{\n  global:\n    extern \"C++\" { piw::*; };\n  local: *;\n};\n")
-            target_link_options(parallelImarisWriter_shared PRIVATE
+            target_link_options(parallelImarisWriter_shared PRIVATE -Wl,--undefined=__cxa_pure_virtual
                 -Wl,--exclude-libs,ALL "-Wl,--version-script=${PIW_VERSION_SCRIPT}")
             set_property(TARGET parallelImarisWriter_shared APPEND PROPERTY LINK_DEPENDS "${PIW_VERSION_SCRIPT}")
-        endif()
-        if(WIN32)
-            # As the executable (libgcc's unwind symbols re-exported by the readers' DLLs). And
-            # ImarisWriter's dllexport declarations would turn off MinGW's export of everything,
-            # leaving the piw:: functions unexported.
-            target_link_options(parallelImarisWriter_shared PRIVATE
-                -Wl,--allow-multiple-definition -Wl,--export-all-symbols)
         endif()
     endif()
     install(TARGETS parallelImarisWriter_shared COMPONENT python
@@ -412,7 +463,8 @@ if(PIW_BUILD_TESTS)
     # Builds <source> into <name>Test and registers the CTest test <name>, run from the
     # staging dir as `<name>Test <staged parallelimariswriter> <build>/<name>_work`.
     # Every test gets HDF5, lz4 (tests/imsutil.h), nlohmann_json and OpenMP, and the
-    # cpp-tiff and cpp-zarr headers; LIBS adds the reader libraries it needs.
+    # cpp-tiff and cpp-zarr headers; LIBS adds the reader libraries it needs. Linked like the
+    # executable (its own static C++ runtime).
     function(piw_add_test name source)
         cmake_parse_arguments(PIW_T "" "" "LIBS" ${ARGN})
         set(tgt ${name}Test)
@@ -428,6 +480,7 @@ if(PIW_BUILD_TESTS)
         target_link_libraries(${tgt} PRIVATE
             ${PIW_T_LIBS} nlohmann_json::nlohmann_json OpenMP::OpenMP_CXX
             hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
+        piw_link_like_executable(${tgt})
         add_dependencies(release ${tgt})
         set_property(TARGET piw_tests APPEND PROPERTY PIW_TEST_FILES "$<TARGET_FILE:${tgt}>")
         add_test(NAME ${name}
@@ -460,7 +513,6 @@ if(PIW_BUILD_TESTS)
     piw_add_test(apiEquivalence tests/apitest.cpp LIBS ${PIW_LINK_LIBRARIES})
     target_sources(apiEquivalenceTest PRIVATE $<TARGET_OBJECTS:piw_core>)
     target_include_directories(apiEquivalenceTest PRIVATE ${SRC_DIR} ${PIW_INCLUDE_DIRS})
-    piw_link_like_executable(apiEquivalenceTest)
 
     # imscompare: compares two .ims files chunk by chunk (--all: also the metadata),
     # --map (t,c) pairs between files, or checks one (--deep). A test and validation
@@ -470,6 +522,7 @@ if(PIW_BUILD_TESTS)
     target_include_directories(imscompare PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src ${LZ4_INCLUDE_DIR})
     target_link_libraries(imscompare PRIVATE hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
+    piw_link_like_executable(imscompare)
     add_dependencies(release imscompare)
     set_property(TARGET piw_tests APPEND PROPERTY PIW_TEST_FILES "$<TARGET_FILE:imscompare>")
     # The tool's exit codes and messages on synthetic files with known differences.
@@ -484,6 +537,7 @@ if(PIW_BUILD_TESTS)
     target_include_directories(monoCoreTest PRIVATE
         ${SRC_DIR} ${hdf5_SOURCE_DIR}/src ${hdf5_BINARY_DIR}/src ${LZ4_INCLUDE_DIR})
     target_link_libraries(monoCoreTest PRIVATE hdf5-static lz4_static Threads::Threads ${CMAKE_DL_LIBS})
+    piw_link_like_executable(monoCoreTest)
     add_test(NAME monoCore COMMAND monoCoreTest "${CMAKE_CURRENT_BINARY_DIR}/monocore_work")
     set_tests_properties(monoCore PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -512,6 +566,22 @@ if(PIW_BUILD_TESTS)
     piw_add_test(monoScale tests/monoscaletest.cpp LIBS ${PIW_LINK_LIBRARIES})
     target_sources(monoScaleTest PRIVATE $<TARGET_OBJECTS:piw_core>)
     target_include_directories(monoScaleTest PRIVATE ${SRC_DIR} ${PIW_INCLUDE_DIRS})
-    piw_link_like_executable(monoScaleTest)
     set_tests_properties(monoScale PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Every program and library above brings its own C++ runtime, LZ4 and zlib, none of them bound
+    # to libcppTiff's or libcppZarr's, and the two export none of theirs (nm -D on Linux, nm -m on
+    # macOS, objdump -p's import and export tables on Windows; tests/runtime_isolation.cmake).
+    if(CMAKE_NM AND CMAKE_OBJDUMP)
+        set(PIW_CHECKED "$<TARGET_FILE:parallelimariswriter>|$<TARGET_FILE:monoCoreTest>")
+        string(APPEND PIW_CHECKED "|$<JOIN:$<TARGET_GENEX_EVAL:piw_tests,$<TARGET_PROPERTY:piw_tests,PIW_TEST_FILES>>,|>")
+        if(PIW_BUILD_PYTHON_LIB)
+            string(APPEND PIW_CHECKED "|$<TARGET_FILE:parallelImarisWriter_shared>")
+        endif()
+        add_test(NAME runtimeIsolation COMMAND ${CMAKE_COMMAND}
+            -DPLATFORM=${CMAKE_SYSTEM_NAME} -DNM=${CMAKE_NM} -DOBJDUMP=${CMAKE_OBJDUMP}
+            "-DREADERS=$<TARGET_FILE:cppTiff_shared>|$<TARGET_FILE:cppZarr_shared>" "-DBINARIES=${PIW_CHECKED}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_isolation.cmake)
+    else()
+        message(WARNING "nm or objdump not found: the runtimeIsolation test is not registered")
+    endif()
 endif()

@@ -73,9 +73,9 @@ class BuildExt(build_ext):
                 '-DCMAKE_BUILD_TYPE=Release',
                 f'-DCMAKE_INSTALL_PREFIX={install_dir}',
                 '-DCMAKE_INSTALL_LIBDIR=lib',
+                # (its C++ runtime, and the reader libraries', kept private, as the module's is: see
+                # CMakeLists.txt)
                 '-DPIW_BUILD_PYTHON_LIB=ON',
-                # (the libraries' C++ runtimes kept private, as the module's is: see CMakeLists.txt)
-                '-DPIW_PRIVATE_RUNTIME=ON',
             ])
             cmake = configured_cmake(cmake_build_dir)
         if cmake and os.path.isfile(cmake):
@@ -106,8 +106,10 @@ ext_modules = [
         sources=['parallel_imaris_writer.cpp'],
         # Only the module's init function exported
         extra_compile_args=['-fvisibility=hidden', '-fvisibility-inlines-hidden'] if system != 'Windows' else [],
-        # (the static C++ runtime kept private, as in the library: see CMakeLists.txt)
-        extra_link_args=['-static-libstdc++'] + ([f'-Wl,--exclude-libs,ALL,--version-script={module_version_script}']
+        # (the static C++ runtime kept private, as in the library, __cxa_pure_virtual included: see
+        # CMakeLists.txt)
+        extra_link_args=['-static-libstdc++'] + ([f'-Wl,--exclude-libs,ALL,--version-script={module_version_script}',
+                                                  '-Wl,--undefined=__cxa_pure_virtual']
                                                  if system == 'Linux' else []),
     ),
 ]

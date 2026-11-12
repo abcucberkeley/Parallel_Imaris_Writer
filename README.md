@@ -26,7 +26,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 cmake --build build --target release
 ````
-The `release` target assembles a self-contained folder, `build/Parallel_Imaris_Writer/`, containing the `parallelimariswriter` executable and its shared libraries, ready to run in place.
+The `release` target assembles a self-contained folder, `build/Parallel_Imaris_Writer/`, containing the `parallelimariswriter` executable and its shared libraries, ready to run in place. The executable links its own C++ runtime, LZ4 and zlib statically (on Linux it uses the system's `libgcc_s`), and the `libcppTiff` and `libcppZarr` built with it keep theirs private, so the folder can be copied anywhere; the `runtimeIsolation` test checks this.
 
 ## Usage
 

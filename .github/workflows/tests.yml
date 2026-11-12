@@ -66,3 +66,9 @@ jobs:
 
       - name: C++ tests
         run: ctest --test-dir build --output-on-failure
+
+      # The runtimeIsolation test's counts, printed when it passes too: what each program and
+      # library binds to libcppTiff and libcppZarr, and what those two export (an error when the
+      # test was not registered: nm or objdump not found).
+      - name: Runtime symbol report
+        run: ctest --test-dir build -R runtimeIsolation -V --no-tests=error
