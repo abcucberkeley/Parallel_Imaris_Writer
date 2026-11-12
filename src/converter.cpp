@@ -699,8 +699,19 @@ void listFiles(const std::string& aFolder, const std::string& aPattern, std::vec
     closedir(dir);
 }
 
+// strcmp order, with Windows' '\' compared as '/' so files sort the same on every platform.
 bool lessPath(const std::string& aA, const std::string& aB){
+    #ifdef _WIN32
+    const size_t n = std::min(aA.size(), aB.size());
+    for(size_t i = 0; i < n; ++i){
+        const unsigned char a = aA[i] == '\\' ? '/' : (unsigned char)aA[i];
+        const unsigned char b = aB[i] == '\\' ? '/' : (unsigned char)aB[i];
+        if(a != b) return a < b;
+    }
+    return aA.size() < aB.size();
+    #else
     return strcmp(aA.c_str(), aB.c_str()) < 0;
+    #endif
 }
 
 }  // namespace
