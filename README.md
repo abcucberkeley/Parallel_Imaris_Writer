@@ -30,7 +30,7 @@ The `release` target assembles a self-contained folder, `build/Parallel_Imaris_W
 
 ## Usage
 
-The converter finds its inputs by matching a file-name pattern inside one or more folders. Each file whose name contains a pattern is treated as a timepoint, and multiple comma-separated patterns are treated as multiple channels. The result is written as `<output-directory>/<name>.ims`.
+The converter finds its inputs by matching a file-name pattern inside one or more folders. Each file whose name contains a pattern is treated as a timepoint, and multiple comma-separated patterns are treated as multiple channels. The timepoints of a channel are ordered by name (by full path, folders in name order too), so number them with leading zeros (`t0009`, `t0010`). Only the reader's files are used: `.tif` and `.tiff` (any case) for `tiff`, `.zarr` for `zarr`. Every channel must have the same number of files, and a file may match only one pattern. The result is written as `<output-directory>/<name>.ims`; the inputs are also listed in `<output-directory>/timepoints.txt` (appended to on every run).
 
 ### Options
 | Flag | Description |
@@ -38,20 +38,26 @@ The converter finds its inputs by matching a file-name pattern inside one or mor
 | `-r` | Reader: `tiff` or `zarr` (default: `tiff`) |
 | `-F` | Comma-separated input folder(s) to search |
 | `-P` | Comma-separated file-name pattern(s), one per channel (files whose names contain a pattern are matched) |
-| `-o` | Output directory (default: the first input folder) |
+| `-o` | Output directory, created (with any missing parent folders) if needed (default: the first input folder) |
 | `-n` | Output file name without extension (default: `output`, producing `output.ims`) |
-| `-v` | Voxel size in µm (microns) as `X,Y,Z` (default: `0.108,0.108,0.108`) |
-| `-c` | Number of channels (default: inferred from the number of patterns) |
-| `-t` | Number of timepoints (default: inferred from the matching files) |
-| `-b` | Imaris output block (chunk) size as `X,Y,Z` (default: the reader's native chunk size) |
-| `-B` | Bounding box to crop the input as `Xmin,Ymin,Zmin,Xmax,Ymax,Zmax` |
-| `-C` | Processing block size as `X,Y,Z` — the amount of a timepoint held in RAM at once. Zarr is blocked in all three axes; TIFF only in Z. Values larger than the image simply read the whole image. Omit to process a whole timepoint at once. |
+| `-v` | Voxel size in µm (microns) as `X,Y,Z`, each greater than 0 (default: `0.108,0.108,0.108`) |
+| `-c` | Number of channels; if given, it must equal the number of patterns |
+| `-t` | Number of timepoints; if given, it must equal the number of files per pattern |
+| `-b` | Size of the blocks handed to the ImarisWriter as `X,Y,Z`, whole numbers of at least 1 (default: the reader's native chunk size). It does not change the output: the HDF5 chunks are chosen by the ImarisWriter. |
+| `-B` | Bounding box to crop the input as `Xmin,Ymin,Zmin,Xmax,Ymax,Zmax`: whole numbers, 0-based, the max excluded |
+| `-C` | Processing block size as `X,Y,Z` (whole numbers of at least 1) — the amount of a timepoint held in RAM at once. Zarr is blocked in all three axes; TIFF only in Z. Values larger than the image simply read the whole image. Omit to process a whole timepoint at once (the whole timepoint is then held in RAM). |
 | `--channel-names` | Comma-separated channel names (default: the `-P` patterns, e.g. `CamA,CamB`) |
 | `--colors` | Comma-separated channel colors: `red`, `green`, `blue`, `cyan`, `magenta`, `yellow`, `white`, `gray`, a hex `RRGGBB`, or `r:g:b` with values from 0 to 1 (default: red, green, blue, red, ...) |
 | `--emission` | Comma-separated emission wavelengths in nm, written as `LSMEmissionWavelength` (`0` = none for that channel; default: none) |
 | `--excitation` | Comma-separated excitation wavelengths in nm, written as `LSMExcitationWavelength` (`0` = none; default: none) |
 | `--time-interval` | Seconds between timepoints |
 | `--start-time` | Time of the first timepoint, `"YYYY-MM-DD HH:MM:SS[.mmm]"` (local time) |
+| `-h`, `--help` | Print the options and exit |
+
+A list of numbers may end with one comma (`-v 0.108,0.108,0.25,`). A leading `~` or `~/` in `-F` and `-o` is replaced by the home folder (Linux and Mac).
+
+#### Exit codes
+`0` when the `.ims` was written. `1` on any error — an unknown option or a missing or malformed value, no arguments at all, an unsupported reader, a missing input folder, a pattern without a match, channels with different numbers of files, an output folder that cannot be created or written, unsupported data (such as 64-bit), or a failed read or write — after one `ERROR: <text>` line on stderr (a partly written output file is removed).
 
 #### Metadata
 The channels are named after their patterns and colored red, green, blue, red, ... unless `--channel-names` and `--colors` say otherwise; wavelengths are written only when given. The file's Creator is `parallelimariswriter` with its version. Timepoint `t` is placed at:

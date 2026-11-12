@@ -164,13 +164,13 @@ def main():
                             '-r', 'zarr'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
         check(r.returncode == 0 and 'Current File: ' in r.stdout and is_hdf5(os.path.join(out3, 'output.ims')),
               f'python -m parallel_imaris_writer: exit code {r.returncode}')
-        # An output it cannot write (output.ims is a folder): exit code 1 and "Error: ..." on stderr
+        # An output it cannot write (output.ims is a folder): exit code 1 and "ERROR: ..." on stderr
         out_dir = os.path.join(tmp, 'out_isdir')
         os.makedirs(os.path.join(out_dir, 'output.ims'))
         r = subprocess.run([sys.executable, '-m', 'parallel_imaris_writer', '-P', 'CamA', '-F', inputs, '-o', out_dir,
                             '-r', 'zarr'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-        check(r.returncode == 1 and 'Error: ' in r.stderr and 'Error: ' not in r.stdout,
-              f'python -m with an unwritable output: exit code {r.returncode}, "Error: ..." on stderr')
+        check(r.returncode == 1 and 'ERROR: ' in r.stderr and 'ERROR: ' not in r.stdout,
+              f'python -m with an unwritable output: exit code {r.returncode}, "ERROR: ..." on stderr')
 
         # The library call
         files = pybind11_find_input_files([inputs], ['CamA', 'CamB'])

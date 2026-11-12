@@ -492,6 +492,11 @@ if(PIW_BUILD_TESTS)
     piw_add_test(mono tests/monotest.cpp LIBS cppZarr_shared)
     set_tests_properties(mono PROPERTIES SKIP_RETURN_CODE 77)
 
+    # The converter's command line: options, values, input discovery and exit codes (every error
+    # exits 1 with one ERROR line, never 0 or a signal); the POSIX-only cases are skipped on Windows.
+    piw_add_test(clitest tests/clitest.cpp LIBS cppTiff_shared cppZarr_shared)
+    set_tests_properties(clitest PROPERTIES TIMEOUT 600)
+
     # An output that cannot be written (file-size limit, a directory in the way) ends the
     # conversion with exit code 1 and an error, not a hang. POSIX only (setrlimit, fork).
     # Each run is killed after 30 s and counted as a hang; the timeout only backs that up.

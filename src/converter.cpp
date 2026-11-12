@@ -28,6 +28,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <dirent.h>
 #include <stdint.h>
@@ -50,10 +52,6 @@
 
 namespace piw {
 namespace detail {
-// The one Unsupported case the command line still reports on stdout with exit code 0.
-extern const char* const kNo64BitData;
-const char* const kNo64BitData = "64 bit data is not yet supported by the Imaris Converter";
-
 // HDF5 in this build is not thread-safe, and every Imaris writer has its own HDF5-calling thread:
 // one library call (conversion, write or read) at a time per process (src/imsread.cpp and the single-file
 // cluster steps in src/mono.cpp take it too).
@@ -703,7 +701,7 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     say(aCallbacks, "Block Sizes: %llu,%llu,%llu\n",
         (unsigned long long)vChunks[0], (unsigned long long)vChunks[1], (unsigned long long)vChunks[2]);
     // TODO: 64 BIT NOT YET SUPPORTED
-    if(bits == 64) return Status(Code::Unsupported, detail::kNo64BitData);
+    if(bits == 64) return Status(Code::Unsupported, "64 bit data is not yet supported by the Imaris Converter");
     if(bits != 8 && bits != 16 && bits != 32){
         return Status(Code::Unsupported, std::to_string(bits) + "-bit data is not supported.");
     }
@@ -861,27 +859,46 @@ Status internalError(const char* aWhat){
     return Status(Code::Internal, std::string("Internal error: ") + aWhat);
 }
 
-// One folder's entries for one pattern (today's selection), appended to aFiles.
-void listFiles(const std::string& aFolder, const std::string& aPattern, std::vector<std::string>& aFiles){
+// The inputs a reader takes, by extension: tiff .tif and .tiff in any case, zarr .zarr; an empty
+// reader takes both.
+bool isTiffName(const char* aName){
+    const char* vDot = strrchr(aName, '.');
+    if(!vDot) return false;
+    std::string vExt(vDot + 1);
+    for(size_t i = 0; i < vExt.size(); ++i) vExt[i] = (char)tolower((unsigned char)vExt[i]);
+    return vExt == "tif" || vExt == "tiff";
+}
+bool isZarrName(const char* aName){
+    const char* vDot = strrchr(aName, '.');
+    return vDot && !strcmp(vDot, ".zarr");
+}
+
+// One folder's entries that the reader takes, appended to aEntries as (name, path).
+Status listFolder(const std::string& aFolder, const std::string& aReader,
+                  std::vector<std::pair<std::string, std::string> >& aEntries){
     DIR* dir = opendir(aFolder.c_str());
-    // Unable to open directory stream
-    if (!dir)
-        return;
+    if (!dir){
+        const int vErrno = errno;
+        if(vErrno == ENOENT || vErrno == ENOTDIR){
+            return Status(Code::NotFound, "Input folder \"" + aFolder + "\" does not exist or is not a folder.");
+        }
+        return Status(Code::ReadFailed, "Could not open input folder \"" + aFolder + "\": " + strerror(vErrno) + ".");
+    }
     struct dirent* dp;
     while ((dp = readdir(dir)) != NULL)
     {
-        if (strcmp(dp->d_name, ".") != 0 && strcmp(dp->d_name, "..") != 0 && strrchr(dp->d_name, '.'))
-        {
-            if(((!strcmp(strrchr(dp->d_name, '.'),".tif")) || (!strcmp(strrchr(dp->d_name, '.'),".zarr"))) && strstr(dp->d_name,aPattern.c_str()) != NULL){
-                #ifdef _WIN32
-                aFiles.push_back(aFolder + "\\" + dp->d_name);
-                #else
-                aFiles.push_back(aFolder + "/" + dp->d_name);
-                #endif
-            }
-        }
+        if(!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, "..")) continue;
+        const bool vTake = aReader == "tiff" ? isTiffName(dp->d_name) : aReader == "zarr" ? isZarrName(dp->d_name) :
+                           isTiffName(dp->d_name) || isZarrName(dp->d_name);
+        if(!vTake) continue;
+        #ifdef _WIN32
+        aEntries.push_back(std::make_pair(std::string(dp->d_name), aFolder + "\\" + dp->d_name));
+        #else
+        aEntries.push_back(std::make_pair(std::string(dp->d_name), aFolder + "/" + dp->d_name));
+        #endif
     }
     closedir(dir);
+    return Status();
 }
 
 // strcmp order, with Windows' '\' compared as '/' so files sort the same on every platform.
@@ -983,23 +1000,69 @@ Status writeValidated(const WriteOptions& aOptions, const std::vector<Volume>& a
 }  // namespace
 
 Status findInputFiles(const std::vector<std::string>& folders, const std::vector<std::string>& patterns,
-                      std::vector<std::vector<std::string> >& files) noexcept{
+                      const std::string& reader, std::vector<std::vector<std::string> >& files) noexcept{
     try{
-        std::vector<std::vector<std::string> > vFiles;
+        if(!reader.empty() && reader != "tiff" && reader != "zarr"){
+            return Status(Code::InvalidArgument, "Reader type \"" + reader + "\" is not a supported reader type.");
+        }
+        std::vector<std::pair<std::string, std::string> > vEntries;   // (name, path) in every folder
+        for(size_t vF = 0; vF < folders.size(); ++vF){
+            Status vStatus = listFolder(folders[vF], reader, vEntries);
+            if(!vStatus.ok()) return vStatus;
+        }
+        std::vector<std::vector<std::string> > vFiles(patterns.size());
+        for(size_t vE = 0; vE < vEntries.size(); ++vE){
+            size_t vMatch = patterns.size();
+            for(size_t vP = 0; vP < patterns.size(); ++vP){
+                if(!strstr(vEntries[vE].first.c_str(), patterns[vP].c_str())) continue;
+                if(vMatch != patterns.size()){
+                    return Status(Code::InvalidArgument, vEntries[vE].second + " matches both pattern \"" + patterns[vMatch] +
+                                  "\" and pattern \"" + patterns[vP] + "\"; every input must match one pattern.");
+                }
+                vMatch = vP;
+            }
+            if(vMatch != patterns.size()) vFiles[vMatch].push_back(vEntries[vE].second);
+        }
         for(size_t vP = 0; vP < patterns.size(); ++vP){
-            std::vector<std::string> vChannel;
-            for(size_t vF = 0; vF < folders.size(); ++vF) listFiles(folders[vF], patterns[vP], vChannel);
+            std::vector<std::string>& vChannel = vFiles[vP];
             if(vChannel.empty()){
                 return Status(Code::NotFound, "Given pattern \"" + patterns[vP] + "\" was not found in any of the provided folders.");
             }
             std::sort(vChannel.begin(), vChannel.end(), lessPath);
-            vFiles.push_back(vChannel);
+            for(size_t vT = 1; vT < vChannel.size(); ++vT){
+                if(vChannel[vT] == vChannel[vT - 1]){
+                    return Status(Code::InvalidArgument, vChannel[vT] + " was found twice (is a folder given twice?).");
+                }
+            }
+            if(reader.empty()){
+                const bool vTiff = isTiffName(vChannel[0].c_str());
+                for(size_t vT = 1; vT < vChannel.size(); ++vT){
+                    if(isTiffName(vChannel[vT].c_str()) != vTiff){
+                        return Status(Code::InvalidArgument, "Pattern \"" + patterns[vP] + "\" matches both TIFF and Zarr inputs (" +
+                                      vChannel[0] + ", " + vChannel[vT] + "); give the reader.");
+                    }
+                }
+            }
+        }
+        for(size_t vP = 1; vP < patterns.size(); ++vP){
+            if(vFiles[vP].size() == vFiles[0].size()) continue;
+            std::string vCounts;
+            for(size_t vQ = 0; vQ < patterns.size(); ++vQ){
+                vCounts += (vQ ? ", \"" : "\"") + patterns[vQ] + "\" " + std::to_string(vFiles[vQ].size());
+            }
+            return Status(Code::InvalidArgument, "The channels have different numbers of files: " + vCounts +
+                          "; every channel needs one file per time point.");
         }
         files.swap(vFiles);
         return Status();
     }
     catch(const std::exception& vError){ return internalError(vError.what()); }
     catch(...){ return internalError("unknown exception"); }
+}
+
+Status findInputFiles(const std::vector<std::string>& folders, const std::vector<std::string>& patterns,
+                      std::vector<std::vector<std::string> >& files) noexcept{
+    return findInputFiles(folders, patterns, std::string(), files);
 }
 
 Status convert(const ConvertOptions& options, const Callbacks& callbacks) noexcept{

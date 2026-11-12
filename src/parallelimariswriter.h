@@ -110,9 +110,15 @@ struct WriteOptions {
     std::string startTime;
 };
 
-// The command line's input selection: in every folder, in the given order, the entries whose
-// extension is .tif or .zarr and whose name contains the pattern; one channel per pattern, each
-// sorted by full path (strcmp). A pattern without a match gives NotFound.
+// The command line's input selection: in every folder, the entries the reader takes (tiff: .tif
+// and .tiff in any case; zarr: .zarr; an empty reader: both, but not both for one pattern) whose
+// name contains the pattern; one channel per pattern, each sorted by full path (strcmp, '\' as
+// '/'). Errors: a folder that cannot be opened (NotFound when it does not exist), a pattern
+// without a match (NotFound), an entry that matches two patterns, an entry found twice, and
+// channels with different numbers of files (InvalidArgument).
+PIW_API Status findInputFiles(const std::vector<std::string>& folders, const std::vector<std::string>& patterns,
+                              const std::string& reader, std::vector<std::vector<std::string> >& files) noexcept;
+// The same with an empty reader.
 PIW_API Status findInputFiles(const std::vector<std::string>& folders, const std::vector<std::string>& patterns,
                               std::vector<std::vector<std::string> >& files) noexcept;
 

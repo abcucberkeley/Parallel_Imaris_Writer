@@ -1141,6 +1141,20 @@ int main(int argc, char** argv){
         const std::vector<std::string> want = {native(o1/"CamA_t0001.tif"), native(o1/"CamA_t0002.tif"), native(o1/"CamA_t0003.tif"),
                                                native(o1/"CamA_t0010.tif"), native(o2/"CamA_t0000.tif")};
         check(s.ok() && files.size() == 1 && files[0] == want, "two folders: .tif/.zarr files containing the pattern, sorted by path");
+        // with a reader: only its files; without one, a pattern may not match TIFF and Zarr inputs both
+        const fs::path o3 = work/"order3";
+        fs::create_directories(o3);
+        for(const char* n : {"CamA_t0000.tif", "CamA_t0001.zarr", "CamA_t0002.TIFF"}) std::ofstream(o3/n) << "x";
+        s = piw::findInputFiles({native(o3)}, {"CamA"}, "tiff", files);
+        check(s.ok() && files.size() == 1 && files[0] == std::vector<std::string>{native(o3/"CamA_t0000.tif"), native(o3/"CamA_t0002.TIFF")},
+              "reader tiff: .tif and .TIFF only (" + s.message + ")");
+        s = piw::findInputFiles({native(o3)}, {"CamA"}, "zarr", files);
+        check(s.ok() && files.size() == 1 && files[0] == std::vector<std::string>{native(o3/"CamA_t0001.zarr")},
+              "reader zarr: .zarr only (" + s.message + ")");
+        s = piw::findInputFiles({native(o3)}, {"CamA"}, files);
+        check(s.code == piw::Code::InvalidArgument, "no reader, TIFF and Zarr inputs for one pattern: InvalidArgument (" + s.message + ")");
+        s = piw::findInputFiles({native(o3)}, {"CamA"}, "png", files);
+        check(s.code == piw::Code::InvalidArgument, "reader png: InvalidArgument (" + s.message + ")");
     }
 
     // --- 3. cancel ---

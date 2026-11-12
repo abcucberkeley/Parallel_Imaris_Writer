@@ -14,10 +14,9 @@
  *   limitations under the License.                                        *
  ***************************************************************************/
 
-// The command line (piw::runCli): the cluster subcommands, else the single-node conversion with
-// the original options, messages and exit codes. The conversion itself is piw::convert; the
-// table that turns its Status into output and an exit code is cliExitCode below.
-#include "helperfunctions.h"        // cpp-tiff's expandTilde(char*), used for the output folder as before
+// The command line (piw::runCli): the cluster subcommands, else the single-node conversion. The
+// conversion itself is piw::convert; every error of the conversion's command line ends with one
+// "ERROR: <text>" line on stderr and exit code 1 (cliExitCode turns a Status into both).
 #include "parallelimariswriter.h"
 #include "imsmeta.h"
 #include "parallel.h"
@@ -26,32 +25,18 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
+#include <cmath>
 #include <exception>
 #include <string>
 #include <vector>
-
-#ifndef _WIN32
-#include <wordexp.h>
-// Expand the tilde to the home directory on Mac and Linux
-const char* expandTilde(const char* path) {
-    if(strchr(path,'~')){
-        wordexp_t expPath;
-        wordexp(path, &expPath, 0);
-        return expPath.we_wordv[0];
-    }
-    else return path;
-}
-#endif
-
-namespace piw {
-namespace detail {
-extern const char* const kNo64BitData;   // src/converter.cpp
-}
-}
 
 namespace {
 
@@ -86,32 +71,105 @@ void MessageCallback(const char* aText, void*)
     if(!strncmp(aText, "Current File: ", 14)) fflush(stdout);
 }
 
-// Status -> output and exit code. Kept as the original converter behaved, except that a failed
-// write is reported on stderr like a failed read (it was printed on stdout without a newline);
-// the cases that print and return 0 are the ones A-3 turns into errors.
-int cliExitCode(const piw::Status& aStatus)
+int cliError(const std::string& aText)
 {
-    switch(aStatus.code){
-        case piw::Code::Ok:
-            return 0;
-        case piw::Code::WriteFailed:            // ImarisWriter's message (a failed write, the file not created)
-        case piw::Code::ReadFailed:
-            fprintf(stderr, "Error: %s\n", aStatus.message.c_str());
-            return 1;
-        case piw::Code::Unsupported:
-            if(aStatus.message == piw::detail::kNo64BitData){
-                printf("%s", aStatus.message.c_str());
-                return 0;
-            }
-            break;
-        default:
-            break;
-    }
-    fprintf(stderr, "ERROR: %s\n", aStatus.message.c_str());
+    fprintf(stderr, "ERROR: %s\n", aText.c_str());
     return 1;
 }
 
-// strtok_r's view of a comma-separated list: the non-empty items (a trailing comma is fine).
+// Status -> output and exit code: 0, or one ERROR line and 1.
+int cliExitCode(const piw::Status& aStatus)
+{
+    if(aStatus.ok()) return 0;
+    return cliError(aStatus.message);
+}
+
+void printUsage(FILE* aOut)
+{
+    fprintf(aOut,
+        "usage: parallelimariswriter -F FOLDER[,FOLDER...] -P PATTERN[,PATTERN...] [options]\n"
+        "       parallelimariswriter setup|worker|monitor|combineone|link|linkparts|layout|monoinit|monoplace|monofinish|monostatus ...\n"
+        "Converts TIFF or Zarr stacks to one Imaris .ims file. Each pattern is one channel; the files in the\n"
+        "folders whose names contain it are its time points, in the order of their names (full paths).\n"
+        "  -F FOLDERS      comma-separated input folders\n"
+        "  -P PATTERNS     comma-separated file-name patterns, one per channel\n"
+        "  -r READER       tiff (.tif, .tiff) or zarr (.zarr); default tiff\n"
+        "  -o FOLDER       output folder, created if needed (default: the first input folder)\n"
+        "  -n NAME         output file name without .ims (default: output)\n"
+        "  -v X,Y,Z        voxel size in um, each > 0 (default: 0.108,0.108,0.108)\n"
+        "  -c N            number of channels: must equal the number of patterns\n"
+        "  -t N            number of time points: must equal the number of files per pattern\n"
+        "  -b X,Y,Z        size of the blocks handed to the Imaris writer, each >= 1 (default: the\n"
+        "                  input's chunks; does not change the output)\n"
+        "  -B X0,Y0,Z0,X1,Y1,Z1  crop to [X0,X1) x [Y0,Y1) x [Z0,Z1), 0-based\n"
+        "  -C X,Y,Z        voxels of a time point held in memory at once, each >= 1 (TIFF: Z only;\n"
+        "                  default: a whole time point)\n");
+    const std::vector<imsmeta::OptionInfo>& vMetadataOptions = imsmeta::metadataOptions();
+    for(size_t i = 0; i < vMetadataOptions.size(); ++i){
+        fprintf(aOut, "  --%s %s\n                  %s\n", vMetadataOptions[i].name, vMetadataOptions[i].value, vMetadataOptions[i].help);
+    }
+    fprintf(aOut,
+        "  -h, --help      this text\n"
+        "Exit code 0 when the file was written; 1 on any error, after one \"ERROR: ...\" line on stderr.\n");
+}
+
+// The items of a comma-separated list, spaces around them removed; one trailing comma is fine
+// (the MATLAB wrapper writes "-v a,b,c,"), other empty items are not. False for an empty list.
+bool listValues(const std::string& aText, std::vector<std::string>& aItems)
+{
+    aItems.clear();
+    size_t vStart = 0;
+    for(;;){
+        size_t vEnd = aText.find(',', vStart);
+        const bool vLast = vEnd == std::string::npos;
+        if(vLast) vEnd = aText.size();
+        size_t vA = vStart, vB = vEnd;
+        while(vA < vB && (aText[vA] == ' ' || aText[vA] == '\t')) ++vA;
+        while(vB > vA && (aText[vB - 1] == ' ' || aText[vB - 1] == '\t')) --vB;
+        if(vA == vB){
+            if(!(vLast && !aItems.empty())) return false;   // empty, except after a trailing comma
+        }
+        else aItems.push_back(aText.substr(vA, vB - vA));
+        if(vLast) return !aItems.empty();
+        vStart = vEnd + 1;
+    }
+}
+
+// A whole number written as digits only.
+bool parseWhole(const std::string& aText, uint64_t& aValue)
+{
+    if(aText.empty()) return false;
+    for(size_t i = 0; i < aText.size(); ++i) if(aText[i] < '0' || aText[i] > '9') return false;
+    errno = 0;
+    aValue = strtoull(aText.c_str(), NULL, 10);
+    return errno == 0;
+}
+
+// aCount numbers > 0 (-v).
+bool parsePositiveFloats(const char* aText, unsigned aCount, float* aValues)
+{
+    std::vector<std::string> vItems;
+    if(!listValues(aText, vItems) || vItems.size() != aCount) return false;
+    for(unsigned i = 0; i < aCount; ++i){
+        char* vEnd = NULL;
+        aValues[i] = strtof(vItems[i].c_str(), &vEnd);
+        if(*vEnd != '\0' || !std::isfinite(aValues[i]) || !(aValues[i] > 0.0f)) return false;
+    }
+    return true;
+}
+
+// aCount whole numbers >= aMin (-b, -B, -C).
+bool parseWholes(const char* aText, unsigned aCount, uint64_t aMin, uint64_t* aValues)
+{
+    std::vector<std::string> vItems;
+    if(!listValues(aText, vItems) || vItems.size() != aCount) return false;
+    for(unsigned i = 0; i < aCount; ++i){
+        if(!parseWhole(vItems[i], aValues[i]) || aValues[i] < aMin) return false;
+    }
+    return true;
+}
+
+// The items of -F and -P: empty items (a trailing comma) are skipped.
 std::vector<std::string> listItems(const std::string& aText)
 {
     std::vector<std::string> vItems;
@@ -125,55 +183,51 @@ std::vector<std::string> listItems(const std::string& aText)
     return vItems;
 }
 
-bool wholeNumber(const char* aStart, const char* aEnd)
+// A leading "~" or "~/" is the home folder ($HOME) on Mac and Linux; nothing else in the path
+// changes. Not on Windows.
+std::string expandHome(const std::string& aPath)
 {
-    if(aEnd == aStart) return false;
-    while(*aEnd == ' ' || *aEnd == '\t') ++aEnd;
-    return *aEnd == '\0';
-}
-
-// aCount numbers read with strtof, as the original read -v, -b and -B.
-bool parseFloats(const char* aText, unsigned aCount, float* aValues)
-{
-    std::vector<std::string> vItems = listItems(aText);
-    if(vItems.size() != aCount) return false;
-    for(unsigned i = 0; i < aCount; ++i){
-        char* vEnd = NULL;
-        aValues[i] = strtof(vItems[i].c_str(), &vEnd);
-        if(!wholeNumber(vItems[i].c_str(), vEnd)) return false;
+    #ifndef _WIN32
+    if(!aPath.empty() && aPath[0] == '~' && (aPath.size() == 1 || aPath[1] == '/')){
+        const char* vHome = getenv("HOME");
+        if(vHome && *vHome) return std::string(vHome) + aPath.substr(1);
     }
-    return true;
+    #endif
+    return aPath;
 }
 
-// -b and -B: strtof, then converted to whole voxels as before.
-bool parseFloatSizes(const char* aText, unsigned aCount, uint64_t* aValues)
+bool isSeparator(char aChar)
 {
-    float vValues[6];
-    if(aCount > 6 || !parseFloats(aText, aCount, vValues)) return false;
-    for(unsigned i = 0; i < aCount; ++i){
-        if(!(vValues[i] >= 0.0f) || vValues[i] >= 18446744073709551616.0f) return false;
-        aValues[i] = (uint64_t)vValues[i];
+    #ifdef _WIN32
+    return aChar == '/' || aChar == '\\';
+    #else
+    return aChar == '/';
+    #endif
+}
+
+// Creates aPath and every missing folder above it. Returns 0, or the errno of the last mkdir
+// that failed (the caller then checks whether the folder is there).
+int makeFolders(const std::string& aPath)
+{
+    int vErrno = 0;
+    for(size_t i = 1; i <= aPath.size(); ++i){
+        if(i < aPath.size() && !isSeparator(aPath[i])) continue;
+        if(isSeparator(aPath[i - 1])) continue;                // "//", or a trailing separator
+        const std::string vPart = aPath.substr(0, i);
+        if(vPart[vPart.size() - 1] == ':') continue;           // a Windows drive ("C:")
+        #ifdef _WIN32
+        const int vMade = _mkdir(vPart.c_str());
+        #else
+        const int vMade = mkdir(vPart.c_str(), 0775);
+        #endif
+        vErrno = (vMade == 0 || errno == EEXIST) ? 0 : errno;
     }
-    return true;
+    return vErrno;
 }
 
-// -C: strtoull, as before.
-bool parseSizes(const char* aText, unsigned aCount, uint64_t* aValues)
+int badValue(char aOption, const char* aText, const char* aExpected)
 {
-    std::vector<std::string> vItems = listItems(aText);
-    if(vItems.size() != aCount) return false;
-    for(unsigned i = 0; i < aCount; ++i){
-        char* vEnd = NULL;
-        aValues[i] = strtoull(vItems[i].c_str(), &vEnd, 10);
-        if(!wholeNumber(vItems[i].c_str(), vEnd)) return false;
-    }
-    return true;
-}
-
-int badValue(char aOption, const char* aText, unsigned aCount)
-{
-    fprintf(stderr, "ERROR: Could not read -%c \"%s\": expected %u comma-separated numbers.\n", aOption, aText, aCount);
-    return 1;
+    return cliError(std::string("Could not read -") + aOption + " \"" + aText + "\": expected " + aExpected + ".");
 }
 
 // getopt keeps its position between calls: start over so runCli can run more than once.
@@ -189,8 +243,12 @@ void resetGetopt()
 
 int convertToImaris(int argc, char **argv)
 {
-    int64_t timepoints = -1;
-    int64_t channels = -1;
+    if(argc < 2){
+        printUsage(stderr);
+        return cliError("No arguments were given; the options are listed above.");
+    }
+    const char* channelsString = NULL;
+    const char* timepointsString = NULL;
     int option_index = 0;
     const char* vVoxelSizes = NULL;
     const char* folderNames = NULL;
@@ -210,30 +268,33 @@ int convertToImaris(int argc, char **argv)
         struct option vOption = {vMetadataOptions[i].name, required_argument, NULL, kMetadataBase + (int)i};
         vLongOptions.push_back(vOption);
     }
+    struct option vHelp = {"help", no_argument, NULL, 'h'};
+    vLongOptions.push_back(vHelp);
     struct option vEnd = {NULL, 0, NULL, 0};
     vLongOptions.push_back(vEnd);
     resetGetopt();
-    while (( option_index = getopt_long(argc, argv, ":c:P:t:f:F:o:r:v:n:b:B:C:", vLongOptions.data(), NULL)) != -1){
+    while (( option_index = getopt_long(argc, argv, ":hc:P:t:F:o:r:v:n:b:B:C:", vLongOptions.data(), NULL)) != -1){
         if(option_index >= kMetadataBase && option_index < kMetadataBase + (int)vMetadataOptions.size()){
             const std::string vError = imsmeta::parseMetadataOption(vMetadataOptions[option_index - kMetadataBase].name, optarg, vOptions);
-            if(!vError.empty()){
-                fprintf(stderr, "ERROR: %s\n", vError.c_str());
-                return 1;
-            }
+            if(!vError.empty()) return cliError(vError);
             continue;
         }
+        // The argument getopt just looked at, to name a bad long option.
+        const char* vArg = (optind > 0 && optind <= argc) ? argv[optind - 1] : "";
+        const bool vLong = !strncmp(vArg, "--", 2);
         switch (option_index) {
+        case 'h':
+            printUsage(stdout);
+            return 0;
         case 'c':
-            channels = atoi(optarg);
+            channelsString = optarg;
             break;
         case 'P':
             patterns = optarg;
             break;
         case 't':
-            timepoints = atoi(optarg);
+            timepointsString = optarg;
             break;
-        case 'f':
-            break;   // accepted and not used
         case 'F':
             folderNames = optarg;
             break;
@@ -258,61 +319,69 @@ int convertToImaris(int argc, char **argv)
         case 'C':
             blockProcessString = optarg;
             break;
+        case ':':
+            if(optopt >= kMetadataBase && optopt < kMetadataBase + (int)vMetadataOptions.size()){
+                return cliError(std::string("Option --") + vMetadataOptions[optopt - kMetadataBase].name + " needs a value. Run with -h for the options.");
+            }
+            if(vLong && strchr(vArg, '=')) return cliError(std::string("Option ") + vArg + " takes no value. Run with -h for the options.");
+            if(vLong) return cliError(std::string("Option ") + vArg + " needs a value. Run with -h for the options.");
+            return cliError(std::string("Option -") + (char)optopt + " needs a value. Run with -h for the options.");
         default:
-            printf("Option incorrect\n");
+            if(vLong) return cliError(std::string("Unknown or malformed option \"") + vArg + "\". Run with -h for the options.");
+            if(optopt > ' ' && optopt < 127) return cliError(std::string("Unknown option -") + (char)optopt + ". Run with -h for the options.");
+            return cliError(std::string("Unknown option \"") + vArg + "\". Run with -h for the options.");
         }
     }
+    if(optind < argc) return cliError(std::string("Unexpected argument \"") + argv[optind] + "\". Run with -h for the options.");
 
-    std::string folderNamesString = folderNames ? folderNames : "";
-    // Expand the tilde to the home directory on Mac and Linux (item by item, as std::getline
-    // split the list before: no empty item after a trailing comma)
-    #ifndef _WIN32
-    if(folderNames){
-        std::string vExpanded;
-        size_t vStart = 0;
-        while(vStart < folderNamesString.size()){
-            size_t vEnd = folderNamesString.find(',', vStart);
-            if(vEnd == std::string::npos) vEnd = folderNamesString.size();
-            vExpanded.append(expandTilde(folderNamesString.substr(vStart, vEnd - vStart).c_str()));
-            vExpanded.append(",");
-            vStart = vEnd + 1;
-        }
-        if(!vExpanded.empty()) vExpanded.erase(vExpanded.size() - 1);
-        folderNamesString = vExpanded;
+    // Tilde expansion item by item (a leading ~ only), then the folders without empty items
+    std::vector<std::string> folders = listItems(folderNames ? folderNames : "");
+    std::string folderNamesString;
+    for(size_t i = 0; i < folders.size(); ++i){
+        folders[i] = expandHome(folders[i]);
+        folderNamesString += (i ? "," : "") + folders[i];
     }
-    #endif
-    const std::vector<std::string> folders = listItems(folderNamesString);
     const std::vector<std::string> patternList = patterns ? listItems(patterns) : std::vector<std::string>();
-    if(folders.empty()){
-        fprintf(stderr, "ERROR: No input folder given. Use -F folder1,folder2,... to give the folders to search.\n");
-        return 1;
-    }
-    if(patternList.empty()){
-        fprintf(stderr, "ERROR: No channel pattern given. Use -P pattern1,pattern2,... (one pattern per channel).\n");
-        return 1;
-    }
+    if(folders.empty()) return cliError("No input folder given. Use -F folder1,folder2,... to give the folders to search.");
+    if(patternList.empty()) return cliError("No channel pattern given. Use -P pattern1,pattern2,... (one pattern per channel).");
 
-    if(vVoxelSizes && !parseFloats(vVoxelSizes, 3, vOptions.voxelSize)) return badValue('v', vVoxelSizes, 3);
+    if(vVoxelSizes && !parsePositiveFloats(vVoxelSizes, 3, vOptions.voxelSize)) return badValue('v', vVoxelSizes, "three numbers greater than 0 (X,Y,Z)");
     if(blockSizes){
-        if(!parseFloatSizes(blockSizes, 3, vOptions.blockSize)) return badValue('b', blockSizes, 3);
+        if(!parseWholes(blockSizes, 3, 1, vOptions.blockSize)) return badValue('b', blockSizes, "three whole numbers of at least 1 (X,Y,Z)");
         vOptions.hasBlockSize = true;
     }
     if(boundingBoxString){
-        if(!parseFloatSizes(boundingBoxString, 6, vOptions.boundingBox)) return badValue('B', boundingBoxString, 6);
+        if(!parseWholes(boundingBoxString, 6, 0, vOptions.boundingBox)) return badValue('B', boundingBoxString, "six whole numbers (X0,Y0,Z0,X1,Y1,Z1)");
         vOptions.hasBoundingBox = true;
     }
     if(blockProcessString){
-        if(!parseSizes(blockProcessString, 3, vOptions.processBlock)) return badValue('C', blockProcessString, 3);
+        if(!parseWholes(blockProcessString, 3, 1, vOptions.processBlock)) return badValue('C', blockProcessString, "three whole numbers of at least 1 (X,Y,Z)");
         vOptions.hasProcessBlock = true;
     }
+    uint64_t channels = 0, timepoints = 0;
+    if(channelsString && (!parseWhole(channelsString, channels) || !channels)) return badValue('c', channelsString, "a whole number of at least 1");
+    if(timepointsString && (!parseWhole(timepointsString, timepoints) || !timepoints)) return badValue('t', timepointsString, "a whole number of at least 1");
 
     if(!reader){
         printf("Reader type not specified. Defaulting to tiff.\n");
         reader = "tiff";
     }
     if(strcmp(reader,"tiff") && strcmp(reader,"zarr")){
-        printf("ERROR: Reader type \"%s\" is not a supported reader type.\n",reader);
-        return 0;
+        return cliError(std::string("Reader type \"") + reader + "\" is not a supported reader type (tiff or zarr).");
+    }
+
+    // Files and patterns: files[channel][timepoint], sorted by name
+    piw::Status vStatus = piw::findInputFiles(folders, patternList, reader, vOptions.files);
+    if(!vStatus.ok()) return cliExitCode(vStatus);
+    const uint64_t nChannels = vOptions.files.size();
+    const uint64_t nTimepoints = vOptions.files[0].size();
+    if(channelsString && channels != nChannels){
+        return cliError("-c " + std::to_string((unsigned long long)channels) + " was given, but -P gives " +
+                        std::to_string((unsigned long long)nChannels) + " pattern(s), one per channel.");
+    }
+    if(timepointsString && timepoints != nTimepoints){
+        return cliError("-t " + std::to_string((unsigned long long)timepoints) + " was given, but each channel has " +
+                        std::to_string((unsigned long long)nTimepoints) + " file(s).");
     }
 
     std::string outputDirString;
@@ -320,31 +389,17 @@ int convertToImaris(int argc, char **argv)
         outputDirString = folders[0];
         printf("Output Directory not provided. Using %s as the output directory.\n",outputDirString.c_str());
     }
-    else outputDirString = outputDirArg;
-    #ifdef WIN32
-    int madeDir = mkdir(outputDirString.c_str());
-    #else
-    // Expand the tilde to the home directory on Mac and Linux. A char* argument selects cpp-tiff's
-    // expandTilde(char*), as before (it runs wordexp on every path).
-    {
-        std::vector<char> vPath(outputDirString.begin(), outputDirString.end());
-        vPath.push_back('\0');
-        const char* expandedOutputDirString = expandTilde(vPath.data());
-        if(expandedOutputDirString) outputDirString = expandedOutputDirString;
-    }
-    int madeDir = mkdir(outputDirString.c_str(), 0775);
-    #endif
-    (void)madeDir;
+    else outputDirString = expandHome(outputDirArg);
+    const int vMkdirErrno = makeFolders(outputDirString);
     DIR* outputDir = opendir(outputDirString.c_str());
     if(!outputDir){
-        printf("ERROR: Given Output Directory \"%s\" does not exist and was unable to be created.\n",outputDirString.c_str());
-        return 0;
+        return cliError("Given Output Directory \"" + outputDirString + "\" does not exist and was unable to be created" +
+                        (vMkdirErrno ? std::string(": ") + strerror(vMkdirErrno) : std::string()) + ".");
     }
     closedir(outputDir);
     // Check if we can write to the output dir
     if(access(outputDirString.c_str(), W_OK)){
-        printf("ERROR: Given Output Directory \"%s\" exists but cannot be written to.\n",outputDirString.c_str());
-        return 0;
+        return cliError("Given Output Directory \"" + outputDirString + "\" exists but cannot be written to.");
     }
     if (!outName) outName = "output";
     #ifdef _WIN32
@@ -355,39 +410,16 @@ int convertToImaris(int argc, char **argv)
     const std::string timepointsFile = outputDirString + "/timepoints.txt";
     #endif
 
-    // Files and patterns: files[channel][timepoint], sorted by name
-    piw::Status vStatus = piw::findInputFiles(folders, patternList, vOptions.files);
-    if(vStatus.code == piw::Code::NotFound){
-        printf("ERROR: %s\n", vStatus.message.c_str());
-        return 0;
-    }
-    if(!vStatus.ok()) return cliExitCode(vStatus);
-    const uint64_t nChannels = vOptions.files.size();
-    uint64_t nTimepoints = 0;
-    for(size_t c = 0; c < vOptions.files.size(); ++c) nTimepoints += vOptions.files[c].size();
-
-    if(channels == -1) channels = nChannels;
-    if((uint64_t)channels != nChannels){
-        printf("Number of channels given \"%lld\" is incorrect",(long long)channels);
-        return 0;
-    }
-
-    if(timepoints == -1) timepoints = nTimepoints/nChannels;
-    if(nTimepoints/nChannels != (uint64_t)timepoints){
-        printf("Number of timepoints given \"%lld\" is incorrect",(long long)timepoints);
-        return 0;
-    }
-
-    FILE* fp;
-    fp = fopen(timepointsFile.c_str(),"a");
+    FILE* fp = fopen(timepointsFile.c_str(),"a");
     if(fp){
         fprintf(fp,"Folder Names: %s\n",folderNamesString.c_str());
         for(size_t c = 0; c < vOptions.files.size(); c++){
             fprintf(fp,"Channel Pattern: %s\n",patternList[c].c_str());
             for(size_t t = 0; t < vOptions.files[c].size(); t++) fprintf(fp,"%s\n",vOptions.files[c][t].c_str());
         }
-        fclose(fp);
+        if(fclose(fp)) fprintf(stderr, "WARNING: Could not write %s: %s; continuing.\n", timepointsFile.c_str(), strerror(errno));
     }
+    else fprintf(stderr, "WARNING: Could not open %s: %s; continuing without it.\n", timepointsFile.c_str(), strerror(errno));
 
     vOptions.reader = reader;
     vOptions.outputFile = outputFile;

@@ -3,7 +3,7 @@
 // ImarisWriter writes the .ims in its own threads, and an error there used to be dropped: the
 // converter then waited forever (or wrote an incomplete file and exited 0). This runs the shipped
 // executable on generated inputs whose output cannot be written, and checks that it exits with
-// code 1 and an "Error: ... write ..." message within 30 s (a run still going then is killed and
+// code 1 and an "ERROR: ... write ..." message within 30 s (a run still going then is killed and
 // counted as a hang; PIW_FAILTEST_TIMEOUT=<seconds> changes the limit, e.g. for a sanitizer build):
 //   1. a file-size limit (RLIMIT_FSIZE, SIGXFSZ ignored, so write() fails with EFBIG) of 8 MB, far
 //      below the output of an incompressible 40 MB volume (random uint16 in an uncompressed Zarr);
@@ -201,7 +201,7 @@ static void expectWriteFailure(const std::string& what, const std::string& exe, 
     else check(r.exitCode == 1, "exit code " + std::to_string(r.exitCode) + ", expected 1");
     const std::string o = lower(r.output);
     check(o.find("error:") != std::string::npos && o.find("write") != std::string::npos,
-          "no \"Error: ... write ...\" message in the output");
+          "no \"ERROR: ... write ...\" message in the output");
     std::printf("  exit %d after %.1f s\n%s", r.exitCode, r.seconds, tail(r.output).c_str());
     if(gFailures == before) std::printf("  OK\n");
 }
