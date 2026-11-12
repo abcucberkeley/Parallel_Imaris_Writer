@@ -609,9 +609,7 @@ void convertToImaris(int argc, char **argv)
         for (uint64_t vT = 0; vT < vNBlocksT; ++vT) {
             aBlockIndex.mValueT = vT;
             char fileName[10000];
-            //sprintf(fileName,"D:\\imarisData\\ch%llu_z0_t%04llu.tif",vC,vT+1);
             //sprintf(fileName,files,vC,vT+1);
-            //sprintf(fileName,"X:\\Data\\20220115_Korra_LLCPK_LFOV_0p1PSAmpKan\\DSR_RotateXY_Cropped_filtered_combined\\ch%llu_z0_t%04llu.tif",vC,vT+1+skipN);
             //skipN += 7;
             sprintf(fileName,files[vT+(vC*vNBlocksT)]);
             printf("Current File: %s\n",fileName);
@@ -650,6 +648,11 @@ void convertToImaris(int argc, char **argv)
                 else vData = readZarrParallelHelper(fileName,
                                  boundingBox[0]+x0, boundingBox[1]+y0, boundingBox[2]+z0,
                                  boundingBox[0]+xEnd, boundingBox[1]+yEnd, boundingBox[2]+zEnd, 0);
+                // The readers return NULL on failure; don't let it zero-fill like padding.
+                if(!vData){
+                    fprintf(stderr, "Error: could not read %s\n", fileName);
+                    exit(1);
+                }
             }
 
             for (uint64_t vZ = vZbase; vZ < vZlimit; ++vZ) {
@@ -780,9 +783,6 @@ void convertToImaris(int argc, char **argv)
 
 int main(int argc, char **argv)
 {
-    //listFiles("C:/Users/Matt/Desktop/test","CamA");
-    //return 0;
-
     // Cluster subcommands (setup/worker/combine/monitor); otherwise the monolithic conversion.
     if(argc >= 2 && isParallelCommand(argv[1])) return runParallel(argc, argv);
 

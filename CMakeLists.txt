@@ -104,7 +104,7 @@ FetchContent_MakeAvailable(hdf5)
 # ---------------------------------------------------------------------------
 # cpp-tiff and cpp-zarr -- your reader libraries, built as libcppTiff/libcppZarr.
 # Pinned to release tags for reproducibility; bump the GIT_TAGs to pick up new
-# versions. cpp-tiff v1.5.1 carries the Z-range readTiffParallelWrapper overload
+# versions. cpp-tiff v1.5.1+ carries the Z-range readTiffParallelWrapper overload
 # the -C block feature needs.
 # ---------------------------------------------------------------------------
 # cpp-zarr's bundled c-blosc2 otherwise builds its own zlib-ng, whose "zlib"/
@@ -113,11 +113,11 @@ FetchContent_MakeAvailable(hdf5)
 set(PREFER_EXTERNAL_ZLIB ON CACHE BOOL "" FORCE)
 FetchContent_Declare(cpptiff
     GIT_REPOSITORY https://github.com/abcucberkeley/cpp-tiff.git
-    GIT_TAG        v1.5.1
+    GIT_TAG        v1.7.3
 )
 FetchContent_Declare(cppzarr
     GIT_REPOSITORY https://github.com/abcucberkeley/cpp-zarr.git
-    GIT_TAG        v1.5.1
+    GIT_TAG        v1.7.3
 )
 FetchContent_MakeAvailable(cpptiff cppzarr)
 

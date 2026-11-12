@@ -244,6 +244,7 @@ static int doWorker(const std::string& wd,int r,long index){
         bpSize ex=std::min(to[0]+td[0],m.X),ey=std::min(to[1]+td[1],m.Y),ez=std::min(to[2]+td[2],m.Z);
         if(to[0]<m.X&&to[1]<m.Y&&to[2]<m.Z){ bpSize rx=ex-to[0],ry=ey-to[1],rz=ez-to[2];
             uint16_t* reg=(uint16_t*)readZarrParallelHelper(zarrAt(m,c,t).c_str(),to[0],to[1],to[2],ex,ey,ez,0);
+            if(!reg){ fprintf(stderr,"cannot read %s\n",zarrAt(m,c,t).c_str()); return 1; }
             for(bpSize z=0;z<rz;z++)for(bpSize y=0;y<ry;y++)for(bpSize x=0;x<rx;x++) tile[x+y*td[0]+z*(size_t)td[0]*td[1]]=reg[x+y*rx+z*(size_t)rx*ry];
             free(reg); }
     } else {
