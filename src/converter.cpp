@@ -522,6 +522,12 @@ Status validate(const ConvertOptions& aOptions){
     if(aOptions.reader != "tiff" && aOptions.reader != "zarr"){
         return Status(Code::InvalidArgument, "Reader type \"" + aOptions.reader + "\" is not a supported reader type.");
     }
+    if(aOptions.inputAxes != InputAxes::YXZ && aOptions.inputAxes != InputAxes::ZYX){
+        return Status(Code::InvalidArgument, "Unknown input axes " + std::to_string((int)aOptions.inputAxes) + ".");
+    }
+    if(aOptions.inputAxes == InputAxes::ZYX && aOptions.reader != "zarr"){
+        return Status(Code::InvalidArgument, "(z, y, x) input axes are for Zarr input only; TIFF pages are (y, x, z).");
+    }
     if(aOptions.files.empty() || aOptions.files[0].empty()){
         return Status(Code::InvalidArgument, "No input files were given.");
     }
@@ -857,7 +863,10 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     const bool vTiff = aOptions.reader == "tiff";
     const uint64_t channels = aOptions.files.size();
     const uint64_t timepoints = aOptions.files[0].size();
-    const int vAxis[3] = {aOptions.xOnImarisX ? 1 : 0, aOptions.xOnImarisX ? 0 : 1, 2};
+    // The input axes of the image's y, x and z; Imaris X, Y, Z are its y, x, z (x, y, z with xOnImarisX).
+    const bool vZyx = aOptions.inputAxes == InputAxes::ZYX;
+    const int vImageY = vZyx ? 1 : 0, vImageX = vZyx ? 2 : 1, vImageZ = vZyx ? 0 : 2;
+    const int vAxis[3] = {aOptions.xOnImarisX ? vImageX : vImageY, aOptions.xOnImarisX ? vImageY : vImageX, vImageZ};
 
     imsmeta::Metadata vMetadata;
     uint64_t vShape[3] = {0, 0, 0};
@@ -992,6 +1001,13 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
                         if(inStart[2] == 0 && inEnd[2] == vFull[2]) vData = readTiffParallelWrapper(fileName);
                         else vData = readTiffParallelWrapper(fileName, {inStart[2], inEnd[2]});
                     }
+                    else if(vZyx){
+                        // in C order, the input's axis 2 (the image's x) fastest: a (z, y, x) Zarr
+                        // is stored so, and the fill reads it as a (z, y, x) array in memory
+                        zarr Zarr(vFile);
+                        vData = parallelReadZarrWriteWrapper(Zarr, true, {inStart[0], inStart[1], inStart[2]},
+                                                             {inEnd[0], inEnd[1], inEnd[2]}, true);
+                    }
                     else vData = readZarrParallelHelper(fileName,
                                      inStart[0], inStart[1], inStart[2], inEnd[0], inEnd[1], inEnd[2], 0);
                 }
@@ -1001,11 +1017,15 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
                 vReadSeconds += secondsSince(vReadStart);
                 // The readers return NULL on failure; don't let it zero-fill like padding.
                 if(!vData) return Status(Code::ReadFailed, "could not read " + vFile + (vWhy.empty() ? "" : ": " + vWhy));
-                // The buffer runs along the input's axes, axis 0 fastest. A TIFF read holds whole
-                // pages, so the region starts at the box's row and column inside them.
+                // The buffer runs along the input's axes, axis 0 fastest (axis 2 with vZyx). A
+                // TIFF read holds whole pages, so the region starts at the box's row and column
+                // inside them.
                 const uint64_t vRows = vTiff ? vFull[0] : inEnd[0] - inStart[0];
                 const uint64_t vCols = vTiff ? vFull[1] : inEnd[1] - inStart[1];
-                const int64_t vInStride[3] = {1, (int64_t)vRows, (int64_t)(vRows*vCols)};
+                const uint64_t vPages = inEnd[2] - inStart[2];
+                const int64_t vInStride[3] = {vZyx ? (int64_t)(vCols*vPages) : 1,
+                                              vZyx ? (int64_t)vPages : (int64_t)vRows,
+                                              vZyx ? 1 : (int64_t)(vRows*vCols)};
                 for(int i = 0; i < 3; ++i) vStride[i] = vInStride[vAxis[i]];
                 const uint64_t vOffset = vTiff ? inStart[0] + inStart[1]*vRows : 0;
                 vSrc = (const char*)vData + vOffset*vBytes;

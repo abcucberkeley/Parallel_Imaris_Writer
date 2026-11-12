@@ -1,1 +1,2 @@
-from .parallel_imaris_writer_wrappers import __version__, ims_info, read_ims, run_cli, write_ims
+from .parallel_imaris_writer_wrappers import (__version__, convert_dataset, convert_to_ims, find_input_files, ims_info,
+                                              read_ims, run_cli, write_ims)

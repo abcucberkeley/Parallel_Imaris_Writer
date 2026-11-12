@@ -44,7 +44,7 @@ jobs:
           msystem: UCRT64
           update: false
           install: git
-          pacboy: gcc:p libgomp:p cmake:p ninja:p
+          pacboy: gcc:p libgomp:p cmake:p ninja:p python:p python-numpy:p pybind11:p
 
       # Same compiler as the release builds. Apple clang has no OpenMP.
       - name: Set up GCC 13 (macOS)
@@ -54,15 +54,25 @@ jobs:
           echo "CC=$(brew --prefix gcc@13)/bin/gcc-13" >> "$GITHUB_ENV"
           echo "CXX=$(brew --prefix gcc@13)/bin/g++-13" >> "$GITHUB_ENV"
 
+      # The Python tests' interpreter on Linux and macOS (Windows uses MSYS2's, built with the
+      # same MinGW toolchain as the library).
+      - name: Set up Python (Linux, macOS)
+        if: runner.os != 'Windows'
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
       # The release target assembles the shipped folder (executable, libcppTiff,
       # libcppZarr and, on Linux and macOS, libgomp) that the tests run from.
       # PIW_BUILD_PYTHON_LIB also builds libparallelImarisWriter, the Python
-      # package's library, so that it links on every system.
+      # package's library, installed with the readers and the header into install/
+      # (lib/, bin/ on Windows; include/) for the Python tests.
       - name: Build
         run: |
-          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release -DPIW_BUILD_TESTS=ON -DPIW_BUILD_PYTHON_LIB=ON
+          cmake -S . -B build -G "${{ matrix.generator }}" -DCMAKE_BUILD_TYPE=Release -DPIW_BUILD_TESTS=ON -DPIW_BUILD_PYTHON_LIB=ON -DCMAKE_INSTALL_LIBDIR=lib
           cmake --build build --parallel 4
           cmake --build build --target release
+          cmake --install build --prefix install --component python
 
       - name: C++ tests
         run: ctest --test-dir build --output-on-failure
@@ -72,3 +82,36 @@ jobs:
       # test was not registered: nm or objdump not found).
       - name: Runtime symbol report
         run: ctest --test-dir build -R runtimeIsolation -V --no-tests=error
+
+      # Compiles the module straight against the installed library and runs the test file the
+      # wheels run. Linked as A-11's runtime model has every binary: its own static libstdc++
+      # (Linux: kept private, __cxa_pure_virtual included, and only PyInit_* exported; macOS: only
+      # its entry point exported, so the loader merges none of its weak C++ code with another
+      # module's); the unwinder is libgcc_s on Linux and libSystem's on macOS. Windows: MSYS2's
+      # Python, the library's DLLs next to the module (MinGW's own DLLs are beside python.exe).
+      - name: Python tests
+        run: |
+          python -c "import sys; print(sys.version)"
+          EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          MOD=python/parallel_imaris_writer/parallel_imaris_writer$EXT
+          case "$RUNNER_OS" in
+            Linux)
+              python -m pip install numpy pybind11
+              printf '{ global: PyInit_*; local: *; };\n' > build/module.map
+              FLAGS="-fPIC -fvisibility=hidden -fvisibility-inlines-hidden $(python -m pybind11 --includes) -Wl,-rpath,$PWD/install/lib -static-libstdc++ -Wl,--exclude-libs,ALL -Wl,--version-script=build/module.map -Wl,--undefined=__cxa_pure_virtual" ;;
+            macOS)
+              python -m pip install numpy pybind11
+              FLAGS="-fPIC -fvisibility=hidden -fvisibility-inlines-hidden $(python -m pybind11 --includes) -isysroot $(xcrun --show-sdk-path) -undefined dynamic_lookup -Wl,-rpath,$PWD/install/lib -static-libstdc++ -static-libgcc -Wl,-exported_symbol,_PyInit_parallel_imaris_writer" ;;
+            Windows)
+              PYINC=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
+              PYVER=$(python -c "import sysconfig; print(sysconfig.get_config_var('LDVERSION'))")
+              FLAGS="-I$PYINC -lpython$PYVER"
+              cp install/bin/*.dll python/parallel_imaris_writer/ ;;
+          esac
+          "${CXX:-g++}" -O2 -std=c++17 -shared python/parallel_imaris_writer.cpp -o "$MOD" \
+            -Iinstall/include -Linstall/lib -Linstall/bin -lparallelImarisWriter $FLAGS
+          case "$RUNNER_OS" in
+            Linux) nm -D --defined-only "$MOD" ;;
+            macOS) nm -gU "$MOD" ;;
+          esac
+          PYTHONPATH=python python python/tests/test_python.py

@@ -38,6 +38,8 @@
 //     transposed data
 //   - bounding boxes on TIFF input (-B, through the API and the executable, whole and with -C)
 //     give the cropped input, the same file as on a Zarr of the same data
+//   - inputAxes ZYX: a C-order (z, y, x) Zarr gives the file of the (y, x, z) Zarr of the same
+//     image (with xOnImarisX, -C and a box too); TIFF input refuses it
 //   usage: apiTest <path-to-parallelimariswriter> [workdir]
 //          apiTest --tiff <file.tif> <workdir> [bx,by,bz]   (timing: writeVolumes of a TIFF from
 //          its (y, x, z) buffer and from a (z, y, x) C-contiguous copy; the files are left there)
@@ -678,6 +680,63 @@ static void testVolumes(const fs::path& work, const fs::path& mdir){
         s = piw::imsDataset(native(work/"not_hdf5.ims"), 0, 0, 0, size, type);
         check(s.code == piw::Code::ReadFailed, "imsDataset of a text file: ReadFailed (" + s.message + ")");
     }
+}
+
+// (z, y, x) Zarr input (InputAxes::ZYX): a C-order Zarr whose dims are the image's (z, y, x) gives
+// the file of the (y, x, z) Zarr of the same image, its per-axis values along (z, y, x), with and
+// without xOnImarisX, a processing block and a bounding box; TIFF input refuses it.
+static void testZyxInput(const fs::path& work, const fs::path& zdir, const fs::path& tdir){
+    std::printf("[(z, y, x) Zarr input]\n");
+    const Dims d = {100, 70, 200};                   // zdir's Zarr, seed 0: dims (0, 1, 2) = the image's (y, x, z)
+    std::vector<uint16_t> v = makeVolume(d.x, d.y, d.z, 0);
+    const fs::path cdir = work/"zyx_zarr";
+    fs::create_directories(cdir);
+    {
+        // dims (z, y, x) = (d.z, d.x, d.y), C order: element [z][a][b] is v[a + b*d.x + z*d.x*d.y]
+        std::vector<uint64_t> shape = {d.z, d.x, d.y}, chunks = {32, 32, 32};
+        zarr Zw;
+        Zw.set_fileName((cdir/"CamA_t0000.zarr").string());
+        Zw.set_cname("zstd"); Zw.set_clevel(5); Zw.set_order("C");
+        Zw.set_chunks(chunks); Zw.set_dimension_separator("."); Zw.set_dtype("<u2"); Zw.set_shape(shape);
+        Zw.write_zarray();
+        Zw.set_chunkInfo({0,0,0}, shape);
+        if(parallelWriteZarr(Zw, v.data(), {0,0,0}, shape, shape, {d.x*d.y, 1, d.x}, 16, false, false, false)){
+            std::fprintf(stderr,"Zarr write failed: %s\n", Zw.get_errString().c_str()); std::exit(1); }
+    }
+    const uint64_t box[6] = {10, 5, 20, 90, 60, 150};          // (y, x, z) of zdir's Zarr
+    int i = 0;
+    for(bool xOnX : {false, true}){
+        for(const char* pb : {"", "32,32,32"}){
+            for(bool withBox : {false, true}){
+                const std::string tag = std::to_string(i++);
+                const std::string what = std::string(xOnX ? "xOnImarisX" : "default") + (*pb ? " -C 32,32,32" : "") +
+                                         (withBox ? " with a box" : "");
+                const fs::path ref = work/("zyx_ref" + tag + ".ims"), out = work/("zyx_" + tag + ".ims");
+                piw::ConvertOptions r = optionsFor("zarr", findFiles(zdir, {"CamA"}), ref, pb);
+                piw::ConvertOptions c = optionsFor("zarr", findFiles(cdir, {"CamA"}), out, pb);
+                r.voxelSize[0] = 0.1f; r.voxelSize[1] = 0.2f; r.voxelSize[2] = 0.3f;
+                c.voxelSize[0] = 0.3f; c.voxelSize[1] = 0.1f; c.voxelSize[2] = 0.2f;
+                if(*pb){ c.processBlock[0] = 64; c.processBlock[1] = 32; c.processBlock[2] = 48; }
+                c.inputAxes = piw::InputAxes::ZYX;
+                r.xOnImarisX = c.xOnImarisX = xOnX;
+                r.startTime = c.startTime = kStartTime;
+                if(withBox){
+                    r.hasBoundingBox = c.hasBoundingBox = true;
+                    const uint64_t zyx[6] = {box[2], box[0], box[1], box[5], box[3], box[4]};
+                    for(int j = 0; j < 6; ++j){ r.boundingBox[j] = box[j]; c.boundingBox[j] = zyx[j]; }
+                }
+                Recorder rec;
+                const piw::Status rs = piw::convert(r, callbacksFor(rec)), cs = piw::convert(c, callbacksFor(rec));
+                check(rs.ok() && cs.ok(), "(z, y, x) Zarr " + what + " (" + rs.message + cs.message + ")");
+                if(rs.ok() && cs.ok()) checkSameInfo(ref, out, "(z, y, x) Zarr " + what + ": the (y, x, z) Zarr's file");
+            }
+        }
+    }
+    piw::ConvertOptions t = optionsFor("tiff", findFiles(tdir, {"CamA"}), work/"zyx_tiff.ims", "");
+    t.inputAxes = piw::InputAxes::ZYX;
+    const piw::Status s = piw::convert(t);
+    check(s.code == piw::Code::InvalidArgument && !fs::exists(work/"zyx_tiff.ims"),
+          "(z, y, x) input axes with TIFF input: InvalidArgument, no output (" + s.message + ")");
 }
 
 // The image's x on Imaris X (xOnImarisX), and bounding boxes on TIFF input (fixed in this
@@ -1636,9 +1695,10 @@ int main(int argc, char** argv){
 
     metadataTests(exe, work, mdir);
 
-    // --- 6. in-memory volumes and read-back; xOnImarisX; TIFF bounding boxes ---
+    // --- 6. in-memory volumes and read-back; xOnImarisX; TIFF bounding boxes; (z, y, x) Zarrs ---
     testVolumes(work, mdir);
     testAxesAndBoxes(work, tdir, zdir, exe);
+    testZyxInput(work, zdir, tdir);
 
     if(gFailures == 0){ std::printf("apitest PASSED\n"); return 0; }
     std::printf("apitest FAILED (%d checks)\n", gFailures);

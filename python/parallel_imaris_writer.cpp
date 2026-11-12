@@ -330,12 +330,14 @@ void setMetadata(Options& aOptions, const std::vector<std::string>& aChannelName
 }
 
 // piw::convert with every field of piw::ConvertOptions; sizes, voxel sizes and the box along the
-// input's axes 0, 1, 2 (Imaris X, Y, Z; with aXOnImarisX axis 1 is Imaris X and axis 0 Imaris Y).
-// None for a size or the box: not given.
+// input's axes 0, 1, 2: the image's (y, x, z) with aInputAxes "yxz", its (z, y, x) with "zyx"
+// (Zarr only). Imaris X, Y, Z are the image's y, x, z (x, y, z with aXOnImarisX). None for a size
+// or the box: not given.
 void pybind11_convert(const std::string& aReader, const std::vector<std::vector<std::string> >& aFiles,
                       const std::string& aOutputFile, const std::array<float, 3>& aVoxelSize,
                       const pybind11::object& aBlockSize, const pybind11::object& aBoundingBox,
                       const pybind11::object& aProcessBlock, int aNumThreads, bool aXOnImarisX,
+                      const std::string& aInputAxes,
                       const std::vector<std::string>& aChannelNames,
                       const std::vector<std::array<float, 3> >& aChannelColors,
                       const std::vector<float>& aEmissionWavelengths,
@@ -353,6 +355,10 @@ void pybind11_convert(const std::string& aReader, const std::vector<std::vector<
     vOptions.hasProcessBlock = optionalSizes(aProcessBlock, "process_block", vOptions.processBlock);
     vOptions.numThreads = aNumThreads;
     vOptions.xOnImarisX = aXOnImarisX;
+    if(aInputAxes == "zyx") vOptions.inputAxes = piw::InputAxes::ZYX;
+    else if(aInputAxes != "yxz"){
+        throw pybind11::value_error("input_axes must be 'yxz' or 'zyx', not '" + aInputAxes + "'");
+    }
     setMetadata(vOptions, aChannelNames, aChannelColors, aEmissionWavelengths, aExcitationWavelengths,
                 aTimeInterval, aStartTime);
 
@@ -518,17 +524,25 @@ pybind11::tuple pybind11_ims_dataset(const std::string& aFile, unsigned aLevel, 
     return pybind11::make_tuple(triple(vSize), dataTypeName(vType));
 }
 
-std::vector<std::vector<std::string> > pybind11_find_input_files(const std::vector<std::string>& aFolders,
-                                                                  const std::vector<std::string>& aPatterns)
+// piw::findInputFiles: files[channel][timepoint] as str (names that are not UTF-8 with surrogates,
+// as os.fsdecode gives them). aReader "tiff", "zarr", or "" for both (not both for one pattern).
+pybind11::list pybind11_find_input_files(const std::vector<std::string>& aFolders,
+                                         const std::vector<std::string>& aPatterns, const std::string& aReader)
 {
     std::vector<std::vector<std::string> > vFiles;
     piw::Status vStatus;
     {
         pybind11::gil_scoped_release vRelease;
-        vStatus = piw::findInputFiles(aFolders, aPatterns, vFiles);
+        vStatus = piw::findInputFiles(aFolders, aPatterns, aReader, vFiles);
     }
     throwIfFailed(vStatus);
-    return vFiles;
+    pybind11::list vChannels;
+    for(size_t vC = 0; vC < vFiles.size(); ++vC){
+        pybind11::list vChannel;
+        for(size_t vT = 0; vT < vFiles[vC].size(); ++vT) vChannel.append(text(vFiles[vC][vT]));
+        vChannels.append(vChannel);
+    }
+    return vChannels;
 }
 
 }  // namespace
@@ -550,7 +564,7 @@ PYBIND11_MODULE(parallel_imaris_writer, m) {
           pybind11::arg("output_file"), pybind11::arg("voxel_size"),
           pybind11::arg("block_size") = pybind11::none(), pybind11::arg("bounding_box") = pybind11::none(),
           pybind11::arg("process_block") = pybind11::none(), pybind11::arg("num_threads") = 0,
-          pybind11::arg("x_on_imaris_x") = false,
+          pybind11::arg("x_on_imaris_x") = false, pybind11::arg("input_axes") = std::string("yxz"),
           pybind11::arg("channel_names") = std::vector<std::string>(),
           pybind11::arg("channel_colors") = std::vector<std::array<float, 3> >(),
           pybind11::arg("emission_wavelengths") = std::vector<float>(),
@@ -585,5 +599,6 @@ PYBIND11_MODULE(parallel_imaris_writer, m) {
           "(size along Imaris X, Y, Z, data type name) of one dataset, without listing chunks (piw::imsDataset)");
 
     m.def("pybind11_find_input_files", &pybind11_find_input_files, pybind11::arg("folders"), pybind11::arg("patterns"),
-          "The command line's input files: files[channel][timepoint]");
+          pybind11::arg("reader") = std::string(),
+          "The command line's input files: files[channel][timepoint] (reader 'tiff', 'zarr' or '' for both)");
 }

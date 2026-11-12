@@ -7,6 +7,17 @@ Sections:
               an output it cannot write) and the file conversion call (pybind11_convert with its input
               selection, messages, progress, the opt-in x-on-Imaris-X mapping, errors, Ctrl-C), on
               small Zarr v2 volumes written here with NumPy alone; the version against CMakeLists.txt
+  convert     convert_to_ims and find_input_files on Zarr ((y, x, z) in F order, (z, y, x) in C
+              order) and TIFF inputs written here: the file of write_ims of the same array, also with
+              process_block_size, block_size, input_bbox (the array's crop), order='F', input_axes and
+              x_on_imaris_x (read back with it too); two channels and three time points by patterns in
+              name order; the command line with the same options; compressed inputs from cpp-zarr and
+              cpp-tiff when installed; errors (no match, no metadata, a truncated chunk, a box outside,
+              inputs of different sizes, mixed orders, ...) leave nothing behind
+  dataset     convert_dataset as PetaKit5D's MATLAB dataset wrapper: the file and path of its command
+              line, overwrite, result_dir_name, TIFF datasets, a missing match (None, a warning), a
+              list of datasets and one in two folders, inputs of different sizes refused before any
+              output unless input_bbox lies inside all of them
   roundtrip   write_ims then read_ims and ims_info: uint8, uint16, uint32 and float32, order 'C' and
               'F', 2-D to 5-D arrays and lists, odd sizes, every resolution level, regions, out=
   layout      the memory layout never changes the file: F-contiguous, strided, reversed, other byte
@@ -40,11 +51,13 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import warnings
 
 import numpy as np
 import parallel_imaris_writer as piw
@@ -150,11 +163,11 @@ def zvolume(seed, shape=ZSHAPE):
     return ((y * 7 + x * 13 + z * 17 + seed * 137) % 4096 + 1).astype(np.uint16)
 
 
-def write_zarr(path, data, chunks=ZCHUNKS):
-    # An uncompressed Zarr v2 array in F order (MATLAB's layout), chunk files named i.j.k
+def write_zarr(path, data, chunks=ZCHUNKS, order='F'):
+    # An uncompressed Zarr v2 array, in F order (MATLAB's layout) by default, chunk files named i.j.k
     os.makedirs(path)
     meta = {'zarr_format': 2, 'shape': list(data.shape), 'chunks': list(chunks), 'dtype': data.dtype.str,
-            'order': 'F', 'compressor': None, 'fill_value': 0, 'filters': None, 'dimension_separator': '.'}
+            'order': order, 'compressor': None, 'fill_value': 0, 'filters': None, 'dimension_separator': '.'}
     with open(os.path.join(path, '.zarray'), 'w') as f:
         json.dump(meta, f)
     counts = [-(-n // c) for n, c in zip(data.shape, chunks)]
@@ -164,7 +177,35 @@ def write_zarr(path, data, chunks=ZCHUNKS):
         part = data[region]
         chunk[tuple(slice(0, s) for s in part.shape)] = part
         with open(os.path.join(path, '.'.join(map(str, index))), 'wb') as f:
-            f.write(chunk.tobytes(order='F'))
+            f.write(chunk.tobytes(order=order))
+
+
+def write_tiff(path, image):
+    # A multi-page uncompressed little-endian TIFF of a (y, x, z) image, as PetaKit5D stores one:
+    # page k holds image[:, :, k], its rows y and its columns x
+    ny, nx, nz = image.shape
+    data = image.astype(image.dtype.newbyteorder('<'))
+    pages = [np.ascontiguousarray(data[:, :, k]).tobytes() for k in range(nz)]
+    fmt = {'u': 1, 'i': 2, 'f': 3}[image.dtype.kind]
+    entries = 11
+    ifd_size = 2 + entries * 12 + 4
+    first_ifd = 8 + sum(len(p) for p in pages)
+    out = bytearray(b'II*\x00' + struct.pack('<I', first_ifd))
+    offsets = []
+    for p in pages:
+        offsets.append(len(out))
+        out += p
+    for k, p in enumerate(pages):
+        nxt = first_ifd + (k + 1) * ifd_size if k + 1 < nz else 0
+        tags = [(256, 4, nx), (257, 4, ny), (258, 3, image.dtype.itemsize * 8), (259, 3, 1), (262, 3, 1),
+                (273, 4, offsets[k]), (277, 3, 1), (278, 4, ny), (279, 4, len(p)), (284, 3, 1), (339, 3, fmt)]
+        out += struct.pack('<H', entries)
+        for tag, kind, value in tags:
+            out += struct.pack('<HHI', tag, kind, 1) + (struct.pack('<HH', value, 0) if kind == 3 else
+                                                         struct.pack('<I', value))
+        out += struct.pack('<I', nxt)
+    with open(path, 'wb') as f:
+        f.write(out)
 
 
 def is_hdf5(path):
@@ -326,6 +367,338 @@ def interrupt(call, after):
     if seconds is None:     # (the interrupt came between the call's end and the line after it)
         seconds = time.time() - t0
     return interrupted, seconds
+
+
+# ---- convert: convert_to_ims and find_input_files
+
+def normalized(files):
+    return [[os.path.normpath(f) for f in channel] for channel in files]
+
+
+def mtime_ns(path):
+    return os.stat(path).st_mtime_ns
+
+
+def seconds(stamp):
+    # 'YYYY-MM-DD HH:MM:SS[.mmm]' as seconds
+    t = datetime.datetime.strptime(stamp[:19], '%Y-%m-%d %H:%M:%S').timestamp()
+    return t + (int(stamp[20:23]) / 1000 if len(stamp) > 20 else 0)
+
+
+def test_convert(tmp):
+    # One (z, y, x) volume stored as PetaKit5D stores it, (y, x, z): an F-order Zarr and a TIFF;
+    # and as a C-order (z, y, x) Zarr
+    a = sample((37, 61, 45), np.uint16, seed=11)
+    img = np.transpose(a, (1, 2, 0))
+    voxel = (0.5, 0.2, 0.1)
+    dirs = {k: os.path.join(tmp, k) for k in ('zarr', 'tiff', 'zyx')}
+    for d in dirs.values():
+        os.makedirs(d)
+    zf = os.path.join(dirs['zarr'], 'CamA_t0000.zarr')
+    tf = os.path.join(dirs['tiff'], 'CamA_t0000.tif')
+    cf = os.path.join(dirs['zyx'], 'CamA_t0000.zarr')
+    write_zarr(zf, img, chunks=(32, 32, 16))
+    write_tiff(tf, img)
+    write_zarr(cf, a, chunks=(16, 32, 32), order='C')
+
+    def out(name):
+        return os.path.join(tmp, name + '.ims')
+
+    def write(name, data, **kw):
+        piw.write_ims(out(name), data, start_time=START, channel_names=['CamA'], **kw)
+        return out(name)
+
+    def convert(name, **kw):
+        kw.setdefault('start_time', START)
+        piw.convert_to_ims(out(name), **kw)
+        return out(name)
+    ref = write('ref', a, voxel_size=voxel)
+    check(same_file(ref, convert('z', folders=dirs['zarr'], channel_patterns='CamA', voxel_size=voxel)) and
+          np.array_equal(piw.read_ims(out('z')), a), 'convert_to_ims of a (y, x, z) Zarr: the file of write_ims')
+    check(same_file(ref, convert('t', folders=[dirs['tiff']], channel_patterns=['CamA'], voxel_size=voxel)),
+          'convert_to_ims of a (y, x, z) TIFF: the file of write_ims')
+    check(same_file(ref, convert('tf', files=tf, voxel_size=voxel, channel_names=['CamA'])),
+          'convert_to_ims(files=one TIFF): the same file')
+    check(same_file(ref, convert('c', folders=dirs['zyx'], channel_patterns='CamA', voxel_size=voxel)),
+          'a C-order (z, y, x) Zarr, input_axes from its order: the same file')
+    check(same_file(ref, convert('c2', files=[cf], input_axes='zyx', voxel_size=voxel, channel_names=['CamA'])),
+          "input_axes='zyx': the same file")
+    other = convert('c3', files=cf, input_axes='yxz', voxel_size=voxel, channel_names=['CamA'])
+    check(crcs(other) != crcs(ref) and piw.ims_info(other, order='F')['shape'] == a.shape,
+          "the C-order Zarr with input_axes='yxz' is the (y, x, z) image of its dims: another file")
+    check(same_file(ref, convert('zF', folders=dirs['zarr'], channel_patterns='CamA', voxel_size=(0.2, 0.1, 0.5),
+                                 order='F')), "order='F': voxel_size (dy, dx, dz)")
+    check(same_file(ref, convert('zmap', folders=dirs['zarr'], channel_patterns='CamA',
+                                 voxel_size={'x': 0.1, 'y': 0.2, 'z': 0.5})), 'voxel_size as a mapping')
+
+    # block_size and process_block_size do not change the file
+    for name, kw in (('z', dict(folders=dirs['zarr'])), ('t', dict(folders=dirs['tiff'])),
+                     ('c', dict(folders=dirs['zyx']))):
+        for pb in ((8, 16, 16), (20, 61, 45)):
+            check(crcs(convert('pb', channel_patterns='CamA', voxel_size=voxel, process_block_size=pb, **kw)) ==
+                  crcs(ref), f'{name}: process_block_size {pb}')
+        check(crcs(convert('bs', channel_patterns='CamA', voxel_size=voxel, block_size=(16, 32, 24), **kw)) ==
+              crcs(ref), f'{name}: block_size (16, 32, 24)')
+
+    # input_bbox (z0, y0, x0, z1, y1, x1): the crop of the array
+    box = (3, 5, 7, 30, 50, 40)
+    crop = write('crop', a[3:30, 5:50, 7:40], voxel_size=voxel)
+    for name, kw in (('zarr', dict(folders=dirs['zarr'])), ('TIFF', dict(folders=dirs['tiff'])),
+                     ('(z, y, x) Zarr', dict(folders=dirs['zyx']))):
+        for pb in (None, (8, 16, 16)):
+            check(same_file(crop, convert('box', channel_patterns='CamA', voxel_size=voxel, input_bbox=box,
+                                          process_block_size=pb, **kw)),
+                  f'input_bbox {box} on the {name}' + (f', process_block_size {pb}' if pb else '') +
+                  ': write_ims of a[3:30, 5:50, 7:40]')
+    check(same_file(crop, convert('boxF', folders=dirs['zarr'], channel_patterns='CamA', voxel_size=(0.2, 0.1, 0.5),
+                                  input_bbox=(5, 7, 3, 50, 40, 30), order='F')), "input_bbox with order='F'")
+
+    # x_on_imaris_x: the image's x on Imaris X; read back with it, the same array
+    xref = write('xref', a, voxel_size=voxel, x_on_imaris_x=True)
+    info = piw.ims_info(xref, order='F')
+    check(info['shape'] == (a.shape[2], a.shape[1], a.shape[0]) and np.allclose(info['voxel_size'], (0.1, 0.2, 0.5)) and
+          np.array_equal(piw.read_ims(xref, x_on_imaris_x=True), a) and
+          np.array_equal(piw.read_ims(xref, order='F', x_on_imaris_x=True), img) and
+          piw.ims_info(xref, x_on_imaris_x=True)['shape'] == a.shape and
+          np.array_equal(piw.read_ims(xref, order='F'), np.transpose(a, (2, 1, 0))),
+          f'write_ims(x_on_imaris_x=True): Imaris X, Y, Z = x, y, z; read back with it: the array ({info["shape"]})')
+    check(np.array_equal(piw.read_ims(xref, start_coords=(1, 2, 3), end_coords=(20, 30, 40), x_on_imaris_x=True),
+                         a[1:20, 2:30, 3:40]), 'read_ims(x_on_imaris_x=True) of a region')
+    for name, folder in (('zarr', dirs['zarr']), ('TIFF', dirs['tiff']), ('(z, y, x) Zarr', dirs['zyx'])):
+        check(same_file(xref, convert('x', folders=folder, channel_patterns='CamA', voxel_size=voxel,
+                                      x_on_imaris_x=True)), f'convert_to_ims(x_on_imaris_x=True) of the {name}: '
+                                                            'the file of write_ims(x_on_imaris_x=True)')
+    check(same_file(write('xcrop', a[3:30, 5:50, 7:40], voxel_size=voxel, x_on_imaris_x=True),
+                    convert('xbox', folders=dirs['zyx'], channel_patterns='CamA', voxel_size=voxel, input_bbox=box,
+                            x_on_imaris_x=True)), 'x_on_imaris_x with input_bbox on the (z, y, x) Zarr')
+
+    # Two channels by patterns, three time points: files in name order
+    multi = os.path.join(tmp, 'multi')
+    os.makedirs(multi)
+    vols = {(c, t): sample((9, 30, 22), np.uint16, seed=20 + 3 * c + t) for c in range(2) for t in range(3)}
+    for t in (2, 0, 1):
+        for c, name in enumerate(('CamA', 'CamB')):
+            write_zarr(os.path.join(multi, f'{name}_t{t:04d}.zarr'), np.transpose(vols[c, t], (1, 2, 0)),
+                       chunks=(16, 16, 8))
+    files = piw.find_input_files(multi, ['CamA', 'CamB'])
+    expect = [[os.path.join(multi, f'{n}_t{t:04d}.zarr') for t in range(3)] for n in ('CamA', 'CamB')]
+    check(normalized(files) == expect,
+          'find_input_files: files[channel][timepoint] in name order')
+    m = convert('multi', folders=multi, channel_patterns=['CamA', 'CamB'])
+    info = piw.ims_info(m)
+    check(info['channels'] == 2 and info['timepoints'] == 3 and info['channel_names'] == ['CamA', 'CamB'] and
+          all(np.array_equal(piw.read_ims(m, timepoint=t, channel=c), vols[c, t]) for c in range(2) for t in range(3)),
+          'two channels, three time points: the volumes in name order, channels named after the patterns')
+    check(same_file(m, convert('multi_f', files=files, channel_names=['CamA', 'CamB'])),
+          'files=files[channel][timepoint] gives the same file')
+    piw.write_ims(out('multi_w'), [[vols[c, t] for c in range(2)] for t in range(3)], channel_names=['CamA', 'CamB'],
+                  start_time=START)
+    check(same_file(m, out('multi_w')), 'two channels, three time points: the file of write_ims')
+
+    # find_input_files and the reader
+    both = os.path.join(tmp, 'both')
+    os.makedirs(both)
+    write_zarr(os.path.join(both, 'CamA_t0000.zarr'), img, chunks=(32, 32, 16))
+    write_tiff(os.path.join(both, 'CamA_t0001.tif'), img)
+    raises(ValueError, lambda: piw.find_input_files(both, 'CamA'), 'find_input_files of TIFF and Zarr inputs')
+    check(normalized(piw.find_input_files(both, 'CamA', reader='zarr')) == [[os.path.join(both, 'CamA_t0000.zarr')]] and
+          normalized(piw.find_input_files(both, 'CamA', reader='tiff')) == [[os.path.join(both, 'CamA_t0001.tif')]],
+          'find_input_files with a reader takes its files only')
+    check(same_file(ref, convert('r', folders=both, channel_patterns='CamA', reader='tiff', voxel_size=voxel)),
+          "convert_to_ims(reader='tiff') of a folder with both")
+
+    # The command line (python -m parallel_imaris_writer; its X, Y, Z = y, x, z) gives the same file
+    cli = os.path.join(tmp, 'cli')
+    r = subprocess.run([sys.executable, '-m', 'parallel_imaris_writer', '-P', 'CamA,CamB', '-F', multi, '-o', cli,
+                        '-n', 'multi', '-r', 'zarr', '-v', '0.2,0.1,0.5', '-B', '5,7,1,25,20,8', '-C', '16,16,4'],
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    p = convert('multi_cli', folders=multi, channel_patterns=['CamA', 'CamB'], reader='zarr', voxel_size=voxel,
+                input_bbox=(1, 5, 7, 8, 25, 20), process_block_size=(4, 16, 16), start_time=None)
+    check(r.returncode == 0 and same_file(os.path.join(cli, 'multi.ims'), p),
+          f'python -m parallel_imaris_writer -B -C: the file of convert_to_ims (exit code {r.returncode})')
+
+    # verbose, progress, threads
+    captured, sys.stdout = sys.stdout, io.StringIO()
+    values = []
+    try:
+        convert('v', folders=multi, channel_patterns=['CamA', 'CamB'], verbose=True, num_threads=2,
+                progress=lambda f, b: values.append(f))
+        text = sys.stdout.getvalue()
+    finally:
+        sys.stdout = captured
+    check(text.count('Current File: ') == 6 and values and values[-1] == 1.0 and values == sorted(values),
+          f'verbose prints the messages; progress ends at 1.0 ({len(values)} calls)')
+
+    # With cpp-zarr and cpp-tiff: compressed Zarrs (zstd, F and C order) and an LZW TIFF
+    try:
+        import cppzarr
+        cz = os.path.join(tmp, 'cppzarr')
+        os.makedirs(cz)
+        cppzarr.write_zarr(os.path.join(cz, 'CamA_f.zarr'), np.asfortranarray(img))
+        cppzarr.write_zarr(os.path.join(cz, 'CamB_c.zarr'), a, order='C')
+        check(same_file(ref, convert('czf', files=os.path.join(cz, 'CamA_f.zarr'), voxel_size=voxel,
+                                     channel_names=['CamA'])) and
+              same_file(ref, convert('czc', files=os.path.join(cz, 'CamB_c.zarr'), voxel_size=voxel,
+                                     channel_names=['CamA'])),
+              'cppzarr.write_zarr (zstd) of the (y, x, z) image, and of the array in C order: the same file')
+    except ImportError:
+        skip('compressed Zarrs: cpp-zarr is not installed')
+    try:
+        import cpptiff
+        ct = os.path.join(tmp, 'lzw.tif')
+        cpptiff.write_tiff(ct, a)
+        check(same_file(ref, convert('ct', files=ct, voxel_size=voxel, channel_names=['CamA'])),
+              'cpptiff.write_tiff (LZW) of the array: the same file')
+    except ImportError:
+        skip('LZW TIFF: cpp-tiff is not installed')
+
+    # Errors: exceptions, nothing left behind
+    err = os.path.join(tmp, 'errors')
+    os.makedirs(err)
+    e = os.path.join(err, 'e.ims')
+    raises(FileNotFoundError, lambda: piw.convert_to_ims(e, folders=dirs['zarr'], channel_patterns='CamC'),
+           'a pattern without a match')
+    raises(FileNotFoundError, lambda: piw.convert_to_ims(e, folders=os.path.join(tmp, 'none'), channel_patterns='A'),
+           'a folder that does not exist')
+    bad = os.path.join(tmp, 'bad')
+    os.makedirs(os.path.join(bad, 'CamA_nometa.zarr'))
+    raises(RuntimeError, lambda: piw.convert_to_ims(e, folders=bad, channel_patterns='CamA'),
+           'a .zarr folder without metadata')
+    trunc = os.path.join(tmp, 'trunc')
+    os.makedirs(trunc)
+    tz = os.path.join(trunc, 'CamA_t0000.zarr')
+    write_zarr(tz, img, chunks=(32, 32, 16))
+    with open(os.path.join(tz, '1.1.1'), 'r+b') as f:
+        f.truncate(100)
+    raises(RuntimeError, lambda: piw.convert_to_ims(e, folders=trunc, channel_patterns='CamA'), 'a truncated chunk')
+    raises(ValueError, lambda: piw.convert_to_ims(e, folders=dirs['zarr'], channel_patterns='CamA',
+                                                  input_bbox=(0, 0, 0, 38, 61, 45)), 'an input_bbox outside the data')
+    raises(ValueError, lambda: piw.convert_to_ims(e, folders=dirs['zarr'], channel_patterns='CamA',
+                                                  input_bbox=(5, 0, 0, 5, 61, 45)), 'an empty input_bbox')
+    raises(ValueError, lambda: piw.convert_to_ims(e, folders=dirs['zarr'], channel_patterns='CamA',
+                                                  input_bbox=(0, 0, 0, 5, 6)), 'an input_bbox of five values')
+    raises(TypeError, lambda: piw.convert_to_ims(e, folders=dirs['zarr'], channel_patterns='CamA',
+                                                 input_bbox=(0, 0, 0.5, 5, 6, 7)), 'an input_bbox of 0.5')
+    sizes = os.path.join(tmp, 'sizes')
+    os.makedirs(sizes)
+    write_zarr(os.path.join(sizes, 'CamA_t0000.zarr'), img, chunks=(32, 32, 16))
+    write_zarr(os.path.join(sizes, 'CamA_t0001.zarr'), img[:, :40], chunks=(32, 32, 16))
+    raises(ValueError, lambda: piw.convert_to_ims(e, folders=sizes, channel_patterns='CamA'),
+           'inputs of different sizes')
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=[cf, zf]), 'Zarrs of C and F order without input_axes')
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=tf, input_axes='zyx'), "input_axes='zyx' with a TIFF")
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=tf, input_axes='xyz'), "input_axes='xyz'")
+    raises(ValueError, lambda: piw.convert_to_ims(e), 'no inputs')
+    raises(ValueError, lambda: piw.convert_to_ims(e, folders=dirs['zarr']), 'folders without channel_patterns')
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=tf, folders=dirs['zarr'], channel_patterns='CamA'),
+           'files and folders')
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=os.path.join(tmp, 'x.png')), 'a file of no known reader')
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=[tf, zf]), 'TIFF and Zarr files without a reader')
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=tf, reader='png'), "reader='png'")
+    raises(ValueError, lambda: piw.convert_to_ims(os.path.join(err, 'e.h5'), files=tf), 'a file name without .ims')
+    raises(TypeError, lambda: piw.convert_to_ims(e, folders=dirs['zarr'], channel_patterns=[1]), 'a pattern that is 1')
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=tf, num_threads=0), 'num_threads=0')
+    raises(ValueError, lambda: piw.convert_to_ims(e, files=[[tf], [tf, tf]]),
+           'channels with different numbers of files')
+    check(not leftovers(err), f'no file left behind by the refused conversions ({leftovers(err)})')
+
+
+# ---- dataset: convert_dataset, the MATLAB dataset wrapper's behaviour
+
+def test_dataset(tmp):
+    stamps = (1000, 3500, 6000)                 # ms, in the names as PetaKit5D writes them
+    shape = (13, 40, 33)                        # (z, y, x)
+    vols = {(c, t): sample(shape, np.uint16, seed=40 + 3 * c + t) for c in range(2) for t in range(3)}
+
+    def dataset(folder, zarr=True, times=range(3), sizes=None):
+        os.makedirs(folder, exist_ok=True)
+        for t in times:
+            for c, cam in enumerate(('CamA', 'CamB')):
+                v = vols[c, t] if sizes is None else sizes(c, t)
+                name = f'Iter_{t:04d}_{cam}_ch0_{stamps[t]:010d}msecAbs'
+                if zarr:
+                    write_zarr(os.path.join(folder, name + '.zarr'), np.transpose(v, (1, 2, 0)), chunks=(16, 16, 8))
+                else:
+                    write_tiff(os.path.join(folder, name + '.tif'), np.transpose(v, (1, 2, 0)))
+        return folder
+    ds = dataset(os.path.join(tmp, 'ds'))
+    stem = 'Iter_0000_CamA_ch0_0000001000msecAbs'
+    voxel = (0.25, 0.108, 0.108)                # (dz, dy, dx)
+
+    # The MATLAB wrapper's command line, then its rename
+    cli_dir = os.path.join(tmp, 'cli')
+    args = ['-P', 'CamA,CamB', '-F', ds + '/', '-n', stem + '_abcd', '-r', 'zarr', '-v',
+            '%.20f,%.20f,%.20f,' % (voxel[1], voxel[2], voxel[0]), '-o', cli_dir + '/', '-b', '64,64,64,']
+    rc = piw.run_cli(args)
+    cli = os.path.join(cli_dir, stem + '.ims')
+    if rc == 0:
+        os.replace(os.path.join(cli_dir, stem + '_abcd.ims'), cli)
+    result = piw.convert_dataset(ds, channel_patterns=('CamA', 'CamB'), zarr_file=True, voxel_size=voxel)
+    expect = os.path.join(ds, 'imaris', stem + '.ims')
+    check(rc == 0 and result == [expect] and os.path.isfile(expect),
+          f'convert_dataset: <folder>/imaris/<first file>.ims ({result})')
+    check(rc == 0 and same_file(cli, expect), "convert_dataset: the file of the MATLAB wrapper's command line")
+    info = piw.ims_info(expect)
+    check(info['channels'] == 2 and info['timepoints'] == 3 and info['channel_names'] == ['CamA', 'CamB'] and
+          np.allclose(info['voxel_size'], voxel) and
+          all(np.array_equal(piw.read_ims(expect, timepoint=t, channel=c), vols[c, t]) for c in range(2)
+              for t in range(3)) and
+          np.allclose([seconds(p) - seconds(info['time_points'][0]) for p in info['time_points']], (0, 2.5, 5)),
+          f'convert_dataset: channels, data, voxel size, time points from the names ({info["time_points"]})')
+    check(leftovers(os.path.join(ds, 'imaris')) == [stem + '.ims'],
+          'convert_dataset: only the .ims in the result folder')
+
+    # overwrite=False leaves an existing output alone; True writes it again
+    os.utime(expect, ns=(10 ** 18, 10 ** 18))
+    again = piw.convert_dataset(ds, channel_patterns=('CamA', 'CamB'), zarr_file=True, voxel_size=voxel)
+    check(again == [expect] and mtime_ns(expect) == 10 ** 18, 'a second call: the path, nothing written')
+    piw.convert_dataset(ds, channel_patterns=('CamA', 'CamB'), zarr_file=True, voxel_size=voxel, overwrite=True)
+    check(mtime_ns(expect) != 10 ** 18 and same_file(cli, expect), 'overwrite=True: written again, the same file')
+
+    # result_dir_name; TIFF datasets (the default); defaults of the MATLAB wrapper (0.108, its patterns)
+    r = piw.convert_dataset(ds, channel_patterns=['CamB'], zarr_file=True, result_dir_name='other')
+    check(r == [os.path.join(ds, 'other', 'Iter_0000_CamB_ch0_0000001000msecAbs.ims')] and
+          np.allclose(piw.ims_info(r[0])['voxel_size'], 0.108), 'result_dir_name; voxel_size defaults to 0.108')
+    tds = dataset(os.path.join(tmp, 'tds'), zarr=False)
+    r = piw.convert_dataset(tds, channel_patterns=('CamA', 'CamB'), voxel_size=voxel)
+    check(r == [os.path.join(tds, 'imaris', stem + '.ims')] and crcs(cli) == crcs(r[0]),
+          'a TIFF dataset: the data of the Zarr one')
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        r = piw.convert_dataset(tds, zarr_file=True)
+    check(r == [None] and any('does not contain' in str(x.message) for x in w),
+          "no file with the default patterns ('CamA_ch0', 'CamA_ch1', 'CamB_ch0') and zarr_file: None, a warning")
+
+    # A list of datasets, one of them in two folders
+    ds2 = dataset(os.path.join(tmp, 'ds2'))
+    parts = [dataset(os.path.join(tmp, 'part1'), times=[0]), dataset(os.path.join(tmp, 'part2'), times=[1, 2])]
+    empty = os.path.join(tmp, 'empty')
+    os.makedirs(empty)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        r = piw.convert_dataset([ds2, parts, empty], channel_patterns=('CamA', 'CamB'), zarr_file=True,
+                                voxel_size=voxel)
+    check(r == [os.path.join(ds2, 'imaris', stem + '.ims'), os.path.join(parts[0], 'imaris', stem + '.ims'), None] and
+          len([x for x in w if 'does not contain' in str(x.message)]) == 1, f'a list of datasets: {r}')
+    check(r[0] and crcs(cli) == crcs(r[0]) and r[1] and crcs(cli) == crcs(r[1]),
+          'a dataset in two folders: the data of one folder holding them all')
+
+    # Inputs of different sizes: refused before any output, unless input_bbox lies inside all of them
+    odd = dataset(os.path.join(tmp, 'odd'), sizes=lambda c, t: vols[c, t][:, :35] if t == 1 else vols[c, t])
+    try:
+        piw.convert_dataset(odd, channel_patterns=('CamA', 'CamB'), zarr_file=True)
+        check(False, 'inputs of different sizes: no exception')
+    except ValueError as e:
+        check('Iter_0000_CamA' in str(e) and 'Iter_0001_CamA' in str(e) and
+              not [f for f in os.listdir(os.path.join(odd, 'imaris')) if f.endswith('.ims')],
+              f'inputs of different sizes: ValueError naming two of them, no .ims ({e})')
+    box = (1, 2, 3, 12, 35, 30)
+    r = piw.convert_dataset(odd, channel_patterns=('CamA', 'CamB'), zarr_file=True, input_bbox=box)
+    check(r[0] is not None and all(np.array_equal(piw.read_ims(r[0], timepoint=t, channel=c),
+                                                  vols[c, t][1:12, 2:35, 3:30]) for c in range(2) for t in range(3)),
+          'a box inside all of them converts: the crops')
+    raises(FileNotFoundError, lambda: piw.convert_dataset(os.path.join(tmp, 'none'), zarr_file=True),
+           'a dataset folder that does not exist')
 
 
 # ---- roundtrip
@@ -908,10 +1281,10 @@ def test_sigint(tmp):
           f'{p.returncode}), files left: {leftovers(tmp)}' + ('' if 'KeyboardInterrupt' in err else '\n' + err[-2000:]))
 
 
-SECTIONS = [('cli', test_cli), ('roundtrip', test_roundtrip), ('layout', test_layout), ('golden', test_golden),
-            ('threads', test_threads), ('progress', test_progress), ('metadata', test_metadata),
-            ('errors', test_errors), ('h5py', test_h5py), ('importorder', test_importorder), ('fork', test_fork),
-            ('sigint', test_sigint)]
+SECTIONS = [('cli', test_cli), ('convert', test_convert), ('dataset', test_dataset), ('roundtrip', test_roundtrip),
+            ('layout', test_layout), ('golden', test_golden), ('threads', test_threads), ('progress', test_progress),
+            ('metadata', test_metadata), ('errors', test_errors), ('h5py', test_h5py), ('importorder', test_importorder),
+            ('fork', test_fork), ('sigint', test_sigint)]
 
 
 def main(names):

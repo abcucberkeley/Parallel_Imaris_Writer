@@ -51,9 +51,16 @@ struct Color {
     float red, green, blue;
 };
 
+// The order of an input's axes 0, 1, 2 (TIFF rows, columns, pages; a Zarr's dims 0, 1, 2).
+enum class InputAxes : int {
+    YXZ = 0,    // the image's (y, x, z): every TIFF, and a Zarr in MATLAB's layout ([ny, nx, nz])
+    ZYX = 1     // (z, y, x): a Zarr written from a NumPy array of (z, y, x) (Zarr only)
+};
+
 // The per-axis values are along the input's axes 0, 1, 2: (row, column, page) of a TIFF, dims
-// (0, 1, 2) of a Zarr. These are Imaris X, Y, Z, so the image's y (the TIFF row) is Imaris X, as in
-// every file written so far; xOnImarisX puts the image's x there instead.
+// (0, 1, 2) of a Zarr. Imaris X, Y, Z are the image's y, x, z, so the image's y (the TIFF row) is
+// Imaris X, as in every file written so far: input axes 0, 1, 2 with InputAxes::YXZ, 1, 2, 0 with
+// ZYX. xOnImarisX puts the image's x on Imaris X instead.
 struct ConvertOptions {
     std::string reader = "tiff";                        // "tiff" or "zarr"
     std::vector<std::vector<std::string> > files;       // files[channel][timepoint]; every channel has as many
@@ -64,9 +71,10 @@ struct ConvertOptions {
     bool hasBoundingBox = false;  uint64_t boundingBox[6] = {0, 0, 0, 0, 0, 0}; // -B: a0,a1,a2,b0,b1,b2; 0-based, end excluded
     bool hasProcessBlock = false; uint64_t processBlock[3] = {0, 0, 0};       // -C, voxels
     int numThreads = 0;                                 // 0: the calling thread's OpenMP default
-    // false: input axes 0, 1, 2 are Imaris X, Y, Z. true: axis 1 (the image's x) is Imaris X and
-    // axis 0 Imaris Y; the values above stay along the input's axes.
+    // false: Imaris X, Y, Z are the image's y, x, z. true: its x, y, z (input axes 1, 0, 2 with
+    // YXZ, 2, 1, 0 with ZYX); the values above stay along the input's axes.
     bool xOnImarisX = false;
+    InputAxes inputAxes = InputAxes::YXZ;
 
     // Metadata (/DataSetInfo). Each list is empty (the default) or has one entry per channel.
     std::vector<std::string> channelNames;              // default "Channel 0", "Channel 1", ...; the command

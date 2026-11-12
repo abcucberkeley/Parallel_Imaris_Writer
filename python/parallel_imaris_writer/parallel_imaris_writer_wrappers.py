@@ -1,21 +1,26 @@
 import datetime
+import json
 import numbers
 import operator
 import os
 import secrets
 import sys
+import warnings
 from collections.abc import Mapping
 import numpy as np
-from .parallel_imaris_writer import (pybind11_ims_dataset, pybind11_ims_info, pybind11_read_ims, pybind11_run_cli,
-                                     pybind11_version, pybind11_write_ims)
+from .parallel_imaris_writer import (pybind11_convert, pybind11_find_input_files, pybind11_ims_dataset,
+                                     pybind11_ims_info, pybind11_read_ims, pybind11_run_cli, pybind11_version,
+                                     pybind11_write_ims)
 
 __version__ = pybind11_version()
 
 # Axes. order='C' (the default) names arrays (z, y, x), (c, z, y, x) and (t, c, z, y, x), and
 # per-axis values (z, y, x); order='F' MATLAB's (y, x, z), (y, x, z, c) and (y, x, z, c, t), and
 # per-axis values (y, x, z). Either way Imaris X is the image's y, Imaris Y its x and Imaris Z its
-# z, as in every file the command line (and PetaKit5D's MATLAB code) writes. The order names the
-# axes only: any memory layout is read in place and means the same.
+# z, as in every file the command line (and PetaKit5D's MATLAB code) writes; x_on_imaris_x=True
+# puts the image's x on Imaris X and its y on Imaris Y instead. The order names the axes only: any
+# memory layout is read in place and means the same. Inside, values travel as the image's
+# (y, x, z) (_per_axis), then become Imaris X, Y, Z (_swap) or the input files' axes (_input_values).
 
 # The sample types of an .ims file
 _TYPES = (np.dtype(np.uint8), np.dtype(np.uint16), np.dtype(np.uint32), np.dtype(np.float32))
@@ -77,7 +82,7 @@ def _index(value, name):
 
 def _per_axis(values, name, order):
     # Three values in the order's axis order ((z, y, x) for order='C', (y, x, z) for 'F'), or a
-    # mapping with the keys 'x', 'y' and 'z' (the image's axes), as Imaris X, Y, Z: (y, x, z)
+    # mapping with the keys 'x', 'y' and 'z' (the image's axes), as the image's (y, x, z)
     if isinstance(values, Mapping):
         if set(values) != {'x', 'y', 'z'}:
             raise ValueError(f"{name} as a mapping needs the keys 'x', 'y' and 'z', not {sorted(map(str, values))}")
@@ -108,8 +113,15 @@ def _voxel_size(voxel_size, order):
     return values
 
 
+def _swap(values, x_on_imaris_x):
+    # The image's (y, x, z) as Imaris X, Y, Z, and back: the same values, the first two swapped
+    # when the image's x is on Imaris X
+    v = list(values)
+    return [v[1], v[0], v[2]] if x_on_imaris_x else v
+
+
 def _sizes(values, name, order):
-    # Whole numbers of at least 1 along Imaris X, Y, Z, or None
+    # Whole numbers of at least 1 along the image's (y, x, z), or None
     if values is None:
         return None
     sizes = []
@@ -303,7 +315,7 @@ def _remove(path):
 
 def write_ims(file_name, data, voxel_size=None, block_size=None, order='C', num_threads=None, progress=None,
               verbose=False, channel_names=None, channel_colors=None, emission_wavelengths=None,
-              excitation_wavelengths=None, time_interval=None, start_time=None):
+              excitation_wavelengths=None, time_interval=None, start_time=None, x_on_imaris_x=False):
     """Write arrays to an Imaris (.ims) file, with its resolution pyramid.
 
     data: a NumPy array, or a list of 3-D arrays (one per channel), or a list of such lists
@@ -315,7 +327,8 @@ def write_ims(file_name, data, voxel_size=None, block_size=None, order='C', num_
     only arrays in the other byte order, unaligned ones and ones with negative strides are copied.
     uint8, uint16, uint32 or float32; other types raise TypeError.
     Imaris X is the image's y, Imaris Y its x and Imaris Z its z (as the command line writes
-    every image).
+    every image); x_on_imaris_x=True puts its x on Imaris X and its y on Imaris Y (read such a
+    file back with x_on_imaris_x=True too).
 
     voxel_size, block_size: three values in the order's axis order, (dz, dy, dx) by default, or a
     mapping with the keys 'x', 'y' and 'z'. voxel_size defaults to 0.108 for all three.
@@ -342,8 +355,13 @@ def write_ims(file_name, data, voxel_size=None, block_size=None, order='C', num_
     threads = _threads(num_threads)
     progress = _progress(progress)
     volumes, channels, timepoints = _volumes(data, order)
-    voxel = _voxel_size(voxel_size, order)
+    x_on_imaris_x = bool(x_on_imaris_x)
+    if x_on_imaris_x:
+        volumes = [np.transpose(v, (1, 0, 2)) for v in volumes]
+    voxel = _swap(_voxel_size(voxel_size, order), x_on_imaris_x)
     block = _sizes(block_size, 'block_size', order)
+    if block is not None:
+        block = _swap(block, x_on_imaris_x)
     metadata = _metadata(channel_names, channel_colors, emission_wavelengths, excitation_wavelengths, time_interval,
                          start_time)
     if os.path.isdir(file_name):
@@ -363,9 +381,338 @@ def write_ims(file_name, data, voxel_size=None, block_size=None, order='C', num_
         raise
 
 
-def _to_order(xyz, order):
-    # Values along Imaris X, Y, Z (the image's y, x, z) in the order's axis order
-    return (xyz[2], xyz[0], xyz[1]) if order == 'C' else tuple(xyz)
+# ---- files: find_input_files, convert_to_ims, convert_dataset
+
+def _paths(value, name):
+    # One path, or a list of paths, as a list of str
+    if isinstance(value, (str, bytes, os.PathLike)):
+        return [_path(value, name)]
+    try:
+        paths = [_path(v, name) for v in value]
+    except TypeError:
+        raise TypeError(f'{name} must be a path or a list of paths, not {value!r}') from None
+    if not paths:
+        raise ValueError(f'{name} is an empty list')
+    return paths
+
+
+def _folders(value):
+    # Input folders, a leading ~ expanded (as the command line's -F)
+    return [os.path.expanduser(f) for f in _paths(value, 'folders')]
+
+
+def _patterns(value):
+    # Channel patterns: one str, or a list of str (one per channel)
+    patterns = [value] if isinstance(value, str) else value
+    if isinstance(patterns, bytes) or not hasattr(patterns, '__iter__'):
+        raise TypeError(f'channel_patterns must be a str or a list of str (one per channel), not {value!r}')
+    patterns = list(patterns)
+    if not patterns or not all(isinstance(p, str) for p in patterns):
+        raise TypeError(f'channel_patterns must be a str or a list of str (one per channel), not {value!r}')
+    if not all(patterns):
+        raise ValueError(f'channel_patterns must not be empty: {value!r}')
+    return patterns
+
+
+def _reader(reader):
+    if reader is None:
+        return None
+    if reader not in ('tiff', 'zarr'):
+        raise ValueError(f"reader must be 'tiff', 'zarr' or None (from the file names), not {reader!r}")
+    return reader
+
+
+def _takes(name, reader):
+    # Whether the reader takes the file (the library's rule: tiff .tif and .tiff in any case, zarr .zarr)
+    if reader == 'zarr':
+        return name.endswith('.zarr')
+    return os.path.splitext(name)[1].lower() in ('.tif', '.tiff')
+
+
+def _reader_of(files):
+    # The reader of files[channel][timepoint], from their names
+    readers = {('zarr' if _takes(f, 'zarr') else 'tiff' if _takes(f, 'tiff') else None, f)
+               for channel in files for f in channel}
+    kinds = {r for r, _ in readers}
+    if None in kinds:
+        raise ValueError(f'cannot tell the reader of {next(f for r, f in readers if r is None)} from its name (.tif, '
+                         ".tiff or .zarr): give reader='tiff' or 'zarr'")
+    if len(kinds) > 1:
+        raise ValueError("the inputs are TIFF and Zarr files: give reader='tiff' or 'zarr'")
+    return kinds.pop()
+
+
+def _file_grid(files):
+    # files: one path (one channel, one time point), a list of paths (the time points of one
+    # channel), or files[channel][timepoint]
+    if isinstance(files, (str, bytes, os.PathLike)):
+        return [[_path(files, 'files')]]
+    try:
+        items = list(files)
+    except TypeError:
+        raise TypeError(f'files must be a path, a list of paths or files[channel][timepoint], not {files!r}') from None
+    if not items:
+        raise ValueError('files is an empty list')
+    if all(isinstance(f, (str, bytes, os.PathLike)) for f in items):
+        return [[_path(f, 'files') for f in items]]
+    return [_paths(channel, 'files[channel]') for channel in items]
+
+
+def _zarr_order(path):
+    # 'C' or 'F' of a Zarr's metadata (v2 .zarray "order"; v3 zarr.json: F when a transpose codec
+    # reverses the axes, as cpp-zarr reads it), None when it has none that can be read
+    try:
+        with open(os.path.join(path, '.zarray'), 'rb') as f:
+            order = json.load(f).get('order')
+        return order if order in ('C', 'F') else None
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        with open(os.path.join(path, 'zarr.json'), 'rb') as f:
+            meta = json.load(f)
+        ndim = len(meta['shape'])
+        for codec in meta.get('codecs') or []:
+            if isinstance(codec, Mapping) and codec.get('name') == 'transpose':
+                order = (codec.get('configuration') or {}).get('order')
+                return 'F' if order == 'F' or order == list(range(ndim - 1, -1, -1)) else 'C'
+        return 'C'
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _input_axes(input_axes, reader, files):
+    # 'yxz' or 'zyx'. None: TIFF 'yxz'; Zarr from the arrays' order: F (MATLAB's layout, [ny, nx,
+    # nz]) 'yxz', C 'zyx', the same for every input (arrays without readable metadata are left to
+    # the library, which refuses them)
+    if input_axes is not None:
+        if input_axes not in ('yxz', 'zyx'):
+            raise ValueError(f"input_axes must be 'yxz', 'zyx' or None (from each Zarr's order), not {input_axes!r}")
+        if input_axes == 'zyx' and reader != 'zarr':
+            raise ValueError("input_axes='zyx' is for Zarr input only; TIFF pages are (y, x, z)")
+        return input_axes
+    if reader != 'zarr':
+        return 'yxz'
+    first = None
+    for channel in files:
+        for f in channel:
+            order = _zarr_order(f)
+            if order is None:
+                continue
+            if first is None:
+                first = (f, order)
+            elif order != first[1]:
+                raise ValueError(f'{first[0]} is in {first[1]} order but {f} in {order} order (F: (y, x, z), C: '
+                                 '(z, y, x)): give input_axes')
+    return 'zyx' if first is not None and first[1] == 'C' else 'yxz'
+
+
+def _input_values(yxz, input_axes):
+    # Values along the image's (y, x, z) along the input's axes 0, 1, 2
+    return list(yxz) if input_axes == 'yxz' else [yxz[2], yxz[0], yxz[1]]
+
+
+def _bbox(input_bbox, order, input_axes):
+    # Six values in the order's axis order, the starts then the ends, as the library's box along
+    # the input's axes, or None
+    if input_bbox is None:
+        return None
+    axes = '(z0, y0, x0, z1, y1, x1)' if order == 'C' else '(y0, x0, z0, y1, x1, z1)'
+    wrong = f'input_bbox must be six whole numbers, {axes}, 0-based with the end excluded, not {input_bbox!r}'
+    if isinstance(input_bbox, (str, bytes, Mapping)):
+        raise TypeError(wrong)
+    try:
+        values = list(input_bbox)
+    except TypeError:
+        raise TypeError(wrong) from None
+    if len(values) != 6:
+        raise ValueError(wrong)
+    start = [_index(v, 'input_bbox values') for v in _per_axis(values[:3], 'input_bbox', order)]
+    end = [_index(v, 'input_bbox values') for v in _per_axis(values[3:], 'input_bbox', order)]
+    if any(e <= s for s, e in zip(start, end)):
+        raise ValueError(f'input_bbox must end after it starts along every axis: {tuple(values)}')
+    return _input_values(start, input_axes) + _input_values(end, input_axes)
+
+
+def find_input_files(folders, channel_patterns, reader=None):
+    """The files the command line converts for -F folders -P patterns, as files[channel][timepoint].
+
+    folders: a folder or a list of folders (a leading ~ is the home folder). channel_patterns: a
+    str or a list of str, one per channel. In every folder, the entries the reader takes (reader
+    'tiff': .tif and .tiff in any case; 'zarr': .zarr; None: both, but not both for one pattern)
+    whose name contains the pattern are that channel's time points, sorted by full path.
+    FileNotFoundError for a folder that does not exist or a pattern without a match; ValueError
+    for an entry that matches two patterns or channels with different numbers of files.
+    """
+    folders = _folders(folders)
+    patterns = _patterns(channel_patterns)
+    reader = _reader(reader)
+    return pybind11_find_input_files([_native(f) for f in folders], [_native(p) for p in patterns], reader or '')
+
+
+def convert_to_ims(file_name, folders=None, channel_patterns=None, files=None, reader=None, voxel_size=None,
+                   block_size=None, input_bbox=None, process_block_size=None, order='C', input_axes=None,
+                   x_on_imaris_x=False, num_threads=None, progress=None, verbose=False, channel_names=None,
+                   channel_colors=None, emission_wavelengths=None, excitation_wavelengths=None, time_interval=None,
+                   start_time=None):
+    """Convert TIFF or Zarr volumes to one Imaris (.ims) file, as the command line does.
+
+    The inputs: folders and channel_patterns (the command line's -F and -P: find_input_files picks
+    and orders the files), or files: a path, a list of paths (the time points of one channel), or
+    files[channel][timepoint]. reader: 'tiff' or 'zarr'; by default from the file names. Every
+    input must have the first one's size (unless input_bbox lies inside all of them) and sample
+    type (uint8, uint16, uint32 or float32); this is checked before anything is written.
+
+    voxel_size, block_size, process_block_size: three values in the order's axis order, (dz, dy,
+    dx) by default, or a mapping with the keys 'x', 'y' and 'z'. voxel_size defaults to 0.108 for
+    all three. block_size is the size of the pieces handed to the Imaris writer (default the
+    input's chunks; it does not change the file). process_block_size bounds the voxels of a time
+    point held in memory at once (TIFF: along z only; default a whole time point).
+    input_bbox: crop every input to this box, six values in the order's axis order, the starts then
+    the ends, 0-based with the end excluded: (z0, y0, x0, z1, y1, x1) by default.
+
+    input_axes: the axes of the input files. 'yxz' is MATLAB's layout: every TIFF (rows, columns,
+    pages) and a Zarr of [ny, nx, nz]; 'zyx' a Zarr of (z, y, x), as written from a C-order NumPy
+    array. None (the default): 'yxz' for TIFF files and, for Zarr arrays, from their order: 'F'
+    (MATLAB's) 'yxz', 'C' 'zyx' (the command line takes every input as 'yxz').
+    Imaris X is the image's y, Imaris Y its x and Imaris Z its z, as the command line writes;
+    x_on_imaris_x=True puts its x on Imaris X and its y on Imaris Y.
+
+    channel_names default to the channel patterns (as the command line names them), else "Channel
+    0", "Channel 1", ...; channel_colors, emission_wavelengths, excitation_wavelengths, time_interval
+    and start_time as write_ims takes them. Without time_interval the time points come from
+    "<n>msecAbs" in the file names, else 1 s apart; without start_time the first time point is the
+    modification time of the first input. With the same options the file is the command line's.
+    num_threads, progress, verbose and the temporary name as write_ims; no timepoints.txt is written.
+    """
+    file_name = _ims_name(file_name)
+    order = _order(order)
+    threads = _threads(num_threads)
+    progress = _progress(progress)
+    reader = _reader(reader)
+    patterns = None
+    if files is not None:
+        if folders is not None or channel_patterns is not None:
+            raise ValueError('give either files, or folders and channel_patterns, not both')
+        grid = _file_grid(files)
+    elif folders is None or channel_patterns is None:
+        raise ValueError('give the inputs: folders and channel_patterns, or files')
+    else:
+        patterns = _patterns(channel_patterns)
+        grid = find_input_files(folders, patterns, reader)
+    if reader is None:
+        reader = _reader_of(grid)
+    axes = _input_axes(input_axes, reader, grid)
+    voxel = _input_values(_voxel_size(voxel_size, order), axes)
+    block = _sizes(block_size, 'block_size', order)
+    process = _sizes(process_block_size, 'process_block_size', order)
+    box = _bbox(input_bbox, order, axes)
+    if channel_names is None and patterns is not None:
+        channel_names = patterns
+    metadata = _metadata(channel_names, channel_colors, emission_wavelengths, excitation_wavelengths, time_interval,
+                         start_time)
+    if os.path.isdir(file_name):
+        raise IsADirectoryError(f'{file_name} is a folder')
+    if verbose:
+        sys.stdout.flush()
+    temporary = None
+    try:
+        temporary = _temporary(file_name)
+        pybind11_convert(reader, [[_native(f) for f in channel] for channel in grid], _native(temporary), voxel,
+                         None if block is None else _input_values(block, axes), box,
+                         None if process is None else _input_values(process, axes), threads,
+                         x_on_imaris_x=bool(x_on_imaris_x), input_axes=axes, verbose=bool(verbose),
+                         progress=progress, **metadata)
+        os.replace(temporary, file_name)
+    except BaseException:
+        if temporary is not None:
+            _remove(temporary)
+        raise
+
+
+def _first_input(folder, patterns, reader):
+    # The first entry, by name, of folder that the reader takes and whose name contains a pattern
+    # (None if there is none)
+    try:
+        names = sorted(n for n in os.listdir(os.fsencode(folder)))
+    except FileNotFoundError:
+        raise FileNotFoundError(f'Input folder "{folder}" does not exist') from None
+    for n in names:
+        name = os.fsdecode(n)
+        if _takes(name, reader) and any(p in name for p in patterns):
+            return name
+    return None
+
+
+def convert_dataset(data_paths, channel_patterns=('CamA_ch0', 'CamA_ch1', 'CamB_ch0'), result_dir_name='imaris',
+                    overwrite=False, zarr_file=False, voxel_size=None, block_size=(64, 64, 64), input_bbox=None,
+                    process_block_size=None, order='C', input_axes=None, x_on_imaris_x=False, num_threads=None,
+                    progress=None, verbose=False, channel_names=None, channel_colors=None, emission_wavelengths=None,
+                    excitation_wavelengths=None, time_interval=None, start_time=None):
+    """Convert datasets to .ims files on this machine, as PetaKit5D's MATLAB dataset wrapper
+    (XR_imaris_conversion_data_wrapper) does with the command line: one .ims per dataset.
+
+    data_paths: a dataset folder, or a list whose items are a folder or a list of folders (one
+    dataset in several folders). In a dataset's folders the TIFF files (zarr_file=True: the Zarr
+    arrays) whose names contain a channel pattern are converted (each pattern one channel, its
+    files the time points in name order) into <first folder>/<result_dir_name>/<stem>.ims, <stem>
+    being the name without its extension of the first such file of the first folder; the result
+    folder is made. Written under a temporary name (<stem>_<8 hex digits>.ims) and renamed when
+    complete.
+    overwrite=False leaves an existing output as it is (its path is returned, nothing written);
+    True replaces it (the folder's other files stay).
+    Inputs of different sizes are refused (ValueError naming two of them) before anything is
+    written, unless input_bbox lies inside all of them.
+
+    Returns the .ims paths, one per dataset: None for a dataset without matching files (with a
+    warning, and the next dataset is converted). The other arguments are convert_to_ims's, with the
+    MATLAB wrapper's defaults (its pixelSizes are voxel_size here, in the order's axis order:
+    (dz, dy, dx) by default); progress is called for each dataset's conversion in turn.
+    """
+    if isinstance(data_paths, (str, bytes, os.PathLike)):
+        datasets = [[data_paths]]
+    else:
+        try:
+            datasets = [[d] if isinstance(d, (str, bytes, os.PathLike)) else list(d) for d in data_paths]
+        except TypeError:
+            raise TypeError(f'data_paths must be a folder or a list of folders or of lists of folders, not '
+                            f'{data_paths!r}') from None
+        if not datasets:
+            raise ValueError('data_paths is an empty list')
+    datasets = [_folders(d) for d in datasets]
+    patterns = _patterns(channel_patterns)
+    reader = 'zarr' if zarr_file else 'tiff'
+    if not isinstance(result_dir_name, str):
+        raise TypeError(f'result_dir_name must be a str, not {result_dir_name!r}')
+    result_dir_name = result_dir_name or 'imaris'
+    options = dict(reader=reader, voxel_size=voxel_size, block_size=block_size, input_bbox=input_bbox,
+                   process_block_size=process_block_size, order=order, input_axes=input_axes,
+                   x_on_imaris_x=x_on_imaris_x, num_threads=num_threads, progress=progress, verbose=verbose,
+                   channel_names=channel_names, channel_colors=channel_colors,
+                   emission_wavelengths=emission_wavelengths, excitation_wavelengths=excitation_wavelengths,
+                   time_interval=time_interval, start_time=start_time)
+    results = []
+    for folders in datasets:
+        first = _first_input(folders[0], patterns, reader)
+        if first is None:
+            kind = 'Zarr' if zarr_file else 'TIFF'
+            warnings.warn(f'Folder {folders[0]} does not contain any {kind} input whose name contains one of the '
+                          f'channel patterns {patterns}', stacklevel=2)
+            results.append(None)
+            continue
+        result_dir = os.path.join(folders[0], result_dir_name)
+        output = os.path.join(result_dir, os.path.splitext(first)[0] + '.ims')
+        if os.path.exists(output) and not overwrite:
+            results.append(output)
+            continue
+        os.makedirs(result_dir, exist_ok=True)
+        convert_to_ims(output, folders=folders, channel_patterns=patterns, **options)
+        results.append(output)
+    return results
+
+
+def _image_to_order(yxz, order):
+    # Values along the image's (y, x, z) in the order's axis order
+    return (yxz[2], yxz[0], yxz[1]) if order == 'C' else tuple(yxz)
 
 
 def _existing(file_name):
@@ -381,9 +728,10 @@ def _single(value):
     return float(str(np.float32(value)))
 
 
-def ims_info(file_name, checksums=False, order='C'):
+def ims_info(file_name, checksums=False, order='C', x_on_imaris_x=False):
     """What an .ims file holds, as a dict; sizes and per-axis values in the order's axis order
-    ((z, y, x) by default, (y, x, z) for order='F'):
+    ((z, y, x) by default, (y, x, z) for order='F'), Imaris X taken as the image's y (its x with
+    x_on_imaris_x=True, for files written that way):
 
     shape (one volume at resolution level 0), dtype, channels, timepoints, resolution_levels,
     voxel_size, extent_min and extent_max (the image's extent in the file's units), channel_names,
@@ -399,7 +747,12 @@ def ims_info(file_name, checksums=False, order='C'):
     dataset of 80,000 chunks (read_ims does not need this).
     """
     order = _order(order)
+    x_on_imaris_x = bool(x_on_imaris_x)
     raw = pybind11_ims_info(_native(_existing(file_name)), bool(checksums))
+
+    def to_order(xyz):
+        # Imaris X, Y, Z in the order's axis order
+        return _image_to_order(_swap(xyz, x_on_imaris_x), order)
     size = raw['size']
     ext_min, ext_max, voxel = ([_single(v) for v in raw[k]] for k in ('extent_min', 'extent_max', 'voxel_size'))
     colors = []
@@ -409,24 +762,24 @@ def ims_info(file_name, checksums=False, order='C'):
         except ValueError:
             colors.append(text)
     datasets = [{'resolution_level': d['level'], 'timepoint': d['timepoint'], 'channel': d['channel'],
-                 'shape': _to_order(d['size'], order), 'chunk_shape': _to_order(d['chunk'], order),
+                 'shape': to_order(d['size']), 'chunk_shape': to_order(d['chunk']),
                  'chunks': d['chunks'], 'crc': d['crc'], 'histogram_crc': d['histogram_crc']}
                 for d in raw['datasets']]
-    return {'shape': _to_order(size, order), 'dtype': np.dtype(raw['data_type']), 'channels': raw['channels'],
+    return {'shape': to_order(size), 'dtype': np.dtype(raw['data_type']), 'channels': raw['channels'],
             'timepoints': raw['timepoints'], 'resolution_levels': raw['levels'],
-            'voxel_size': _to_order(voxel, order), 'extent_min': _to_order(ext_min, order),
-            'extent_max': _to_order(ext_max, order), 'channel_names': list(raw['channel_names']),
+            'voxel_size': to_order(voxel), 'extent_min': to_order(ext_min),
+            'extent_max': to_order(ext_max), 'channel_names': list(raw['channel_names']),
             'channel_colors': colors, 'time_points': list(raw['time_points']), 'datasets': datasets,
             'thumbnail_crc': raw['thumbnail_crc'], 'attributes': dict(raw['attributes'])}
 
 
 def _coords(values, name, order):
-    # Three whole numbers in the order's axis order, as Imaris X, Y, Z
+    # Three whole numbers in the order's axis order, as the image's (y, x, z)
     return [_index(v, f'{name} values') for v in _per_axis(values, name, order)]
 
 
 def read_ims(file_name, resolution_level=0, timepoint=0, channel=0, start_coords=None, end_coords=None, order='C',
-             num_threads=None, out=None):
+             num_threads=None, out=None, x_on_imaris_x=False):
     """Read one volume (or a region of it) of an .ims file into a NumPy array.
 
     order='C' (the default) returns (z, y, x), C-contiguous; order='F' MATLAB's (y, x, z),
@@ -438,13 +791,17 @@ def read_ims(file_name, resolution_level=0, timepoint=0, channel=0, start_coords
     GIL is released while reading.
     out: an array to read into instead of a new one: the region's shape and the file's data type,
     writeable, any layout with positive strides. It is returned.
+    x_on_imaris_x: Imaris X is the image's x (for files written with x_on_imaris_x=True); by
+    default its y, as write_ims and the command line write.
     """
     order = _order(order)
     threads = _threads(num_threads)
+    x_on_imaris_x = bool(x_on_imaris_x)
     level, t, c = (_index(resolution_level, 'resolution_level'), _index(timepoint, 'timepoint'),
                    _index(channel, 'channel'))
     name = _existing(file_name)
     size, type_name = pybind11_ims_dataset(_native(name), level, t, c)
+    size = _swap(size, x_on_imaris_x)                 # (the image's y, x, z, as start and end)
     dtype = np.dtype(type_name)
     start = [0, 0, 0] if start_coords is None else _coords(start_coords, 'start_coords', order)
     end = list(size) if end_coords is None else _coords(end_coords, 'end_coords', order)
@@ -452,9 +809,10 @@ def read_ims(file_name, resolution_level=0, timepoint=0, channel=0, start_coords
         end = list(size)
     for i in range(3):
         if not start[i] < end[i] <= size[i]:
-            raise ValueError(f'the region [{_to_order(start, order)}, {_to_order(end, order)}) must lie inside the '
-                             f'volume of shape {_to_order(size, order)} and end after it starts along every axis')
-    shape = _to_order([e - s for s, e in zip(start, end)], order)
+            raise ValueError(f'the region [{_image_to_order(start, order)}, {_image_to_order(end, order)}) must lie '
+                             f'inside the volume of shape {_image_to_order(size, order)} and end after it starts '
+                             'along every axis')
+    shape = _image_to_order([e - s for s, e in zip(start, end)], order)
     if out is None:
         out = np.empty(shape, dtype, order=order)
     else:
@@ -466,7 +824,11 @@ def read_ims(file_name, resolution_level=0, timepoint=0, channel=0, start_coords
             raise ValueError(f'out must have the shape of the region, {shape}, not {out.shape}')
         if not out.flags.writeable:
             raise ValueError('out must be writeable')
-    pybind11_read_ims(_native(name), level, t, c, start, end, np.transpose(out, (1, 2, 0)) if order == 'C' else out,
+    # out viewed along the image's (y, x, z), then along Imaris X, Y, Z
+    view = np.transpose(out, (1, 2, 0)) if order == 'C' else out
+    if x_on_imaris_x:
+        view = np.transpose(view, (1, 0, 2))
+    pybind11_read_ims(_native(name), level, t, c, _swap(start, x_on_imaris_x), _swap(end, x_on_imaris_x), view,
                       threads)
     return out
 
