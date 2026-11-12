@@ -102,17 +102,23 @@ static void setEnvVar(const char* k, const char* v){
     setenv(k, v, 1);
 #endif
 }
+// The std::filesystem calls in the failure cases use the error_code forms, so a failing call
+// is reported and fails the case instead of throwing (an exception aborted the test with no
+// message on macOS).
+static bool fsOk(const char* what, const std::error_code& ec){
+    if(ec){ std::printf("  FAIL: %s: %s\n", what, ec.message().c_str()); return false; } return true; }
 static bool expectFail(const char* what, const std::string& cmd, const fs::path& noOutput = fs::path()){
     std::printf("[failure case] %s\n", what);
     int rc = runCmd(cmd);
     if(rc == 0){ std::printf("  FAIL: exit 0\n"); return false; }
-    if(!noOutput.empty() && fs::exists(noOutput)){ std::printf("  FAIL: %s left behind\n", noOutput.string().c_str()); return false; }
+    std::error_code ec;
+    if(!noOutput.empty() && fs::exists(noOutput, ec)){ std::printf("  FAIL: %s left behind\n", noOutput.string().c_str()); return false; }
     std::printf("  ok (exit %d)\n", rc); return true;
 }
 // wd = the finished parallel workdir (manifest + all packs), monoIms = the monolithic 2-channel output.
 static bool failureCases(const std::string& exe, const fs::path& work, const fs::path& wd, const fs::path& monoIms){
-    const std::string E = q(exe); bool ok = true;
-    fs::path none = work/"fc_nomanifest"; fs::create_directories(none);
+    const std::string E = q(exe); bool ok = true; std::error_code ec;
+    fs::path none = work/"fc_nomanifest"; fs::create_directories(none, ec); ok &= fsOk("create fc_nomanifest", ec);
     ok &= expectFail("worker without a manifest", E+" worker "+q(none)+" 0 0");
     ok &= expectFail("monitor without a manifest", E+" monitor "+q(none)+" "+q(none/"out.ims"), none/"out.ims");
     ok &= expectFail("combineone without a manifest", E+" combineone "+q(none)+" 0 0 "+q(none/"out.ims"), none/"out.ims");
@@ -120,41 +126,43 @@ static bool failureCases(const std::string& exe, const fs::path& work, const fs:
     ok &= expectFail("linkparts without a manifest", E+" linkparts "+q(none)+" "+q(none/"out.ims")+" parts", none/"out.ims");
 
     // uint8 data: setup records it (linkparts can take it), the uint16-only tile worker refuses it
-    fs::path z8 = work/"fc_zarr_u8"; fs::create_directories(z8); writeZarrU8(z8/"CamA_t0000.zarr");
+    fs::path z8 = work/"fc_zarr_u8"; fs::create_directories(z8, ec); ok &= fsOk("create fc_zarr_u8", ec); writeZarrU8(z8/"CamA_t0000.zarr");
     fs::path wd8 = work/"fc_u8";
     if(runCmd(E+" setup "+q(z8)+" CamA "+q(wd8)+" 64,64,64 1,1,1") != 0){ std::printf("  FAIL: setup on uint8 data\n"); ok = false; }
     ok &= expectFail("worker on uint8 data", E+" worker "+q(wd8)+" 0 0");
 
     // chunks/ is a file, so no pack can be created (fails for any user on any platform)
-    fs::path wdw = work/"fc_nowrite"; fs::create_directories(wdw);
-    fs::copy_file(wd/"manifest.json", wdw/"manifest.json"); { std::ofstream f((wdw/"chunks").string()); f << "x"; }
+    fs::path wdw = work/"fc_nowrite"; fs::create_directories(wdw, ec); ok &= fsOk("create fc_nowrite", ec);
+    fs::copy_file(wd/"manifest.json", wdw/"manifest.json", ec); ok &= fsOk("copy manifest.json", ec); { std::ofstream f((wdw/"chunks").string()); f << "x"; }
     ok &= expectFail("worker with an unwritable chunks directory", E+" worker "+q(wdw)+" 0 0");
 
     ok &= expectFail("monitor writing into a missing directory", E+" monitor "+q(wd)+" "+q(work/"fc_no"/"such"/"out.ims"));
 
-    fs::path wdt = work/"fc_trunc"; fs::copy(wd, wdt, fs::copy_options::recursive);
-    fs::path pk = wdt/"chunks"/"L0_C0_T0_0.pack"; fs::resize_file(pk, fs::file_size(pk) - 100);
+    fs::path wdt = work/"fc_trunc"; fs::copy(wd, wdt, fs::copy_options::recursive, ec); ok &= fsOk("copy workdir to fc_trunc", ec);
+    fs::path pk = wdt/"chunks"/"L0_C0_T0_0.pack"; const auto pkSize = fs::file_size(pk, ec); ok &= fsOk("size of a pack", ec);
+    if(!ec){ fs::resize_file(pk, pkSize - 100, ec); ok &= fsOk("truncate a pack", ec); }
     ok &= expectFail("monitor with a truncated pack", E+" monitor "+q(wdt)+" "+q(work/"fc_trunc.ims"), work/"fc_trunc.ims");
 
     // one pack missing plus one stale pack: the stale one must not count as the missing one
-    fs::path wds = work/"fc_stale"; fs::copy(wd, wds, fs::copy_options::recursive);
-    fs::remove(wds/"chunks"/"L0_C1_T0_0.pack");
-    fs::copy_file(wds/"chunks"/"L0_C0_T0_0.pack", wds/"chunks"/"L0_C0_T0_999.pack");
+    fs::path wds = work/"fc_stale"; fs::copy(wd, wds, fs::copy_options::recursive, ec); ok &= fsOk("copy workdir to fc_stale", ec);
+    fs::remove(wds/"chunks"/"L0_C1_T0_0.pack", ec); ok &= fsOk("remove a pack", ec);
+    fs::copy_file(wds/"chunks"/"L0_C0_T0_0.pack", wds/"chunks"/"L0_C0_T0_999.pack", ec); ok &= fsOk("make a stale pack", ec);
     setEnvVar("PIW_MONITOR_TIMEOUT", "2");
     ok &= expectFail("monitor with one pack missing and a stale one (2 s timeout)", E+" monitor "+q(wds)+" "+q(work/"fc_stale.ims"), work/"fc_stale.ims");
     setEnvVar("PIW_MONITOR_TIMEOUT", "");
 
     // linkparts with a missing part, then with every part present (positive control)
-    fs::path lp = work/"fc_link"; fs::create_directories(lp/"parts");
-    fs::copy_file(monoIms, lp/"parts"/"part_t0_c0.ims");
+    fs::path lp = work/"fc_link"; fs::create_directories(lp/"parts", ec); ok &= fsOk("create fc_link/parts", ec);
+    fs::copy_file(monoIms, lp/"parts"/"part_t0_c0.ims", ec); ok &= fsOk("copy part_t0_c0", ec);
     ok &= expectFail("linkparts with a missing part", E+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts", lp/"link.ims");
-    fs::copy_file(monoIms, lp/"parts"/"part_t0_c1.ims");
+    fs::copy_file(monoIms, lp/"parts"/"part_t0_c1.ims", ec); ok &= fsOk("copy part_t0_c1", ec);
     if(runCmd(E+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts") != 0 || !fs::exists(lp/"link.ims")){
         std::printf("  FAIL: linkparts with every part present\n"); ok = false; }
     return ok;
 }
 
 int main(int argc, char** argv){
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // nothing lost if the test dies
     if(argc < 2){ std::fprintf(stderr, "usage: %s <parallelimariswriter> [workdir]\n", argv[0]); return 2; }
     const std::string exe = argv[1];
     fs::path work = (argc > 2) ? fs::path(argv[2]) : fs::temp_directory_path()/"piw_paralleltest";
