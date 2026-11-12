@@ -3,7 +3,7 @@ An efficient converter that writes TIFF and Zarr image stacks to the Imaris 5 (.
 
 ## Limitations
 1. Only 3D image stacks are supported (single or multiple channels, single or multiple timepoints). Reading inherits the cpp-tiff and cpp-zarr limitations, and color (RGB/RGBA) TIFFs are not supported.
-2. 8, 16, and 32 bit data are supported; 64 bit data is not yet supported by the Imaris Converter.
+2. Supported sample types: unsigned 8-, 16- and 32-bit integers (`uint8`, `uint16`, `uint32`) and 32-bit floats (`float32`), one sample per pixel. The type is the file's own (a TIFF's BitsPerSample and SampleFormat, a Zarr's dtype) and the `.ims` holds the same type. Signed integers, 16- and 64-bit floats, 64-bit integers, booleans, complex numbers and TIFFs with several samples per pixel are refused with an error before any output is written, and every input must have the type of the first.
 3. Block processing (`-C`) can split a Zarr along all three axes, but a TIFF can only be split along Z (full XY slices) — a limitation of the TIFF format.
 
 ## Releases
@@ -44,7 +44,7 @@ The converter finds its inputs by matching a file-name pattern inside one or mor
 | `-c` | Number of channels; if given, it must equal the number of patterns |
 | `-t` | Number of timepoints; if given, it must equal the number of files per pattern |
 | `-b` | Size of the blocks handed to the ImarisWriter as `X,Y,Z`, whole numbers of at least 1 (default: the reader's native chunk size). It does not change the output: the HDF5 chunks are chosen by the ImarisWriter. |
-| `-B` | Bounding box to crop the input as `Xmin,Ymin,Zmin,Xmax,Ymax,Zmax`: whole numbers, 0-based, the max excluded |
+| `-B` | Bounding box to crop the input as `Xmin,Ymin,Zmin,Xmax,Ymax,Zmax`: whole numbers, 0-based, the max excluded, for both readers. Along every axis `0 ≤ min < max ≤ size` of every input; the inputs may then differ in size (without `-B` they must all have the same size). |
 | `-C` | Processing block size as `X,Y,Z` (whole numbers of at least 1) — the amount of a timepoint held in RAM at once. Zarr is blocked in all three axes; TIFF only in Z. Values larger than the image simply read the whole image. Omit to process a whole timepoint at once (the whole timepoint is then held in RAM). |
 | `--channel-names` | Comma-separated channel names (default: the `-P` patterns, e.g. `CamA,CamB`) |
 | `--colors` | Comma-separated channel colors: `red`, `green`, `blue`, `cyan`, `magenta`, `yellow`, `white`, `gray`, a hex `RRGGBB`, or `r:g:b` with values from 0 to 1 (default: red, green, blue, red, ...) |
@@ -57,7 +57,7 @@ The converter finds its inputs by matching a file-name pattern inside one or mor
 A list of numbers may end with one comma (`-v 0.108,0.108,0.25,`). A leading `~` or `~/` in `-F` and `-o` is replaced by the home folder (Linux and Mac).
 
 #### Exit codes
-`0` when the `.ims` was written. `1` on any error — an unknown option or a missing or malformed value, no arguments at all, an unsupported reader, a missing input folder, a pattern without a match, channels with different numbers of files, an output folder that cannot be created or written, unsupported data (such as 64-bit), or a failed read or write — after one `ERROR: <text>` line on stderr (a partly written output file is removed).
+`0` when the `.ims` was written. `1` on any error — an unknown option or a missing or malformed value, no arguments at all, an unsupported reader, a missing input folder, a pattern without a match, channels with different numbers of files, an output folder that cannot be created or written, an unsupported sample type (see Limitations), inputs of different types or sizes, a bounding box that does not fit an input, or a failed read or write — after one `ERROR: <text>` line on stderr (a partly written output file is removed).
 
 #### Metadata
 The channels are named after their patterns and colored red, green, blue, red, ... unless `--channel-names` and `--colors` say otherwise; wavelengths are written only when given. The file's Creator is `parallelimariswriter` with its version. Timepoint `t` is placed at:

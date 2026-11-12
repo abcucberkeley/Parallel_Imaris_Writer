@@ -306,9 +306,56 @@ private:
     void* mData;
 };
 
-// Shape (X, Y, Z), default block size and bits of one input volume. The readers report errors
-// with NULL or 0, and cpp-zarr's constructor throws std::string: all become ReadFailed.
-Status volumeInfo(bool aTiff, const std::string& aFile, uint64_t aShape[3], uint64_t aChunks[3], uint64_t& aBits){
+// The sample type of a Zarr from cpp-zarr's dtype: NumPy's typestr after a byte-order mark
+// ("<u2", "|u1", ">f4", "|b1", "<c8"), or "bfloat16". Big-endian data is swapped by the reader, so
+// the byte order does not matter.
+std::string zarrSampleType(const std::string& aDtype){
+    const bool vMark = !aDtype.empty() && (aDtype[0] == '<' || aDtype[0] == '>' || aDtype[0] == '|');
+    const std::string vRest = vMark ? aDtype.substr(1) : aDtype;
+    bool vNumbered = vRest.size() >= 2 && vRest.size() <= 3;
+    for(size_t i = 1; vNumbered && i < vRest.size(); ++i) vNumbered = vRest[i] >= '0' && vRest[i] <= '9';
+    if(!vNumbered) return vRest;
+    const std::string vBits = std::to_string(strtoul(vRest.c_str() + 1, NULL, 10)*8);
+    switch(vRest[0]){
+        case 'u': return "uint" + vBits;
+        case 'i': return "int" + vBits;
+        case 'f': return "float" + vBits;
+        case 'c': return "complex" + vBits;
+        case 'b': return "bool";
+        default: return vRest;
+    }
+}
+
+// The sample type of a TIFF from its BitsPerSample, SampleFormat and SamplesPerPixel tags.
+std::string tiffSampleType(const TiffInfo& aInfo){
+    const std::string vBits = std::to_string((unsigned long long)aInfo.bits);
+    std::string vType = aInfo.sampleFormat == 1 ? "uint" + vBits : aInfo.sampleFormat == 2 ? "int" + vBits :
+                        aInfo.sampleFormat == 3 ? "float" + vBits :
+                        "SampleFormat " + std::to_string((unsigned)aInfo.sampleFormat) + " (" + vBits + "-bit)";
+    if(aInfo.samples > 1) vType += " with " + std::to_string((unsigned long long)aInfo.samples) + " samples per pixel";
+    return vType;
+}
+
+// The sample types an .ims gets, by the name the two functions above give them. Everything else
+// (signed integers, float16 and float64, 64-bit integers, bool, complex, several samples per
+// pixel) is refused before any output exists.
+bool imsDataType(const std::string& aSampleType, DataType& aType){
+    if(aSampleType == "uint8") aType = DataType::UInt8;
+    else if(aSampleType == "uint16") aType = DataType::UInt16;
+    else if(aSampleType == "uint32") aType = DataType::UInt32;
+    else if(aSampleType == "float32") aType = DataType::Float32;
+    else return false;
+    return true;
+}
+
+Status unsupportedType(const std::string& aFile, const std::string& aSampleType){
+    return Status(Code::Unsupported, aFile + " has sample type " + aSampleType + "; supported are uint8, uint16, "
+                  "uint32 and float32, one sample per pixel.");
+}
+
+// Shape (X, Y, Z), default block size and sample type of one input volume. The readers report
+// errors with NULL or 1, and cpp-zarr's constructor throws std::string: all become ReadFailed.
+Status volumeInfo(bool aTiff, const std::string& aFile, uint64_t aShape[3], uint64_t aChunks[3], std::string& aSampleType){
     const std::string vFailed = "could not read " + aFile;
     try{
         if(aTiff){
@@ -321,16 +368,20 @@ Status volumeInfo(bool aTiff, const std::string& aFile, uint64_t aShape[3], uint
             aChunks[0] = 64;
             aChunks[1] = 64;
             aChunks[2] = 78;
-            aBits = getDataType(aFile.c_str());
-            if(!aBits) return Status(Code::ReadFailed, vFailed);
+            TiffInfo vInfo;
+            if(getTiffInfo(aFile.c_str(), vInfo)) return Status(Code::ReadFailed, vFailed);
+            aSampleType = tiffSampleType(vInfo);
         }
         else{
             zarr Zarr(aFile);
-            if(Zarr.get_ndims() != 3) return Status(Code::Unsupported, aFile + " is not a 3D array.");
+            if(Zarr.get_ndims() != 3){
+                return Status(Code::Unsupported, aFile + " has " + std::to_string((unsigned long long)Zarr.get_ndims()) +
+                              " dimensions; only 3-D arrays are supported.");
+            }
             aChunks[0] = Zarr.get_chunks(0);
             aChunks[1] = Zarr.get_chunks(1);
             aChunks[2] = Zarr.get_chunks(2);
-            aBits = Zarr.dtypeBytes()*8;
+            aSampleType = zarrSampleType(Zarr.get_dtype());
             aShape[0] = Zarr.get_shape(0);
             aShape[1] = Zarr.get_shape(1);
             aShape[2] = Zarr.get_shape(2);
@@ -342,9 +393,14 @@ Status volumeInfo(bool aTiff, const std::string& aFile, uint64_t aShape[3], uint
     return Status();
 }
 
-// Every input must match the first (same bits; same shape, or with a bounding box: contain it).
-// Runs before the output is created, so a bad file fails at the start and leaves no output.
-Status checkInputs(const ConvertOptions& aOptions, bool aTiff, const uint64_t aShape[3], uint64_t aBits){
+std::string boxText(const uint64_t aBox[6]){
+    return std::to_string(aBox[0]) + "," + std::to_string(aBox[1]) + "," + std::to_string(aBox[2]) + "," +
+           std::to_string(aBox[3]) + "," + std::to_string(aBox[4]) + "," + std::to_string(aBox[5]);
+}
+
+// Every input must match the first (same sample type; same shape, or with a bounding box: contain
+// it). Runs before the output is created, so a bad file fails at the start and leaves no output.
+Status checkInputs(const ConvertOptions& aOptions, bool aTiff, const uint64_t aShape[3], const std::string& aSampleType){
     const std::string& vFirst = aOptions.files[0][0];
     const uint64_t* vBox = aOptions.boundingBox;
     for(size_t vC = 0; vC < aOptions.files.size(); ++vC){
@@ -352,20 +408,20 @@ Status checkInputs(const ConvertOptions& aOptions, bool aTiff, const uint64_t aS
             const std::string& vFile = aOptions.files[vC][vT];
             uint64_t vShape[3] = {aShape[0], aShape[1], aShape[2]};
             uint64_t vChunks[3];
-            uint64_t vBits = aBits;
+            std::string vSampleType = aSampleType;
             if(vC || vT){
-                Status vStatus = volumeInfo(aTiff, vFile, vShape, vChunks, vBits);
+                Status vStatus = volumeInfo(aTiff, vFile, vShape, vChunks, vSampleType);
                 if(!vStatus.ok()) return vStatus;
             }
-            if(vBits != aBits){
-                return Status(Code::InvalidArgument, vFile + " holds " + std::to_string(vBits) + "-bit data but " +
-                              vFirst + " holds " + std::to_string(aBits) + "-bit data.");
+            if(vSampleType != aSampleType){
+                return Status(Code::InvalidArgument, vFile + " has sample type " + vSampleType + " but " + vFirst + " has " +
+                              aSampleType + "; every input must have the same sample type.");
             }
             if(aOptions.hasBoundingBox){
                 if(vBox[3] > vShape[0] || vBox[4] > vShape[1] || vBox[5] > vShape[2]){
-                    const uint64_t vEnd[3] = {vBox[3], vBox[4], vBox[5]};
-                    return Status(Code::InvalidArgument, "The bounding box (end " + sizeText(vEnd) + ") does not fit in " +
-                                  vFile + " (" + sizeText(vShape) + ").");
+                    const uint64_t vBoxSize[3] = {vBox[3] - vBox[0], vBox[4] - vBox[1], vBox[5] - vBox[2]};
+                    return Status(Code::InvalidArgument, "The bounding box " + boxText(vBox) + " (" + sizeText(vBoxSize) +
+                                  ") does not fit in " + vFile + " (" + sizeText(vShape) + ").");
                 }
             }
             else if(vShape[0] != aShape[0] || vShape[1] != aShape[1] || vShape[2] != aShape[2]){
@@ -398,7 +454,7 @@ Status validate(const ConvertOptions& aOptions){
     if(aOptions.hasBoundingBox){
         const uint64_t* vBox = aOptions.boundingBox;
         if(vBox[3] <= vBox[0] || vBox[4] <= vBox[1] || vBox[5] <= vBox[2]){
-            return Status(Code::InvalidArgument, "The bounding box must end after it starts along every axis.");
+            return Status(Code::InvalidArgument, "The bounding box " + boxText(vBox) + " must end after it starts along every axis.");
         }
     }
     if(aOptions.numThreads < 0) return Status(Code::InvalidArgument, "The number of threads cannot be negative.");
@@ -686,10 +742,13 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
 
     uint64_t vShape[3] = {0, 0, 0};
     uint64_t vChunks[3] = {0, 0, 0};
-    uint64_t bits = 1;
-    Status vStatus = volumeInfo(vTiff, aOptions.files[0][0], vShape, vChunks, bits);
+    std::string vSampleType;
+    Status vStatus = volumeInfo(vTiff, aOptions.files[0][0], vShape, vChunks, vSampleType);
     if(!vStatus.ok()) return vStatus;
-    vStatus = checkInputs(aOptions, vTiff, vShape, bits);
+    // The type of the first input decides the .ims's (every other input must have the same).
+    DataType vType = DataType::UInt16;
+    if(!imsDataType(vSampleType, vType)) return unsupportedType(aOptions.files[0][0], vSampleType);
+    vStatus = checkInputs(aOptions, vTiff, vShape, vSampleType);
     if(!vStatus.ok()) return vStatus;
 
     // Use custom chunk sizes if provided
@@ -700,13 +759,6 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     }
     say(aCallbacks, "Block Sizes: %llu,%llu,%llu\n",
         (unsigned long long)vChunks[0], (unsigned long long)vChunks[1], (unsigned long long)vChunks[2]);
-    // TODO: 64 BIT NOT YET SUPPORTED
-    if(bits == 64) return Status(Code::Unsupported, "64 bit data is not yet supported by the Imaris Converter");
-    if(bits != 8 && bits != 16 && bits != 32){
-        return Status(Code::Unsupported, std::to_string(bits) + "-bit data is not supported.");
-    }
-    // The type comes from the bit depth alone: 32-bit input is written as float.
-    const DataType vType = bits == 8 ? DataType::UInt8 : bits == 16 ? DataType::UInt16 : DataType::Float32;
     const size_t vBytes = dataTypeBytes(vType);
 
     // Bounding Box

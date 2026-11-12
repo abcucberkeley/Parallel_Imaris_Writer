@@ -3,12 +3,15 @@
 //
 // Generates its inputs on the fly (no committed test data), runs the shipped
 // executable on them and decodes the .ims with tests/imsutil.h:
-//   1. TIFF and zstd/F-order Zarr x uint8/uint16/float32, one 149x129x101 volume
+//   1. TIFF and zstd/F-order Zarr x uint8/uint16/uint32/float32, one 149x129x101 volume
 //      (odd sizes: partial chunks on every axis, a dropped voxel per axis at level 1)
 //      whose value differs along every axis: exit code 0; level 0 equals the input
 //      byte for byte; ImageSizeX/Y/Z, DataSetInfo/Image X/Y/Z and ExtMax0/1/2 match
 //      the shape and -v; level 1 is the 2x2x2 box average of level 0 over the axes
-//      that halved; the level-0 Histogram counts every voxel; /Thumbnail/Data exists.
+//      that halved; the level-0 Histogram counts every voxel; /Thumbnail/Data exists. The
+//      dataset's type is the input's (uint32 stays an unsigned 32-bit integer, not float).
+//   1b. -B 10,5,20,74,37,84 on that uint16 volume, TIFF and Zarr, alone and with -C (Zarr
+//      32,32,32; TIFF 1000,1000,16, Z-slabs): level 0 is the sub-volume, byte for byte.
 //   2. 2 channels x 3 timepoints (TIFF and Zarr, distinct data per file): every
 //      (timepoint, channel) dataset equals its own input file.
 //   3. Self-test of imsCompare: two conversions of one input compare equal; inputs
@@ -45,10 +48,12 @@ struct CaseResult {
 struct Shape { uint64_t x, y, z; uint64_t n() const { return x*y*z; } };
 
 template<typename T> static const char* typeName(){
-    return std::is_same<T, uint8_t>::value ? "uint8" : std::is_same<T, uint16_t>::value ? "uint16" : "float32";
+    return std::is_same<T, uint8_t>::value ? "uint8" : std::is_same<T, uint16_t>::value ? "uint16" :
+           std::is_same<T, uint32_t>::value ? "uint32" : "float32";
 }
 template<typename T> static const char* zarrDtype(){
-    return std::is_same<T, uint8_t>::value ? "<u1" : std::is_same<T, uint16_t>::value ? "<u2" : "<f4";
+    return std::is_same<T, uint8_t>::value ? "<u1" : std::is_same<T, uint16_t>::value ? "<u2" :
+           std::is_same<T, uint32_t>::value ? "<u4" : "<f4";
 }
 
 // A value that changes along every axis (a swapped or shifted axis changes the data);
@@ -57,6 +62,8 @@ template<typename T> static const char* zarrDtype(){
 template<typename T> static T value(uint64_t x, uint64_t y, uint64_t z, int seed){
     if constexpr(std::is_same<T, uint8_t>::value)  return (T)((x*7 + y*13 + z*29 + (uint64_t)seed*37) % 251);
     if constexpr(std::is_same<T, uint16_t>::value) return (T)((x*7 + y*311 + z*4099 + (uint64_t)seed*977) % 65521);
+    // uint32: above 65535 (a 16-bit or float reading shows), below 2^21 (level-1 sums stay exact in float)
+    if constexpr(std::is_same<T, uint32_t>::value) return (T)(70000 + (x*7919 + y*104729 + z*1299709 + (uint64_t)seed*15485863) % 1000000);
     return (float)x*0.37f + (float)y*1.13f + (float)z*2.71f + (float)seed*0.5f;
 }
 template<typename T> static std::vector<T> makeVolume(const Shape& s, int seed){
@@ -96,7 +103,7 @@ template<typename T> static bool writeInput(const std::string& reader, const fs:
 
 // Runs the converter; true if it exits 0 and writes <outdir>/output.ims.
 static bool convert(const std::string& exe, const std::string& reader, const std::string& patterns,
-                    const fs::path& indir, const fs::path& outdir){
+                    const fs::path& indir, const fs::path& outdir, const std::string& extra = std::string()){
     fs::remove_all(outdir); fs::create_directories(outdir);
     // Native separators: std::system() runs via cmd.exe on Windows, which cannot
     // launch an executable given a forward-slash path (CMake passes C:/... paths).
@@ -104,7 +111,7 @@ static bool convert(const std::string& exe, const std::string& reader, const std
     const std::string inN  = fs::path(indir).make_preferred().string();
     const std::string outN = fs::path(outdir).make_preferred().string();
     std::string cmd = "\"" + exeN + "\" -P " + patterns + " -F \"" + inN + "\" -o \"" + outN +
-                      "\" -r " + reader + " -v 0.1,0.2,0.3";
+                      "\" -r " + reader + " -v 0.1,0.2,0.3" + (extra.empty() ? "" : " " + extra);
 #ifdef _WIN32
     // std::system() runs `cmd /c <cmd>`; when <cmd> starts with a quoted path,
     // cmd.exe mangles it ("The system cannot find the path specified") unless the
@@ -232,6 +239,31 @@ template<typename T> static void volumeCase(const std::string& exe, const std::s
     check(imsExists(ims, "/Thumbnail/Data"), "/Thumbnail/Data missing");
 }
 
+// Case 1b: -B on case 1's uint16 volume (alone, and with -C: processBlock non-empty).
+static void boxCase(const std::string& exe, const std::string& reader, const fs::path& work, const std::string& processBlock){
+    const Shape s = {149, 129, 101};
+    const uint64_t b[6] = {10, 5, 20, 74, 37, 84};
+    const std::string tag = reader + "_box" + (processBlock.empty() ? "" : "_C");
+    std::printf("[%s -B 10,5,20,74,37,84%s]\n", reader.c_str(), processBlock.empty() ? "" : (" -C " + processBlock).c_str());
+    CaseResult result;
+    const fs::path indir = work/("in_" + reader + "_uint16"), outdir = work/("out_" + tag), ims = outdir/"output.ims";
+    if(!fs::exists(indir) && !writeInput(reader, indir, "CamA_t0000", s, makeVolume<uint16_t>(s, 0))) return;
+    std::string extra = "-B 10,5,20,74,37,84";
+    if(!processBlock.empty()) extra += " -C " + processBlock;
+    if(!convert(exe, reader, "CamA", indir, outdir, extra)) return;
+    const Shape c = {b[3] - b[0], b[4] - b[1], b[5] - b[2]};
+    std::vector<uint16_t> want(c.n());
+    for(uint64_t z = 0; z < c.z; z++)
+        for(uint64_t y = 0; y < c.y; y++)
+            for(uint64_t x = 0; x < c.x; x++) want[x + y*c.x + z*c.x*c.y] = value<uint16_t>(x + b[0], y + b[1], z + b[2], 0);
+    ImsVolumeInfo info;
+    std::vector<uint8_t> got = imsReadVolume(ims, 0, 0, 0, info);
+    if(!info.error.empty()){ check(false, "level 0: " + info.error); return; }
+    check(info.sizeX == c.x && info.sizeY == c.y && info.sizeZ == c.z,
+          "level 0 ImageSize " + std::to_string(info.sizeX) + "x" + std::to_string(info.sizeY) + "x" + std::to_string(info.sizeZ));
+    sameVoxels(got, want, c, "level 0 (the sub-volume)");
+}
+
 // Case 2: 2 channels x 3 timepoints, every file distinct.
 static void multiCase(const std::string& exe, const std::string& reader, const fs::path& work){
     const Shape s = {67, 45, 23};
@@ -300,8 +332,13 @@ int main(int argc, char** argv){
     for(const char* reader : {"tiff", "zarr"}){
         volumeCase<uint8_t>(exe, reader, work);
         volumeCase<uint16_t>(exe, reader, work);
+        volumeCase<uint32_t>(exe, reader, work);
         volumeCase<float>(exe, reader, work);
     }
+    boxCase(exe, "zarr", work, "");
+    boxCase(exe, "zarr", work, "32,32,32");
+    boxCase(exe, "tiff", work, "");
+    boxCase(exe, "tiff", work, "1000,1000,16");
     multiCase(exe, "tiff", work);
     multiCase(exe, "zarr", work);
     compareSelfTest(exe, work);

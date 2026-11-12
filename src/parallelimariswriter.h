@@ -122,7 +122,9 @@ PIW_API Status findInputFiles(const std::vector<std::string>& folders, const std
 PIW_API Status findInputFiles(const std::vector<std::string>& folders, const std::vector<std::string>& patterns,
                               std::vector<std::vector<std::string> >& files) noexcept;
 
-// Writes options.outputFile. Every input file is checked (shape, bit depth; with a bounding box,
+// Writes options.outputFile. The inputs' sample type is the file's: uint8, uint16, uint32 or
+// float32 with one sample per pixel (Unsupported for any other: signed, float16/64, 64-bit, bool,
+// complex, RGB). Every input file is checked (sample type, shape; Zarr: 3-D; with a bounding box,
 // that it contains the box) before the output is created; after any later failure the partial
 // output is removed. One conversion runs at a time in a process (calls from other threads wait).
 PIW_API Status convert(const ConvertOptions& options, const Callbacks& callbacks = Callbacks()) noexcept;

@@ -15,8 +15,13 @@
 //     file and in a folder name, a space in a path, 100 channels
 //   - output: a folder nested three levels deep (created), a folder that cannot be created, a
 //     timepoints.txt that cannot be written (a warning only)
-//   - inputs that used to crash: bad zarr metadata, a corrupt chunk, a TIFF that is not a TIFF,
-//     64-bit data
+//   - inputs that used to crash: bad zarr metadata, a corrupt chunk, a TIFF that is not a TIFF
+//   - sample types: int16 (Zarr, TIFF), float64 (Zarr, TIFF), an RGB TIFF, a bool Zarr, a 2-D and a
+//     4-D Zarr are refused with the type in the message; a second time point of another type with
+//     the same bit depth (uint32 after float32, Zarr and TIFF) or an int16 one is refused before
+//     any output
+//   - bounding boxes: max == min, outside along Z only, outside a TIFF, inside the first time point
+//     but not the second (the message names that file)
 //   - POSIX only: "~/" with HOME set for the child, an unreadable input folder and an unwritable
 //     output folder (skipped when running as root)
 // C stdio for file I/O (no iostreams, no std::filesystem copies: see failtest.cpp). The executable
@@ -94,20 +99,44 @@ static void writeZarrData(const fs::path& path, const Dims& d, const void* data,
         std::exit(1);
     }
 }
+// A Zarr of zeros of any shape (2-D, 4-D, ...), 16 per chunk along every dimension.
+static void writeZarrShape(const fs::path& path, const std::vector<uint64_t>& shape, const char* dtype, uint64_t bits){
+    fs::create_directories(path.parent_path());
+    uint64_t n = 1;
+    for(uint64_t e : shape) n *= e;
+    std::vector<uint8_t> zeros(n*bits/8);
+    zarr Zw;
+    Zw.set_fileName(path.string());
+    Zw.set_cname("zstd"); Zw.set_clevel(1); Zw.set_order("F");
+    Zw.set_chunks(std::vector<uint64_t>(shape.size(), 16)); Zw.set_dimension_separator("."); Zw.set_dtype(dtype); Zw.set_shape(shape);
+    Zw.write_zarray();
+    const std::vector<uint64_t> origin(shape.size(), 0);
+    Zw.set_chunkInfo(origin, shape);
+    if(parallelWriteZarr(Zw, zeros.data(), origin, shape, shape, bits, false, false, false)){
+        std::fprintf(stderr, "Zarr write of %s failed: %s\n", path.string().c_str(), Zw.get_errString().c_str());
+        std::exit(1);
+    }
+}
 static void writeZarr(const fs::path& path, const Dims& d, int seed){
     const std::vector<uint16_t> v = makeVolume(d, seed);
     writeZarrData(path, d, v.data(), "<u2", 16);
 }
 
-static void writeTiff(const fs::path& path, const Dims& d, int seed){
+// A TIFF of data: bits per sample, SampleFormat (1 unsigned, 2 signed, 3 float), samples per pixel.
+static void writeTiffData(const fs::path& path, const Dims& d, const void* data, uint64_t bits, uint16_t sampleFormat,
+                          uint64_t samples = 1){
     fs::create_directories(path.parent_path());
-    std::vector<uint16_t> v = makeVolume(d, seed);
     // The TIFF reader returns (rows, columns, pages) with the row fastest, so the volume's first
     // axis is the TIFF height: a column-major buffer of width d.y and height d.x (see roundtrip.cpp).
-    if(writeTiffParallelWrapper(d.y, d.x, d.z, path.string().c_str(), v.data(), 16, 0, 8, "w", true, std::string("none"), 1)){
+    if(writeTiffParallelWrapper(d.y, d.x, d.z, path.string().c_str(), data, bits, 0, 8, "w", true, std::string("none"),
+                                sampleFormat, 0, samples)){
         std::fprintf(stderr, "TIFF write of %s failed\n", path.string().c_str());
         std::exit(1);
     }
+}
+static void writeTiff(const fs::path& path, const Dims& d, int seed){
+    const std::vector<uint16_t> v = makeVolume(d, seed);
+    writeTiffData(path, d, v.data(), 16, 1);
 }
 
 static void writeText(const fs::path& p, const std::string& text){
@@ -485,10 +514,70 @@ int main(int argc, char** argv){
         writeText(work/"nottiff"/"CamA_t0000.tif", "not a TIFF file");
         expectError("a .tif that is not a TIFF", {"-r", "tiff", "-F", native(work/"nottiff"), "-P", "CamA", "-o", native(o)},
                     "could not read", o/"output.ims");
-        std::vector<double> v64(d.x*d.y*d.z, 1.5);
-        writeZarrData(work/"f64"/"CamA_t0000.zarr", d, v64.data(), "<f8", 64);
-        expectError("64-bit data", {"-r", "zarr", "-F", native(work/"f64"), "-P", "CamA", "-o", native(o)},
-                    "64 bit data is not yet supported", o/"output.ims");
+    }
+
+    std::printf("[sample types]\n");
+    {
+        const fs::path o = work/"out_types", oIms = o/"output.ims";
+        const uint64_t n = d.x*d.y*d.z;
+        auto refused = [&](const std::string& what, const char* reader, const fs::path& in, const std::string& type){
+            expectError(what, {"-r", reader, "-F", native(in), "-P", "CamA", "-o", native(o)},
+                        "has sample type " + type + "; supported are uint8, uint16, uint32 and float32", oIms);
+        };
+        std::vector<int16_t> i16(n);
+        for(uint64_t i = 0; i < n; ++i) i16[i] = (int16_t)((int64_t)(i % 1000) - 500);
+        writeZarrData(work/"i16z"/"CamA_t0000.zarr", d, i16.data(), "<i2", 16);
+        refused("int16 Zarr", "zarr", work/"i16z", "int16");
+        writeTiffData(work/"i16t"/"CamA_t0000.tif", d, i16.data(), 16, 2);
+        refused("int16 TIFF", "tiff", work/"i16t", "int16");
+        std::vector<double> f64(n, 1.5);
+        writeZarrData(work/"f64"/"CamA_t0000.zarr", d, f64.data(), "<f8", 64);
+        refused("float64 Zarr", "zarr", work/"f64", "float64");
+        writeTiffData(work/"f64t"/"CamA_t0000.tif", d, f64.data(), 64, 3);
+        refused("float64 TIFF", "tiff", work/"f64t", "float64");
+        std::vector<uint8_t> rgb(n*3, 7);
+        writeTiffData(work/"rgb"/"CamA_t0000.tif", d, rgb.data(), 8, 1, 3);
+        refused("RGB TIFF", "tiff", work/"rgb", "uint8 with 3 samples per pixel");
+        writeZarrShape(work/"boolz"/"CamA_t0000.zarr", {d.x, d.y, d.z}, "|b1", 8);
+        refused("bool Zarr", "zarr", work/"boolz", "bool");
+        writeZarrShape(work/"z2d"/"CamA_t0000.zarr", {d.x, d.y}, "<u2", 16);
+        expectError("2-D Zarr", {"-r", "zarr", "-F", native(work/"z2d"), "-P", "CamA", "-o", native(o)},
+                    "has 2 dimensions; only 3-D arrays are supported", oIms);
+        writeZarrShape(work/"z4d"/"CamA_t0000.zarr", {d.x, d.y, d.z, 2}, "<u2", 16);
+        expectError("4-D Zarr", {"-r", "zarr", "-F", native(work/"z4d"), "-P", "CamA", "-o", native(o)},
+                    "has 4 dimensions; only 3-D arrays are supported", oIms);
+
+        // A second time point of another type: refused before any output, also with the same bit depth
+        std::vector<float> f32(n, 2.5f);
+        std::vector<uint32_t> u32(n, 70000);
+        writeZarrData(work/"mixz"/"CamA_t0000.zarr", d, f32.data(), "<f4", 32);
+        writeZarrData(work/"mixz"/"CamA_t0001.zarr", d, u32.data(), "<u4", 32);
+        expectError("Zarr uint32 after float32", {"-r", "zarr", "-F", native(work/"mixz"), "-P", "CamA", "-o", native(o)},
+                    "CamA_t0001.zarr has sample type uint32 but", oIms);
+        writeTiffData(work/"mixt"/"CamA_t0000.tif", d, f32.data(), 32, 3);
+        writeTiffData(work/"mixt"/"CamA_t0001.tif", d, u32.data(), 32, 1);
+        expectError("TIFF uint32 after float32", {"-r", "tiff", "-F", native(work/"mixt"), "-P", "CamA", "-o", native(o)},
+                    "CamA_t0001.tif has sample type uint32 but", oIms);
+        writeZarr(work/"mixi"/"CamA_t0000.zarr", d, 0);
+        writeZarrData(work/"mixi"/"CamA_t0001.zarr", d, i16.data(), "<i2", 16);
+        expectError("Zarr int16 after uint16", {"-r", "zarr", "-F", native(work/"mixi"), "-P", "CamA", "-o", native(o)},
+                    "CamA_t0001.zarr has sample type int16 but", oIms);
+    }
+
+    std::printf("[bounding boxes]\n");
+    {
+        expectError("-B with max == min", conv({"-B", "5,0,0,5,30,20"}), "must end after it starts", outIms);
+        expectError("-B outside along Z only", conv({"-B", "0,0,10,40,30,21"}), "does not fit in", outIms);
+        const fs::path te = work/"boxtiff";
+        writeTiff(te/"CamA_t0000.tif", d, 0);
+        expectError("TIFF -B outside", {"-r", "tiff", "-F", native(te), "-P", "CamA", "-o", native(out), "-B", "0,0,0,40,31,20"},
+                    "does not fit in", outIms);
+        // the first time point holds the box, the second does not: the message names the second
+        const fs::path bs = work/"boxsizes";
+        writeZarr(bs/"CamA_t0000.zarr", d, 0);
+        writeZarr(bs/"CamA_t0001.zarr", {40, 30, 10}, 1);
+        expectError("-B inside the first time point only", {"-r", "zarr", "-F", native(bs), "-P", "CamA", "-o", native(out),
+                    "-B", "0,0,0,20,20,15"}, "does not fit in " + native(bs/"CamA_t0001.zarr") + " (40x30x10)", outIms);
     }
 
 #ifndef _WIN32
