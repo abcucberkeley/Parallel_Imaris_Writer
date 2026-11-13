@@ -162,6 +162,9 @@ Status readPlanFile(const std::string& workdir,PlanFile& pf){
         o.hasBlockSize=getU64s(c,"blockSize",3,o.blockSize);
         o.hasProcessBlock=getU64s(c,"processBlock",3,o.processBlock);
         o.xOnImarisX=c.value("xOnImarisX",false);
+        const std::string axes=c.value("inputAxes",std::string("yxz"));
+        if(axes=="zyx") o.inputAxes=piw::InputAxes::ZYX;
+        else if(axes!="yxz") return Status(Code::InvalidArgument,p+": unknown convert.inputAxes '"+axes+"' (expected yxz or zyx)");
     }catch(const std::exception& e){ return Status(Code::InvalidArgument,"invalid "+p+": "+e.what()); }
     return Status();
 }
@@ -227,6 +230,7 @@ piw::ClusterPlan planOf(const PlanFile& pf){
     p.outputFile=!pf.output.empty()?pf.output:pf.wd+"/output.ims";
     p.timepoints=pf.nT; p.channels=pf.nC; p.levels=pf.levels; for(int a=0;a<3;a++) p.size[a]=pf.size[a];
     p.dataType=pf.type; p.stages=pf.stages;
+    p.inputAxes=pf.convert.inputAxes; p.xOnImarisX=pf.convert.xOnImarisX;
     return p;
 }
 
@@ -344,7 +348,9 @@ Status tilesTask(const PlanFile& pf,int r,long index,const piw::ClusterTaskOptio
 std::string seriesManifest(const piw::ConvertOptions& co,const uint64_t size[3],piw::DataType type,int levels,const imsmeta::Metadata& md,const std::vector<piw::ClusterStage>& stages){
     ordered_json j;
     const int nC=(int)co.files.size(), nT=(int)co.files[0].size();
-    const int ax[3]={co.xOnImarisX?1:0,co.xOnImarisX?0:1,2};   // Imaris axis i = input axis ax[i]
+    const bool zyx=co.inputAxes==piw::InputAxes::ZYX;   // the image's y, x, z: input axes 0, 1, 2 (zyx: 1, 2, 0)
+    const int iy=zyx?1:0, ix=zyx?2:1, iz=zyx?0:2;
+    const int ax[3]={co.xOnImarisX?ix:iy,co.xOnImarisX?iy:ix,iz};   // Imaris axis i = input axis ax[i]
     j["kind"]="series"; j["stages"]=stagesJson(stages);
     j["timepoints"]=nT; j["channels"]=nC;
     j["voxel"]={imscore::floatExact(co.voxelSize[ax[0]]),imscore::floatExact(co.voxelSize[ax[1]]),imscore::floatExact(co.voxelSize[ax[2]])};
@@ -358,6 +364,7 @@ std::string seriesManifest(const piw::ConvertOptions& co,const uint64_t size[3],
     if(co.hasBlockSize) c["blockSize"]={(unsigned long long)co.blockSize[0],(unsigned long long)co.blockSize[1],(unsigned long long)co.blockSize[2]};
     if(co.hasProcessBlock) c["processBlock"]={(unsigned long long)co.processBlock[0],(unsigned long long)co.processBlock[1],(unsigned long long)co.processBlock[2]};
     c["xOnImarisX"]=co.xOnImarisX;
+    if(zyx) c["inputAxes"]="zyx";   // (absent: yxz, as the plans written before it)
     ordered_json fs=ordered_json::array();
     for(const std::vector<std::string>& ch:co.files){ ordered_json a=ordered_json::array(); for(const std::string& f:ch) a.push_back(f); fs.push_back(a); }
     c["files"]=fs;
@@ -395,7 +402,7 @@ Status planValidated(const piw::ClusterPlanOptions& o,piw::ClusterPlan* plan){
     else{
         if(co.reader!="zarr") return Status(Code::Unsupported,"a tile plan reads Zarr input only");
         if(type!=piw::DataType::UInt16&&type!=piw::DataType::UInt8) return Status(Code::Unsupported,std::string(TILE_TYPES)+"; "+co.files[0][0]+" is "+typeName(type));
-        if(co.xOnImarisX) return Status(Code::Unsupported,"a tile plan keeps the input's axes 0, 1, 2 as Imaris X, Y, Z (no xOnImarisX)");
+        if(co.xOnImarisX||co.inputAxes!=piw::InputAxes::YXZ) return Status(Code::Unsupported,"a tile plan keeps the input's axes 0, 1, 2 as Imaris X, Y, Z (no xOnImarisX, input axes yxz only)");
         if(!o.tileSize[0]||!o.tileSize[1]||!o.tileSize[2]) return Status(Code::InvalidArgument,"a tile plan needs a tile size of at least 1 voxel along every axis");
         if(o.tilesPerTask<1) return Status(Code::InvalidArgument,"tilesPerTask must be at least 1");
         if(o.chunkBytes&&o.chunkBytes<4096) return Status(Code::InvalidArgument,"the chunk budget must be at least 4096 bytes");

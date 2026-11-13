@@ -86,9 +86,9 @@ struct ClusterPlanOptions {
     // patterns; or none, and convert.files lists them.
     std::vector<std::string> folders, patterns;
     // The converter's options: reader, files, voxel size, bounding box, block size, process block (series: each
-    // task's -C), xOnImarisX (series) and the metadata; channel names default to the patterns. outputFile = the
-    // finished file (default <workdir>/output.ims; the single file must be on the workdir's filesystem); numThreads is
-    // not used (each task takes its own).
+    // task's -C), xOnImarisX and inputAxes (series) and the metadata; channel names default to the patterns.
+    // outputFile = the finished file (default <workdir>/output.ims; the single file must be on the workdir's
+    // filesystem); numThreads is not used (each task takes its own).
     ConvertOptions convert;
     // tiles only
     uint64_t tileSize[3] = {0, 0, 0};        // voxels per tile along X, Y, Z (each > 0)
@@ -107,6 +107,9 @@ struct ClusterPlan {
     uint64_t size[3] = {0, 0, 0};            // level 0, Imaris X, Y, Z
     DataType dataType = DataType::UInt16;
     std::vector<ClusterStage> stages;        // in the order they run
+    // series: the conversion's axes (ConvertOptions's; a task's processBlock is along the input's axes)
+    InputAxes inputAxes = InputAxes::YXZ;
+    bool xOnImarisX = false;
 };
 // Checks the options and every input (sample type, shape, bounding box: as convert() does) before anything is
 // written, then writes <workdir>/manifest.json. A workdir that already holds this same plan is kept as it is.

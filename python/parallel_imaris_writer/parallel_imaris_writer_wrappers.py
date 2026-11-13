@@ -8,9 +8,10 @@ import sys
 import warnings
 from collections.abc import Mapping
 import numpy as np
-from .parallel_imaris_writer import (pybind11_convert, pybind11_find_input_files, pybind11_ims_dataset,
-                                     pybind11_ims_info, pybind11_read_ims, pybind11_run_cli, pybind11_version,
-                                     pybind11_write_ims)
+from .parallel_imaris_writer import (pybind11_cluster_finish, pybind11_cluster_plan, pybind11_cluster_read_plan,
+                                     pybind11_cluster_status, pybind11_cluster_task, pybind11_convert,
+                                     pybind11_find_input_files, pybind11_ims_dataset, pybind11_ims_info,
+                                     pybind11_read_ims, pybind11_run_cli, pybind11_version, pybind11_write_ims)
 
 __version__ = pybind11_version()
 
@@ -549,6 +550,38 @@ def find_input_files(folders, channel_patterns, reader=None):
     return pybind11_find_input_files([_native(f) for f in folders], [_native(p) for p in patterns], reader or '')
 
 
+def _conversion(folders, channel_patterns, files, reader, voxel_size, block_size, input_bbox, process_block_size,
+                order, input_axes, channel_names, channel_colors, emission_wavelengths, excitation_wavelengths,
+                time_interval, start_time):
+    # The arguments of a conversion as the module takes them: the inputs found (files[channel]
+    # [timepoint], native paths), the reader, the input axes and the per-axis values along the
+    # input's axes, the metadata (channel names default to the patterns)
+    reader = _reader(reader)
+    patterns = None
+    if files is not None:
+        if folders is not None or channel_patterns is not None:
+            raise ValueError('give either files, or folders and channel_patterns, not both')
+        grid = _file_grid(files)
+    elif folders is None or channel_patterns is None:
+        raise ValueError('give the inputs: folders and channel_patterns, or files')
+    else:
+        patterns = _patterns(channel_patterns)
+        grid = find_input_files(folders, patterns, reader)
+    if reader is None:
+        reader = _reader_of(grid)
+    axes = _input_axes(input_axes, reader, grid)
+    block = _sizes(block_size, 'block_size', order)
+    process = _sizes(process_block_size, 'process_block_size', order)
+    if channel_names is None and patterns is not None:
+        channel_names = patterns
+    return dict(reader=reader, files=[[_native(f) for f in channel] for channel in grid], axes=axes,
+                voxel=_input_values(_voxel_size(voxel_size, order), axes),
+                block=None if block is None else _input_values(block, axes), box=_bbox(input_bbox, order, axes),
+                process=None if process is None else _input_values(process, axes),
+                metadata=_metadata(channel_names, channel_colors, emission_wavelengths, excitation_wavelengths,
+                                   time_interval, start_time))
+
+
 def convert_to_ims(file_name, folders=None, channel_patterns=None, files=None, reader=None, voxel_size=None,
                    block_size=None, input_bbox=None, process_block_size=None, order='C', input_axes=None,
                    x_on_imaris_x=False, num_threads=None, progress=None, verbose=False, channel_names=None,
@@ -588,28 +621,9 @@ def convert_to_ims(file_name, folders=None, channel_patterns=None, files=None, r
     order = _order(order)
     threads = _threads(num_threads)
     progress = _progress(progress)
-    reader = _reader(reader)
-    patterns = None
-    if files is not None:
-        if folders is not None or channel_patterns is not None:
-            raise ValueError('give either files, or folders and channel_patterns, not both')
-        grid = _file_grid(files)
-    elif folders is None or channel_patterns is None:
-        raise ValueError('give the inputs: folders and channel_patterns, or files')
-    else:
-        patterns = _patterns(channel_patterns)
-        grid = find_input_files(folders, patterns, reader)
-    if reader is None:
-        reader = _reader_of(grid)
-    axes = _input_axes(input_axes, reader, grid)
-    voxel = _input_values(_voxel_size(voxel_size, order), axes)
-    block = _sizes(block_size, 'block_size', order)
-    process = _sizes(process_block_size, 'process_block_size', order)
-    box = _bbox(input_bbox, order, axes)
-    if channel_names is None and patterns is not None:
-        channel_names = patterns
-    metadata = _metadata(channel_names, channel_colors, emission_wavelengths, excitation_wavelengths, time_interval,
-                         start_time)
+    c = _conversion(folders, channel_patterns, files, reader, voxel_size, block_size, input_bbox, process_block_size,
+                    order, input_axes, channel_names, channel_colors, emission_wavelengths, excitation_wavelengths,
+                    time_interval, start_time)
     if os.path.isdir(file_name):
         raise IsADirectoryError(f'{file_name} is a folder')
     if verbose:
@@ -617,11 +631,9 @@ def convert_to_ims(file_name, folders=None, channel_patterns=None, files=None, r
     temporary = None
     try:
         temporary = _temporary(file_name)
-        pybind11_convert(reader, [[_native(f) for f in channel] for channel in grid], _native(temporary), voxel,
-                         None if block is None else _input_values(block, axes), box,
-                         None if process is None else _input_values(process, axes), threads,
-                         x_on_imaris_x=bool(x_on_imaris_x), input_axes=axes, verbose=bool(verbose),
-                         progress=progress, **metadata)
+        pybind11_convert(c['reader'], c['files'], _native(temporary), c['voxel'], c['block'], c['box'], c['process'],
+                         threads, x_on_imaris_x=bool(x_on_imaris_x), input_axes=c['axes'], verbose=bool(verbose),
+                         progress=progress, **c['metadata'])
         os.replace(temporary, file_name)
     except BaseException:
         if temporary is not None:
@@ -845,3 +857,172 @@ def run_cli(args):
     sys.stdout.flush()
     sys.stderr.flush()
     return pybind11_run_cli(args)
+
+
+# ---- the cluster steps: cluster_plan, cluster_task, cluster_status, cluster_finish
+
+def _workdir(workdir):
+    return _path(workdir, 'workdir')
+
+
+def _plan(raw, order, x_on_imaris_x):
+    # A plan of the module (sizes along Imaris X, Y, Z) as cluster_plan returns it
+    shape = _image_to_order(_swap(raw['size'], x_on_imaris_x), order)
+    return {'workdir': raw['workdir'], 'kind': raw['kind'], 'store': raw['store'], 'file_name': raw['output_file'],
+            'timepoints': raw['timepoints'], 'channels': raw['channels'], 'resolution_levels': raw['levels'],
+            'shape': shape, 'dtype': np.dtype(raw['data_type']),
+            'stages': [dict(s) for s in raw['stages']], 'tasks': sum(s['tasks'] for s in raw['stages'])}
+
+
+def cluster_plan(workdir, folders=None, channel_patterns=None, files=None, reader=None, file_name=None,
+                 voxel_size=None, block_size=None, input_bbox=None, process_block_size=None, order='C',
+                 input_axes=None, x_on_imaris_x=False, tile_size=None, store=None, tiles_per_task=None,
+                 chunk_bytes=None, channel_names=None, channel_colors=None, emission_wavelengths=None,
+                 excitation_wavelengths=None, time_interval=None, start_time=None):
+    """Plan a conversion as stages of independent tasks, for any job system (or none): the first of
+    the cluster steps. Then run every task of each stage with cluster_task (each in any process on
+    any node, in any order, each again after a failure; a stage only after the one before it),
+    and write the file with cluster_finish. This never submits a job: the caller's job framework
+    runs the tasks, each a single-node call.
+
+    The inputs and options are convert_to_ims's (folders and channel_patterns, or files; reader,
+    voxel_size, block_size, input_bbox, process_block_size, order, input_axes, x_on_imaris_x and
+    the metadata), and are checked as convert_to_ims checks them before anything is written; the
+    finished file equals convert_to_ims of the same inputs and options. file_name: the finished
+    .ims (default <workdir>/output.ims), on workdir's filesystem. workdir is made if needed; one
+    that holds this same plan is kept (ValueError if it holds another).
+
+    Without tile_size: a time series, stage 'convert' with one task per (time point, channel),
+    task i = time point i // channels, channel i % channels; each task converts its volume
+    (process_block_size bounds the voxels it holds) and places it in the one file. Linux and
+    macOS; uint8, uint16 and float32 data.
+    tile_size (three values in the order's axis order, (z, y, x) by default): one enormous volume
+    per (time point, channel) cut into tiles, stages 'level0', 'level1', ... (each after the one
+    before), tiles_per_task consecutive tiles per task (default 1). Zarr input of (y, x, z) axes
+    (input_axes 'yxz'), uint8 or uint16, x_on_imaris_x False. store: 'mono' (straight into the one
+    file; the default, not on Windows) or 'packs' (one file per tile, merged by cluster_finish;
+    uint16). chunk_bytes: the chunk budget in bytes (default the environment's PIW_CHUNK_BYTES,
+    else 1048576, the converter's); another value changes the file's chunks, not its data.
+
+    Returns a dict: workdir, kind ('series' or 'tiles'), store, file_name, timepoints, channels,
+    resolution_levels, shape (one volume at level 0, in the order's axis order), dtype, stages (in
+    the order they run, each {'name', 'tasks', 'after'}: task indices 0 .. tasks-1, after the
+    stage that must be done first, or None) and tasks (all stages').
+    """
+    workdir = _workdir(workdir)
+    order = _order(order)
+    x_on_imaris_x = bool(x_on_imaris_x)
+    if file_name is not None:
+        file_name = _ims_name(file_name)
+        if os.path.isdir(file_name):
+            raise IsADirectoryError(f'{file_name} is a folder')
+    tiles = _sizes(tile_size, 'tile_size', order)
+    if tiles is None and (store is not None or tiles_per_task is not None or chunk_bytes is not None):
+        raise ValueError('store, tiles_per_task and chunk_bytes are for a tile plan (give tile_size)')
+    if store is not None and store not in ('mono', 'packs'):
+        raise ValueError(f"store must be 'mono', 'packs' or None (the default), not {store!r}")
+    per_task = 1 if tiles_per_task is None else _index(tiles_per_task, 'tiles_per_task')
+    if per_task < 1:
+        raise ValueError(f'tiles_per_task must be at least 1, not {per_task}')
+    budget = 0 if chunk_bytes is None else _index(chunk_bytes, 'chunk_bytes')
+    if chunk_bytes is not None and budget < 4096:
+        raise ValueError(f'chunk_bytes must be at least 4096, not {budget}')
+    c = _conversion(folders, channel_patterns, files, reader, voxel_size, block_size, input_bbox, process_block_size,
+                    order, input_axes, channel_names, channel_colors, emission_wavelengths, excitation_wavelengths,
+                    time_interval, start_time)
+    raw = pybind11_cluster_plan(_native(workdir), c['reader'], c['files'],
+                                '' if file_name is None else _native(file_name), c['voxel'], c['block'], c['box'],
+                                c['process'], x_on_imaris_x=x_on_imaris_x, input_axes=c['axes'],
+                                tile_size=tiles, store=store or '', tiles_per_task=per_task, chunk_bytes=budget,
+                                **c['metadata'])
+    return _plan(raw, order, x_on_imaris_x)
+
+
+def _stage(stage):
+    # A stage's name, or its number in the plan
+    if isinstance(stage, str):
+        return stage
+    return str(_index(stage, 'stage'))
+
+
+def cluster_task(workdir, stage, index, num_threads=None, stage_dir=None, process_block_size=None, order='C',
+                 progress=None, verbose=False):
+    """Run one task of a plan (cluster_plan): task index of stage (its name, such as 'convert' or
+    'level0', or its number in the plan's stages). One single-node call; run it in any process on
+    any node, for example one array job per stage with the job's index as index.
+
+    A task that is done is skipped (nothing changes); one that failed or was stopped is simply run
+    again (also at the same time in two processes: the same bytes go to the same place). A task of
+    a stage fails while the stage it comes after is not done; any task fails once the file was
+    finished. A failure raises (RuntimeError for an input that cannot be read, such as a truncated
+    chunk) and leaves every other task runnable.
+
+    num_threads: the threads of this task (by default OMP_NUM_THREADS, or every CPU). Time series
+    only: stage_dir, the folder where the volume is converted before it is placed (by default
+    memory, /dev/shm, when it fits the job's memory, else <workdir>/stage); process_block_size, in
+    the order's axis order, instead of the plan's. Ctrl-C (KeyboardInterrupt) or an exception from
+    progress(fraction, bytes_written) stops a time-series task between blocks and removes what it
+    staged; a tile task ends its tiles first. verbose prints the conversion's lines (tiles: one
+    timing line per tile).
+
+    Returns a dict: stage (its name), index, skipped, owners (what it placed: P_C<c>_T<t>, or its
+    tiles L<r>_C<c>_T<t>_<tile>), timepoint and channel (None for a tile task), memory_stage,
+    chunks and bytes placed, convert_seconds, place_seconds, total_seconds.
+    """
+    workdir = _workdir(workdir)
+    stage = _stage(stage)
+    index = _index(index, 'index')
+    order = _order(order)
+    threads = _threads(num_threads)
+    progress = _progress(progress)
+    process = _sizes(process_block_size, 'process_block_size', order)
+    if process is not None:
+        plan = pybind11_cluster_read_plan(_native(workdir))
+        if plan['kind'] != 'series':
+            raise ValueError('process_block_size is for the tasks of a time-series plan')
+        process = _input_values(process, plan['input_axes'])
+    if verbose:
+        sys.stdout.flush()
+    r = pybind11_cluster_task(_native(workdir), stage, index, threads,
+                              '' if stage_dir is None else _native(_path(stage_dir, 'stage_dir')), process,
+                              verbose=bool(verbose), progress=progress)
+    lines = r.pop('lines')
+    if verbose and lines:
+        sys.stdout.write(''.join(line + '\n' for line in lines))
+        sys.stdout.flush()
+    return r
+
+
+def cluster_status(workdir):
+    """Which tasks of a plan are done (their results are in place); changes nothing.
+
+    Returns a dict: kind, store, stages (each {'name', 'tasks', 'missing'}: the indices of the
+    tasks not done), missing (their number over all stages), sealed (cluster_finish has started:
+    no more tasks run), finished, and file_name (the finished file, or None).
+    """
+    r = pybind11_cluster_status(_native(_workdir(workdir)))
+    return {'kind': r['kind'], 'store': r['store'], 'stages': [dict(s) for s in r['stages']],
+            'missing': sum(len(s['missing']) for s in r['stages']), 'sealed': r['sealed'], 'finished': r['finished'],
+            'file_name': r['finished_file']}
+
+
+def cluster_finish(workdir, file_name=None, verify=False, num_threads=None):
+    """Write the file of a plan once all its tasks are done: the last of the cluster steps.
+
+    FileNotFoundError, naming the tasks not done per stage, while any task is not done (run them,
+    then this again). file_name: the .ims to write instead of the plan's. verify: also read and
+    decode every chunk of the file again. Running it again after it finished does nothing
+    (already_finished). num_threads as cluster_task's.
+
+    Returns a dict: file_name, already_finished, timepoints, channels, resolution_levels, chunks
+    (placed by the tasks), file_bytes, total_seconds.
+    """
+    workdir = _workdir(workdir)
+    if file_name is not None:
+        file_name = _ims_name(file_name)
+    threads = _threads(num_threads)
+    r = pybind11_cluster_finish(_native(workdir), '' if file_name is None else _native(file_name), bool(verify),
+                                threads)
+    return {'file_name': r['output_file'], 'already_finished': r['already_finished'],
+            'timepoints': r['timepoints'], 'channels': r['channels'], 'resolution_levels': r['levels'],
+            'chunks': r['chunks'], 'file_bytes': r['file_bytes'], 'total_seconds': r['total_seconds']}

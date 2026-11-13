@@ -38,6 +38,13 @@ Sections:
   fork        (Linux, macOS) after a write, a write in a child made by os.fork() ends within 60 s
   sigint      (Linux, macOS) SIGINT 1 s into a long write ends it with KeyboardInterrupt within 5 s,
               leaving no file
+  cluster     (Linux, macOS) the cluster steps on two channels and two time points of (y, x, z) Zarrs:
+              cluster_plan, every task in a Python process of its own (one with a truncated chunk
+              fails alone and runs once the chunk is whole), cluster_status, cluster_finish: the file
+              of convert_to_ims of the same inputs and options, and of the same steps through the
+              command line; (z, y, x) Zarrs, also with x_on_imaris_x; Ctrl-C stops a task, leaving
+              nothing staged; tile plans (single file: every task a process, also through the command
+              line; another chunk_bytes; the packs store); errors
 
 Only NumPy is needed; h5py + hdf5plugin, scipy, cpp-zarr and cpp-tiff are used when installed (a
 line says when a part is skipped). Exits non-zero on any failure.
@@ -1300,10 +1307,282 @@ def test_sigint(tmp):
           f'{p.returncode}), files left: {leftovers(tmp)}' + ('' if 'KeyboardInterrupt' in err else '\n' + err[-2000:]))
 
 
+# ---- cluster: the cluster steps (cluster_plan, cluster_task, cluster_status, cluster_finish)
+
+CLUSTER_TASK = r'''
+import sys
+import parallel_imaris_writer as piw
+stage = int(sys.argv[2]) if sys.argv[2].isdigit() else sys.argv[2]
+r = piw.cluster_task(sys.argv[1], stage, int(sys.argv[3]), num_threads=2)
+print('TASK %s %d %s' % (r['stage'], r['index'], 'skipped' if r['skipped'] else 'done'), flush=True)
+'''
+
+
+def cluster_task_process(workdir, stage, index):
+    # One task in a Python process of its own: (exit code, stdout, stderr)
+    r = subprocess.run([sys.executable, '-c', CLUSTER_TASK, workdir, str(stage), str(index)], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def shuffled(n, seed):
+    order = list(range(n))
+    for i in range(n):
+        j = (i * 7 + seed) % n
+        order[i], order[j] = order[j], order[i]
+    return order
+
+
+def run_plan_processes(workdir, stages):
+    # Every task of every stage, each in a process of its own, stage after stage, shuffled within
+    # one: the tasks that failed, as (stage, index, the last line of their stderr)
+    failed = []
+    for s in stages:
+        for i in shuffled(s['tasks'], 3):
+            rc, out, err = cluster_task_process(workdir, s['name'], i)
+            if rc != 0 or f'TASK {s["name"]} {i} done' not in out:
+                failed.append((s['name'], i, (err.strip().splitlines() or [''])[-1][:300]))
+    return failed
+
+
+def run_plan_here(workdir, stages, **kw):
+    # Every task in this process
+    for s in stages:
+        for i in shuffled(s['tasks'], 5):
+            piw.cluster_task(workdir, s['name'], i, **kw)
+
+
+def cli_steps(workdir, plan_args):
+    # plan, every task (each a process of its own) and finish through the command line
+    # (python -m parallel_imaris_writer): the problems, as text
+    def run(args):
+        return subprocess.run([sys.executable, '-m', 'parallel_imaris_writer'] + args, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, universal_newlines=True)
+    r = run(['plan', workdir] + plan_args)
+    if r.returncode != 0:
+        return [f'plan: exit code {r.returncode}: {r.stdout[-500:]}']
+    with open(os.path.join(workdir, 'manifest.json')) as f:
+        stages = json.load(f)['stages']
+    problems = []
+    for s in stages:
+        for i in shuffled(s['tasks'], 1):
+            t = run(['task', workdir, s['name'], str(i), '--threads', '2'])
+            if t.returncode != 0:
+                problems.append(f'task {s["name"]} {i}: exit code {t.returncode}: {t.stdout[-300:]}')
+    f = run(['finish', workdir])
+    if f.returncode != 0:
+        problems.append(f'finish: exit code {f.returncode}: {f.stdout[-500:]}')
+    return problems
+
+
+def test_cluster(tmp):
+    if not POSIX:
+        # (the single file is not supported there; the packs store is not tested there, as in ctest)
+        skip('cluster: not on Windows')
+        return
+    # Two channels and two time points as PetaKit5D stores them: (y, x, z) F-order Zarrs of
+    # (z, y, x) arrays; two resolution levels
+    inputs = os.path.join(tmp, 'in')
+    os.makedirs(inputs)
+    shape = (70, 180, 160)
+    vols = {(c, t): sample(shape, np.uint16, seed=40 + 2 * c + t) for c in range(2) for t in range(2)}
+    for (c, t), v in vols.items():
+        write_zarr(os.path.join(inputs, f'Cam{"AB"[c]}_t{t:04d}.zarr'), np.transpose(v, (1, 2, 0)), chunks=(64, 64, 32))
+    voxel = (0.5, 0.2, 0.1)
+    box = (3, 5, 7, 66, 170, 150)
+    opts = dict(folders=inputs, channel_patterns=['CamA', 'CamB'], voxel_size=voxel, input_bbox=box,
+                time_interval=1.5, start_time=START)
+    ref = os.path.join(tmp, 'ref.ims')
+    piw.convert_to_ims(ref, process_block_size=(20, 64, 64), **opts)
+    ref_info = piw.ims_info(ref)
+    check(ref_info['resolution_levels'] >= 2, f'the reference has {ref_info["resolution_levels"]} resolution levels')
+    # the command line's options for the same conversion: along the inputs' (y, x, z)
+    cli_opts = ['-F', inputs, '-P', 'CamA,CamB', '-r', 'zarr', '-v', '0.2,0.1,0.5', '-B', '5,7,3,170,150,66',
+                '--time-interval', '1.5', '--start-time', START]
+    # ---- the plan
+    wd = os.path.join(tmp, 'wd')
+    out = os.path.join(tmp, 'series.ims')
+    plan = piw.cluster_plan(wd, file_name=out, process_block_size=(20, 64, 64), **opts)
+    check(plan['kind'] == 'series' and plan['store'] == 'mono' and plan['timepoints'] == 2 and
+          plan['channels'] == 2 and plan['shape'] == (63, 165, 143) and plan['dtype'] == np.uint16 and
+          plan['resolution_levels'] == ref_info['resolution_levels'] and
+          os.path.normpath(plan['file_name']) == out and os.path.normpath(plan['workdir']) == wd and
+          plan['stages'] == [{'name': 'convert', 'tasks': 4, 'after': None}] and plan['tasks'] == 4,
+          f'cluster_plan of a time series: {plan}')
+    check(piw.cluster_plan(wd, file_name=out, process_block_size=(20, 64, 64), **opts) == plan,
+          'cluster_plan again with the same arguments: the plan is kept')
+    raises(ValueError, lambda: piw.cluster_plan(wd, file_name=out, **opts), 'cluster_plan of another plan '
+           'into the same workdir')
+    st = piw.cluster_status(wd)
+    check(st['kind'] == 'series' and st['missing'] == 4 and st['stages'] == [
+          {'name': 'convert', 'tasks': 4, 'missing': [0, 1, 2, 3]}] and not st['sealed'] and not st['finished'],
+          f'cluster_status of the new plan: {st}')
+    raises(FileNotFoundError, lambda: piw.cluster_finish(wd), 'cluster_finish before any task')
+
+    # ---- every task in a process of its own; task 2 = (t=1, c=0) has a truncated chunk
+    chunk = os.path.join(inputs, 'CamA_t0001.zarr', '1.1.1')
+    with open(chunk, 'rb') as f:
+        whole = f.read()
+    with open(chunk, 'r+b') as f:
+        f.truncate(100)
+    failed = run_plan_processes(wd, plan['stages'])
+    check([(s, i) for s, i, _ in failed] == [('convert', 2)] and failed[0][2].startswith('RuntimeError'),
+          f'every task in a process of its own: only task 2 (its truncated input) failed: {failed}')
+    st = piw.cluster_status(wd)
+    check(st['missing'] == 1 and st['stages'][0]['missing'] == [2], f'cluster_status names task 2: {st}')
+    try:
+        piw.cluster_finish(wd)
+        check(False, 'cluster_finish with task 2 not done: no FileNotFoundError')
+    except FileNotFoundError as e:
+        check('convert 2' in str(e), f'cluster_finish with task 2 not done: FileNotFoundError: {e}')
+    with open(chunk, 'wb') as f:
+        f.write(whole)
+    # task 2 again, here, by the stage's number, with another process block, verbose and progress
+    captured, sys.stdout = sys.stdout, io.StringIO()
+    values = []
+    try:
+        r = piw.cluster_task(wd, 0, 2, num_threads=2, process_block_size=(16, 40, 50), verbose=True,
+                             progress=lambda f, b: values.append(f))
+        text = sys.stdout.getvalue()
+    finally:
+        sys.stdout = captured
+    check(r['stage'] == 'convert' and r['index'] == 2 and not r['skipped'] and r['timepoint'] == 1 and
+          r['channel'] == 0 and r['owners'] == ['P_C0_T1'] and r['chunks'] > 0 and r['bytes'] > 0,
+          f'task 2 once its input is whole: {r}')
+    check('Current File: ' in text and values and values[-1] == 1.0 and values == sorted(values),
+          f'cluster_task(verbose=True, progress=...): the messages, progress ends at 1.0 ({len(values)} calls)')
+    check(piw.cluster_task(wd, 'convert', 0)['skipped'], 'a task that is done is skipped')
+    st = piw.cluster_status(wd)
+    check(st['missing'] == 0 and not st['sealed'], 'cluster_status: every task done')
+    f = piw.cluster_finish(wd, verify=True, num_threads=2)
+    check(os.path.normpath(f['file_name']) == out and not f['already_finished'] and f['timepoints'] == 2 and
+          f['channels'] == 2 and f['resolution_levels'] == ref_info['resolution_levels'] and f['chunks'] > 0,
+          f'cluster_finish: {f}')
+    check(same_file(ref, out), 'the time-series plan\'s file: the CRCs and attributes of convert_to_ims of the '
+                               'same inputs')
+    st = piw.cluster_status(wd)
+    check(st['finished'] and st['sealed'] and os.path.normpath(st['file_name']) == out,
+          f'cluster_status after the finish: {st}')
+    check(piw.cluster_finish(wd)['already_finished'], 'cluster_finish again: already finished')
+    raises(ValueError, lambda: piw.cluster_task(wd, 'convert', 1), 'a task after the finish')
+
+    # ---- the same steps through the command line
+    wdc = os.path.join(tmp, 'wd_cli')
+    problems = cli_steps(wdc, cli_opts + ['-C', '64,64,20', '-o', tmp, '-n', 'series_cli'])
+    check(not problems and same_file(out, os.path.join(tmp, 'series_cli.ims')),
+          f'plan, task and finish through the command line: the same file {problems}')
+
+    # ---- (z, y, x) C-order Zarrs (input_axes from their order), also with x_on_imaris_x
+    czyx = os.path.join(tmp, 'zyx')
+    os.makedirs(czyx)
+    small = {(c, t): sample((30, 70, 50), np.uint16, seed=60 + 2 * c + t) for c in range(2) for t in range(2)}
+    for (c, t), v in small.items():
+        write_zarr(os.path.join(czyx, f'Cam{"AB"[c]}_t{t:04d}.zarr'), v, chunks=(16, 32, 32), order='C')
+    for x_on_x in (False, True):
+        name = 'zyx_x' if x_on_x else 'zyx'
+        kw = dict(folders=czyx, channel_patterns=['CamA', 'CamB'], voxel_size=voxel, input_bbox=(2, 3, 4, 28, 66, 45),
+                  x_on_imaris_x=x_on_x, start_time=START)
+        zref = os.path.join(tmp, name + '_ref.ims')
+        piw.convert_to_ims(zref, **kw)
+        wdz = os.path.join(tmp, 'wd_' + name)
+        p = piw.cluster_plan(wdz, **kw)
+        run_plan_here(wdz, p['stages'], num_threads=2)
+        fz = piw.cluster_finish(wdz)
+        check(p['shape'] == (26, 63, 41) and os.path.normpath(fz['file_name']) == os.path.join(wdz, 'output.ims') and
+              same_file(zref, fz['file_name']) and
+              np.array_equal(piw.read_ims(fz['file_name'], timepoint=1, channel=1, x_on_imaris_x=x_on_x),
+                             small[1, 1][2:28, 3:66, 4:45]),
+              f'(z, y, x) Zarrs{" with x_on_imaris_x" if x_on_x else ""}, the tasks run here: the file of '
+              f'convert_to_ims (shape {p["shape"]})')
+
+    # ---- Ctrl-C (simulated, 0.05 s in) stops a task: KeyboardInterrupt, nothing staged left, the
+    # task still to do
+    big = os.path.join(tmp, 'big')
+    os.makedirs(big)
+    write_zarr(os.path.join(big, 'CamA.zarr'), zvolume(2, (400, 400, 800)), chunks=(128, 128, 64))
+    wdb = os.path.join(tmp, 'wd_big')
+    stage = os.path.join(tmp, 'stage')
+    piw.cluster_plan(wdb, files=os.path.join(big, 'CamA.zarr'))
+    interrupted, seconds = interrupt(lambda: piw.cluster_task(wdb, 'convert', 0, num_threads=1, stage_dir=stage),
+                                     0.05)
+    done = piw.cluster_status(wdb)['missing'] == 0
+    if interrupted and not done:
+        check(not leftovers(stage), f'Ctrl-C: KeyboardInterrupt after {seconds:.2f} s, the staged part removed '
+                                    f'({leftovers(stage)}), the task not done')
+    elif interrupted:
+        skip(f'Ctrl-C: the cancel came after the conversion ({seconds:.2f} s); the task is done')
+    else:
+        skip(f'Ctrl-C: the task finished first ({seconds:.2f} s)')
+
+    # ---- tile plans, two tiles per task: the single file and the packs store
+    tile_opts = dict(opts, tile_size=(64, 96, 96), tiles_per_task=2)
+    wdt = os.path.join(tmp, 'wd_tiles')
+    outt = os.path.join(tmp, 'tiles.ims')
+    plan = piw.cluster_plan(wdt, file_name=outt, **tile_opts)
+    names = [s['name'] for s in plan['stages']]
+    check(plan['kind'] == 'tiles' and plan['store'] == 'mono' and plan['shape'] == (63, 165, 143) and
+          len(names) == plan['resolution_levels'] == ref_info['resolution_levels'] and
+          names == [f'level{r}' for r in range(len(names))] and
+          [s['after'] for s in plan['stages']] == [None] + names[:-1] and plan['stages'][0]['tasks'] >= 2,
+          f'cluster_plan of tiles: {plan}')
+    raises(FileNotFoundError, lambda: piw.cluster_task(wdt, 'level1', 0), 'a level-1 task before level 0')
+    failed = run_plan_processes(wdt, plan['stages'])
+    check(not failed, f'every tile task in a process of its own, level after level: {failed}')
+    piw.cluster_finish(wdt)
+    check(same_file(ref, outt), "the tile plan's file: the CRCs and attributes of convert_to_ims")
+    wdtc = os.path.join(tmp, 'wd_tiles_cli')
+    problems = cli_steps(wdtc, cli_opts + ['--tiles', '96,96,64', '--tiles-per-task', '2', '-o', tmp,
+                                           '-n', 'tiles_cli'])
+    check(not problems and same_file(outt, os.path.join(tmp, 'tiles_cli.ims')),
+          f'the tile plan through the command line: the same file {problems}')
+    # another chunk budget: other chunks, the same data
+    wdcb = os.path.join(tmp, 'wd_budget')
+    p = piw.cluster_plan(wdcb, chunk_bytes=1 << 18, **dict(tile_opts, tiles_per_task=4))
+    run_plan_here(wdcb, p['stages'], num_threads=2)
+    fb = piw.cluster_finish(wdcb)['file_name']
+    binfo = piw.ims_info(fb)
+    check([d['chunk_shape'] for d in binfo['datasets']] != [d['chunk_shape'] for d in ref_info['datasets']] and
+          all(np.array_equal(piw.read_ims(fb, level, t, c), piw.read_ims(ref, level, t, c))
+              for level in range(ref_info['resolution_levels']) for t in range(2) for c in range(2)),
+          'chunk_bytes=262144: smaller chunks, the same data at every level')
+    wdp = os.path.join(tmp, 'wd_packs')
+    outp = os.path.join(tmp, 'packs.ims')
+    p = piw.cluster_plan(wdp, file_name=outp, store='packs', **tile_opts)
+    run_plan_here(wdp, p['stages'], num_threads=2)
+    piw.cluster_finish(wdp)
+    check(p['store'] == 'packs' and same_file(ref, outp), "the packs store's file, the tasks run here: the CRCs and "
+                                                          "attributes of convert_to_ims")
+
+    # ---- errors
+    raises(FileNotFoundError, lambda: piw.cluster_status(os.path.join(tmp, 'none')), 'cluster_status of no plan')
+    raises(FileNotFoundError, lambda: piw.cluster_task(os.path.join(tmp, 'none'), 'convert', 0),
+           'cluster_task of no plan')
+    raises(ValueError, lambda: piw.cluster_task(wdp, 'convert', 0), 'a stage the plan does not have')
+    raises(ValueError, lambda: piw.cluster_task(wdp, 'level0', 10 ** 6), 'a task index out of range')
+    raises(ValueError, lambda: piw.cluster_task(wdp, 'level0', -1), 'a negative task index')
+    raises(ValueError, lambda: piw.cluster_task(wdp, 'level0', 0, process_block_size=(8, 8, 8)),
+           'process_block_size for a tile task')
+    e = os.path.join(tmp, 'wd_err')
+    raises(ValueError, lambda: piw.cluster_plan(e, store='packs', **opts), 'store without tile_size')
+    raises(ValueError, lambda: piw.cluster_plan(e, chunk_bytes=1 << 20, **opts), 'chunk_bytes without tile_size')
+    raises(ValueError, lambda: piw.cluster_plan(e, chunk_bytes=100, tile_size=(8, 8, 8), **opts), 'chunk_bytes=100')
+    raises(ValueError, lambda: piw.cluster_plan(e, tile_size=(8, 8), **opts), 'a tile_size of two values')
+    raises(ValueError, lambda: piw.cluster_plan(e, store='disk', tile_size=(8, 8, 8), **opts), "store='disk'")
+    raises(ValueError, lambda: piw.cluster_plan(e, tile_size=(8, 8, 8), x_on_imaris_x=True, **opts),
+           'a tile plan with x_on_imaris_x')
+    raises(ValueError, lambda: piw.cluster_plan(e, folders=czyx, channel_patterns='CamA', tile_size=(8, 8, 8)),
+           'a tile plan of (z, y, x) Zarrs')
+    raises(ValueError, lambda: piw.cluster_plan(e, file_name=os.path.join(tmp, 'x.h5'), **opts),
+           'a file_name without .ims')
+    raises(FileNotFoundError, lambda: piw.cluster_plan(e, folders=inputs, channel_patterns='CamC'),
+           'a pattern without a match')
+    check(not os.path.exists(e), 'no workdir made by the refused plans')
+
+
 SECTIONS = [('cli', test_cli), ('convert', test_convert), ('dataset', test_dataset), ('roundtrip', test_roundtrip),
             ('layout', test_layout), ('golden', test_golden), ('threads', test_threads), ('progress', test_progress),
             ('metadata', test_metadata), ('errors', test_errors), ('h5py', test_h5py), ('importorder', test_importorder),
-            ('fork', test_fork), ('sigint', test_sigint)]
+            ('fork', test_fork), ('sigint', test_sigint), ('cluster', test_cluster)]
 
 
 def main(names):

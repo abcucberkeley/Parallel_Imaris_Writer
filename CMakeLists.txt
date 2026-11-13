@@ -481,7 +481,7 @@ install(DIRECTORY "${RELEASE_DIR}/" DESTINATION ${CMAKE_INSTALL_BINDIR} USE_SOUR
 # (python/setup.py configures with -DPIW_BUILD_PYTHON_LIB=ON). Its API is
 # src/parallelimariswriter.h. Same objects as the executable; the default build is unchanged.
 #     cmake --build <build> --target parallelImarisWriter_shared
-#     cmake --install <build> --component python     (lib/: the three libraries; include/: the header)
+#     cmake --install <build> --component python     (lib/: the three libraries; include/: the headers)
 # ---------------------------------------------------------------------------
 option(PIW_BUILD_PYTHON_LIB "Build libparallelImarisWriter, the shared library of the Python package" OFF)
 if(PIW_BUILD_PYTHON_LIB)
@@ -531,7 +531,9 @@ if(PIW_BUILD_PYTHON_LIB)
     endif()
     install(FILES $<TARGET_FILE:cppTiff_shared> $<TARGET_FILE:cppZarr_shared> COMPONENT python
             DESTINATION ${PIW_READERS_DESTINATION} PERMISSIONS ${RUNTIME_PERMS})
-    install(FILES ${SRC_DIR}/parallelimariswriter.h COMPONENT python DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    # (parallel.h: the cluster steps, with mono.h's results; the Python module binds them too)
+    install(FILES ${SRC_DIR}/parallelimariswriter.h ${SRC_DIR}/parallel.h ${SRC_DIR}/mono.h COMPONENT python
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
 # ---------------------------------------------------------------------------

@@ -913,6 +913,16 @@ uint64_t numBlocks(uint64_t aSize, uint64_t aBlockSize){
     return (aSize + aBlockSize - 1) / aBlockSize;
 }
 
+// aAxis[i]: the input axis that becomes Imaris axis i. Imaris X, Y, Z are the image's y, x, z
+// (x, y, z with xOnImarisX); the image's y, x, z are input axes 0, 1, 2 (1, 2, 0 with ZYX).
+void imarisAxes(const ConvertOptions& aOptions, int aAxis[3]){
+    const bool vZyx = aOptions.inputAxes == InputAxes::ZYX;
+    const int vImageY = vZyx ? 1 : 0, vImageX = vZyx ? 2 : 1, vImageZ = vZyx ? 0 : 2;
+    aAxis[0] = aOptions.xOnImarisX ? vImageX : vImageY;
+    aAxis[1] = aOptions.xOnImarisX ? vImageY : vImageX;
+    aAxis[2] = vImageZ;
+}
+
 // The conversion itself (options validated, library mutex held). The options and the printed
 // lines are along the input's axes 0, 1, 2; the writer gets Imaris X, Y, Z, and vAxis[i] is the
 // input axis that becomes Imaris axis i.
@@ -938,10 +948,9 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
     const bool vTiff = aOptions.reader == "tiff";
     const uint64_t channels = aOptions.files.size();
     const uint64_t timepoints = aOptions.files[0].size();
-    // The input axes of the image's y, x and z; Imaris X, Y, Z are its y, x, z (x, y, z with xOnImarisX).
     const bool vZyx = aOptions.inputAxes == InputAxes::ZYX;
-    const int vImageY = vZyx ? 1 : 0, vImageX = vZyx ? 2 : 1, vImageZ = vZyx ? 0 : 2;
-    const int vAxis[3] = {aOptions.xOnImarisX ? vImageX : vImageY, aOptions.xOnImarisX ? vImageY : vImageX, vImageZ};
+    int vAxis[3];
+    imarisAxes(aOptions, vAxis);
 
     imsmeta::Metadata vMetadata;
     uint64_t vShape[3] = {0, 0, 0};
@@ -1341,7 +1350,8 @@ Status inspectConversion(const ConvertOptions& aOptions, uint64_t aSize[3], Data
         vStatus = inspectInputs(aOptions, aMetadata, vShape, vChunks, aType);
         if(!vStatus.ok()) return vStatus;
         if(aOptions.hasBoundingBox) for(int i = 0; i < 3; ++i) vShape[i] = aOptions.boundingBox[i + 3] - aOptions.boundingBox[i];
-        const int vAxis[3] = {aOptions.xOnImarisX ? 1 : 0, aOptions.xOnImarisX ? 0 : 1, 2};
+        int vAxis[3];
+        imarisAxes(aOptions, vAxis);
         for(int i = 0; i < 3; ++i) aSize[i] = vShape[vAxis[i]];
         if(aSize[0] > UINT_MAX || aSize[1] > UINT_MAX || aSize[2] > UINT_MAX || aOptions.files.size() > UINT_MAX || aOptions.files[0].size() > UINT_MAX){
             return Status(Code::Unsupported, "The image size does not fit the Imaris writer (at most " + std::to_string(UINT_MAX) + " per axis).");

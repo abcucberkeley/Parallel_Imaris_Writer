@@ -1,6 +1,9 @@
 // Python bindings of the Parallel Imaris Writer library (src/parallelimariswriter.h). The
 // functions are named pybind11_*; the Python API is parallel_imaris_writer_wrappers.py.
 //
+// The cluster steps (src/parallel.h: plan, task, status, finish) are bound as they are: each a
+// single-node call on the same worker thread, the job system being the caller's.
+//
 // Every call into the library runs on a worker thread of its own while the calling thread waits
 // without the GIL (callOnWorker): other Python threads keep running, Ctrl-C (or an exception
 // raised by a progress callback) stops a write, and the OpenMP threads belong to a thread that
@@ -30,6 +33,7 @@
 #include <pthread.h>
 #endif
 #include "parallelimariswriter.h"
+#include "parallel.h"
 
 namespace {
 
@@ -545,6 +549,206 @@ pybind11::list pybind11_find_input_files(const std::vector<std::string>& aFolder
     return vChannels;
 }
 
+// ---- the cluster steps (src/parallel.h)
+
+pybind11::list textList(const std::vector<std::string>& aValues)
+{
+    pybind11::list vList;
+    for(size_t i = 0; i < aValues.size(); ++i) vList.append(text(aValues[i]));
+    return vList;
+}
+
+// A plan as a dict: its size along Imaris X, Y, Z; input_axes and x_on_imaris_x those of a
+// time-series plan's conversion.
+pybind11::dict planDict(const piw::ClusterPlan& aPlan)
+{
+    pybind11::dict vDict;
+    vDict["workdir"] = text(aPlan.workdir);
+    vDict["kind"] = aPlan.kind;
+    vDict["store"] = aPlan.store;
+    vDict["output_file"] = text(aPlan.outputFile);
+    vDict["timepoints"] = aPlan.timepoints;
+    vDict["channels"] = aPlan.channels;
+    vDict["levels"] = aPlan.levels;
+    vDict["size"] = triple(aPlan.size);
+    vDict["data_type"] = dataTypeName(aPlan.dataType);
+    pybind11::list vStages;
+    for(size_t i = 0; i < aPlan.stages.size(); ++i){
+        pybind11::dict vStage;
+        vStage["name"] = aPlan.stages[i].name;
+        vStage["tasks"] = aPlan.stages[i].tasks;
+        vStage["after"] = aPlan.stages[i].after.empty() ? pybind11::object(pybind11::none())
+                                                        : pybind11::object(pybind11::str(aPlan.stages[i].after));
+        vStages.append(vStage);
+    }
+    vDict["stages"] = vStages;
+    vDict["input_axes"] = aPlan.inputAxes == piw::InputAxes::ZYX ? "zyx" : "yxz";
+    vDict["x_on_imaris_x"] = aPlan.xOnImarisX;
+    return vDict;
+}
+
+// piw::clusterPlan: a time-series plan, or with aTileSize (Imaris X, Y, Z) a tile plan. The
+// conversion's values along the input's axes 0, 1, 2, as pybind11_convert takes them; aFiles the
+// inputs (found by the caller).
+pybind11::dict pybind11_cluster_plan(const std::string& aWorkdir, const std::string& aReader,
+                                     const std::vector<std::vector<std::string> >& aFiles,
+                                     const std::string& aOutputFile, const std::array<float, 3>& aVoxelSize,
+                                     const pybind11::object& aBlockSize, const pybind11::object& aBoundingBox,
+                                     const pybind11::object& aProcessBlock, bool aXOnImarisX,
+                                     const std::string& aInputAxes, const pybind11::object& aTileSize,
+                                     const std::string& aStore, long aTilesPerTask, uint64_t aChunkBytes,
+                                     const std::vector<std::string>& aChannelNames,
+                                     const std::vector<std::array<float, 3> >& aChannelColors,
+                                     const std::vector<float>& aEmissionWavelengths,
+                                     const std::vector<float>& aExcitationWavelengths,
+                                     double aTimeInterval, const std::string& aStartTime)
+{
+    piw::ClusterPlanOptions vOptions;
+    vOptions.workdir = aWorkdir;
+    piw::ConvertOptions& vConvert = vOptions.convert;
+    vConvert.reader = aReader;
+    vConvert.files = aFiles;
+    vConvert.outputFile = aOutputFile;
+    for(int i = 0; i < 3; ++i) vConvert.voxelSize[i] = aVoxelSize[i];
+    vConvert.hasBlockSize = optionalSizes(aBlockSize, "block_size", vConvert.blockSize);
+    vConvert.hasBoundingBox = optionalSizes(aBoundingBox, "bounding_box", vConvert.boundingBox);
+    vConvert.hasProcessBlock = optionalSizes(aProcessBlock, "process_block", vConvert.processBlock);
+    vConvert.xOnImarisX = aXOnImarisX;
+    if(aInputAxes == "zyx") vConvert.inputAxes = piw::InputAxes::ZYX;
+    else if(aInputAxes != "yxz"){
+        throw pybind11::value_error("input_axes must be 'yxz' or 'zyx', not '" + aInputAxes + "'");
+    }
+    setMetadata(vConvert, aChannelNames, aChannelColors, aEmissionWavelengths, aExcitationWavelengths,
+                aTimeInterval, aStartTime);
+    if(optionalSizes(aTileSize, "tile_size", vOptions.tileSize)) vOptions.kind = "tiles";
+    vOptions.store = aStore;
+    vOptions.tilesPerTask = aTilesPerTask;
+    vOptions.chunkBytes = aChunkBytes;
+
+    CallState vState;
+    std::pair<piw::Status, piw::ClusterPlan> vResult = callOnWorker([&]() {
+        std::pair<piw::Status, piw::ClusterPlan> vPlan;
+        vPlan.first = piw::clusterPlan(vOptions, &vPlan.second);
+        return vPlan;
+    }, &vState);
+    throwIfFailed(vResult.first);
+    return planDict(vResult.second);
+}
+
+// piw::clusterReadPlan: the plan of a workdir as pybind11_cluster_plan returns it.
+pybind11::dict pybind11_cluster_read_plan(const std::string& aWorkdir)
+{
+    CallState vState;
+    std::pair<piw::Status, piw::ClusterPlan> vResult = callOnWorker([&]() {
+        std::pair<piw::Status, piw::ClusterPlan> vPlan;
+        vPlan.first = piw::clusterReadPlan(aWorkdir, vPlan.second);
+        return vPlan;
+    }, &vState);
+    throwIfFailed(vResult.first);
+    return planDict(vResult.second);
+}
+
+// piw::clusterTask: task aIndex of the stage (its name or number). Ctrl-C (or an exception from
+// progress) stops a time-series task between blocks (its staged part removed); a tile task ends
+// its tiles first. aProcessBlock along the input's axes (time series), or None for the plan's.
+pybind11::dict pybind11_cluster_task(const std::string& aWorkdir, const std::string& aStage, long aIndex,
+                                     int aNumThreads, const std::string& aStageDir,
+                                     const pybind11::object& aProcessBlock, bool aVerbose,
+                                     const pybind11::object& aProgress)
+{
+    piw::ClusterTaskOptions vOptions;
+    vOptions.numThreads = aNumThreads;
+    vOptions.stageDir = aStageDir;
+    vOptions.hasProcessBlock = optionalSizes(aProcessBlock, "process_block", vOptions.processBlock);
+    CallState vState;
+    vState.verbose = aVerbose;
+    vState.progress = aProgress;
+    vOptions.callbacks = callbacksFor(vState);
+    std::pair<piw::Status, piw::ClusterTaskResult> vResult = callOnWorker([&]() {
+        std::pair<piw::Status, piw::ClusterTaskResult> vTask;
+        vTask.first = piw::clusterTask(aWorkdir, aStage, aIndex, vOptions, &vTask.second);
+        return vTask;
+    }, &vState);
+    if(aVerbose) printQueued(vState);
+    throwIfFailed(vResult.first);
+    reportProgress(vState, true);
+    const piw::ClusterTaskResult& vTask = vResult.second;
+    pybind11::object vNone = pybind11::none();
+    const bool vSeries = vTask.timepoint >= 0;
+    pybind11::dict vDict;
+    vDict["stage"] = vTask.stage;
+    vDict["index"] = vTask.index;
+    vDict["skipped"] = vTask.skipped;
+    vDict["owners"] = textList(vTask.owners);
+    vDict["timepoint"] = vSeries ? pybind11::object(pybind11::int_(vTask.timepoint)) : vNone;
+    vDict["channel"] = vSeries ? pybind11::object(pybind11::int_(vTask.channel)) : vNone;
+    vDict["memory_stage"] = vTask.memoryStage;
+    vDict["chunks"] = vTask.place.chunks;
+    vDict["bytes"] = vTask.place.bytes;
+    vDict["convert_seconds"] = vTask.convertSeconds;
+    vDict["place_seconds"] = vTask.placeSeconds;
+    vDict["total_seconds"] = vTask.totalSeconds;
+    vDict["lines"] = textList(vTask.lines);
+    return vDict;
+}
+
+// piw::clusterStatus as a dict: per stage the task indices not done.
+pybind11::dict pybind11_cluster_status(const std::string& aWorkdir)
+{
+    CallState vState;
+    std::pair<piw::Status, piw::ClusterStatus> vResult = callOnWorker([&]() {
+        std::pair<piw::Status, piw::ClusterStatus> vStatus;
+        vStatus.first = piw::clusterStatus(aWorkdir, vStatus.second);
+        return vStatus;
+    }, &vState);
+    throwIfFailed(vResult.first);
+    const piw::ClusterStatus& vStatus = vResult.second;
+    pybind11::dict vDict;
+    vDict["kind"] = vStatus.kind;
+    vDict["store"] = vStatus.store;
+    pybind11::list vStages;
+    for(size_t i = 0; i < vStatus.stages.size(); ++i){
+        pybind11::dict vStage;
+        vStage["name"] = vStatus.stages[i].name;
+        vStage["tasks"] = vStatus.stages[i].tasks;
+        vStage["missing"] = vStatus.stages[i].missing;
+        vStages.append(vStage);
+    }
+    vDict["stages"] = vStages;
+    vDict["sealed"] = vStatus.sealed;
+    vDict["finished"] = vStatus.finished;
+    vDict["finished_file"] = vStatus.finished ? pybind11::object(text(vStatus.finishedFile))
+                                              : pybind11::object(pybind11::none());
+    return vDict;
+}
+
+// piw::clusterFinish: FileNotFoundError naming the tasks not done; else the output's dict.
+pybind11::dict pybind11_cluster_finish(const std::string& aWorkdir, const std::string& aOutputFile, bool aVerify,
+                                       int aNumThreads)
+{
+    piw::ClusterFinishOptions vOptions;
+    vOptions.verify = aVerify;
+    vOptions.numThreads = aNumThreads;
+    CallState vState;
+    std::pair<piw::Status, piw::MonoFinishResult> vResult = callOnWorker([&]() {
+        std::pair<piw::Status, piw::MonoFinishResult> vFinish;
+        vFinish.first = piw::clusterFinish(aWorkdir, aOutputFile, vOptions, &vFinish.second);
+        return vFinish;
+    }, &vState);
+    throwIfFailed(vResult.first);
+    const piw::MonoFinishResult& vFinish = vResult.second;
+    pybind11::dict vDict;
+    vDict["output_file"] = text(vFinish.outputFile);
+    vDict["already_finished"] = vFinish.alreadyFinished;
+    vDict["timepoints"] = vFinish.timepoints;
+    vDict["channels"] = vFinish.channels;
+    vDict["levels"] = vFinish.levels;
+    vDict["chunks"] = vFinish.chunks;
+    vDict["file_bytes"] = vFinish.fileBytes;
+    vDict["total_seconds"] = vFinish.totalSeconds;
+    return vDict;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(parallel_imaris_writer, m) {
@@ -601,4 +805,36 @@ PYBIND11_MODULE(parallel_imaris_writer, m) {
     m.def("pybind11_find_input_files", &pybind11_find_input_files, pybind11::arg("folders"), pybind11::arg("patterns"),
           pybind11::arg("reader") = std::string(),
           "The command line's input files: files[channel][timepoint] (reader 'tiff', 'zarr' or '' for both)");
+
+    m.def("pybind11_cluster_plan", &pybind11_cluster_plan, pybind11::arg("workdir"), pybind11::arg("reader"),
+          pybind11::arg("files"), pybind11::arg("output_file"), pybind11::arg("voxel_size"),
+          pybind11::arg("block_size") = pybind11::none(), pybind11::arg("bounding_box") = pybind11::none(),
+          pybind11::arg("process_block") = pybind11::none(), pybind11::arg("x_on_imaris_x") = false,
+          pybind11::arg("input_axes") = std::string("yxz"), pybind11::arg("tile_size") = pybind11::none(),
+          pybind11::arg("store") = std::string(), pybind11::arg("tiles_per_task") = 1L,
+          pybind11::arg("chunk_bytes") = (uint64_t)0,
+          pybind11::arg("channel_names") = std::vector<std::string>(),
+          pybind11::arg("channel_colors") = std::vector<std::array<float, 3> >(),
+          pybind11::arg("emission_wavelengths") = std::vector<float>(),
+          pybind11::arg("excitation_wavelengths") = std::vector<float>(),
+          pybind11::arg("time_interval") = 0.0, pybind11::arg("start_time") = std::string(),
+          "Plan files[channel][timepoint] as stages of independent tasks in workdir (piw::clusterPlan; a tile "
+          "plan with tile_size, Imaris X, Y, Z)");
+
+    m.def("pybind11_cluster_read_plan", &pybind11_cluster_read_plan, pybind11::arg("workdir"),
+          "The plan of a workdir (piw::clusterReadPlan)");
+
+    m.def("pybind11_cluster_task", &pybind11_cluster_task, pybind11::arg("workdir"), pybind11::arg("stage"),
+          pybind11::arg("index"), pybind11::arg("num_threads") = 0, pybind11::arg("stage_dir") = std::string(),
+          pybind11::arg("process_block") = pybind11::none(), pybind11::arg("verbose") = false,
+          pybind11::arg("progress") = pybind11::none(),
+          "Run one task of a plan (piw::clusterTask; stage: its name or number)");
+
+    m.def("pybind11_cluster_status", &pybind11_cluster_status, pybind11::arg("workdir"),
+          "The tasks of a plan not done yet (piw::clusterStatus)");
+
+    m.def("pybind11_cluster_finish", &pybind11_cluster_finish, pybind11::arg("workdir"),
+          pybind11::arg("output_file") = std::string(), pybind11::arg("verify") = false,
+          pybind11::arg("num_threads") = 0,
+          "Write the plan's output once every task is done (piw::clusterFinish)");
 }
