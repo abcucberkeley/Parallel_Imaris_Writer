@@ -3,7 +3,45 @@ requires = [
     "setuptools>=42",
     # 2.12 for NumPy 2
     "pybind11>=2.12",
-    # Linux and macOS build the native library with CMake (see setup.py)
+    # Linux and macOS build the native library with CMake (see setup.py); Windows uses
+    # MSYS2's cmake, with its MinGW-w64 compilers
     "cmake==3.26.4; sys_platform != 'win32'",
 ]
 build-backend = "setuptools.build_meta"
+
+# Wheels: cibuildwheel, from the repository (cibuildwheel python --output-dir wheelhouse, as the
+# Wheels workflow, .github/workflows/wheels.yml, runs it) or, on macOS and Windows, from this folder
+# too (cibuildwheel --output-dir dist; Linux builds in a container that gets only the folder
+# cibuildwheel runs in, and the library's build needs the whole repository). CPython 3.9 to 3.14
+# (setup.py's python_requires) on Linux x86_64, macOS arm64 and Windows AMD64, each wheel tested
+# with tests/test_python.py. The [tool.cibuildwheel.<os>] tables override single keys (each key is
+# inherited unless overridden).
+[tool.cibuildwheel]
+# (no musllinux, no free-threaded Python on Windows; PyPy and GraalPy are not built unless enabled)
+skip = "*musllinux* cp*t-win*"
+environment = {CXX="g++", CC="gcc"}
+test-requires = ["numpy"]
+test-command = "python \"{package}/tests/test_python.py\""
+
+# In the manylinux_2_28 image; the library is found for the repair in the CMake build's install
+# folder (/project is the folder cibuildwheel was run from: the repository, or this folder with the
+# repository's files copied into it).
+[tool.cibuildwheel.linux]
+archs = ["x86_64"]
+environment = {CXX="g++", CC="gcc", LD_LIBRARY_PATH="/project/python/build/install/lib:/project/build/install/lib:$LD_LIBRARY_PATH"}
+
+# Homebrew's gcc@13. The wheels' macOS version is the one Homebrew's libgomp (bundled into the wheel)
+# was built for, read from it: the macOS release the build machine runs. (DYLD_LIBRARY_PATH is set
+# in the repair command itself: macOS drops it on the way through /bin/sh.)
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+environment = {CXX="/opt/homebrew/bin/g++-13", CC="/opt/homebrew/bin/gcc-13", MACOSX_DEPLOYMENT_TARGET="$(sh -c 'otool -l $($CC -print-file-name=libgomp.dylib) | grep -m1 minos | tr -dc 0-9.')"}
+repair-wheel-command = "DYLD_LIBRARY_PATH=\"{package}/build/install/lib\" delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
+
+# MinGW-w64: MSYS2's UCRT64 environment (gcc, g++, cmake, ninja, strip) first on PATH, e.g.
+# C:\msys64\ucrt64\bin. delvewheel vendors the library and the readers from the install folder and
+# MinGW's DLLs (libgomp, libwinpthread) from PATH, all under new names (stripped first where the
+# renaming needs it).
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]
+repair-wheel-command = "delvewheel repair --add-path \"{package}/build/install/bin\" --strip -w {dest_dir} -v {wheel}"

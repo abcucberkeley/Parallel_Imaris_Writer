@@ -1,0 +1,168 @@
+name: Wheels
+
+# Builds the Python package's wheels with cibuildwheel (configured in python/pyproject.toml):
+# CPython 3.9 to 3.14 on Linux x86_64 (manylinux_2_28, 3.14 free-threaded too), macOS arm64
+# (3.14 free-threaded too) and Windows AMD64. Every wheel is tested with python/tests/test_python.py
+# as it is built, its contents are listed and checked (python/tools/check_wheel.py), and the wheels
+# are kept as the run's artifacts. Then each system's wheel is installed for Python 3.12 and 3.14
+# next to numpy, scipy, cpp-tiff and cpp-zarr from PyPI and the tests run again, the import-order
+# test included (see the last step for macOS). Nothing is uploaded to PyPI.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheels:
+    name: Wheels (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS: the oldest arm64 runner (macOS 14's are retired). The wheels need the macOS
+        # release the runner has, the one Homebrew's GCC was built for (see pyproject.toml).
+        # cibuildwheel runs from PowerShell on Windows, so that MSYS2's UCRT64 folder stays first on
+        # PATH (Git Bash puts Git's own folders before it), where delvewheel looks for MinGW's DLLs.
+        include:
+          - { name: Linux,   os: ubuntu-24.04, shell: bash }
+          - { name: macOS,   os: macos-15,     shell: bash }
+          - { name: Windows, os: windows-2025, shell: pwsh }
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The library is built with MinGW-w64, as in the Tests workflow (its build flags and OpenMP
+      # setup are GCC-only); the extension too, so both use one C++ ABI. MSYS2 packages GCC's
+      # OpenMP runtime (libgomp) separately from gcc; strip comes with gcc (binutils).
+      - name: Set up MinGW (Windows)
+        if: runner.os == 'Windows'
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          pacboy: gcc:p libgomp:p cmake:p ninja:p
+
+      # MinGW's gcc, g++, cmake, ninja and strip first on PATH, for setup.py's build and for
+      # delvewheel, which also takes libgomp and libwinpthread from there
+      - name: Put MinGW first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: '"${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin" >> $env:GITHUB_PATH'
+
+      # Same compiler as the release builds. Apple clang has no OpenMP.
+      - name: Set up GCC 13 (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          brew list gcc@13 > /dev/null 2>&1 || brew install gcc@13
+          ls -l /opt/homebrew/bin/gcc-13 /opt/homebrew/bin/g++-13
+          otool -l "$(/opt/homebrew/bin/gcc-13 -print-file-name=libgomp.dylib)" | grep -m1 minos
+
+      # The Python that runs cibuildwheel (the wheels are built with cibuildwheel's own Pythons)
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Build and test the wheels
+        run: |
+          python -m pip install cibuildwheel==4.3.5
+          python -m cibuildwheel python --output-dir wheelhouse
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: wheels-${{ matrix.name }}
+          path: wheelhouse/*.whl
+          if-no-files-found: warn
+
+      # Every file of every wheel; the bundled libraries (on Windows none named as a DLL of the
+      # cpp-tiff or cpp-zarr wheels); no binary naming the checkout, the home folder or, on Linux,
+      # the container's copy of the checkout.
+      - name: List and check the wheels
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)   FORBID=(--forbid /project/python --forbid "$GITHUB_WORKSPACE") ;;
+            macOS)   FORBID=(--forbid "$GITHUB_WORKSPACE" --forbid "$HOME") ;;
+            Windows) FORBID=(--forbid "$GITHUB_WORKSPACE" --forbid "$USERPROFILE") ;;
+          esac
+          ls -l wheelhouse
+          python python/tools/check_wheel.py "${FORBID[@]}" wheelhouse/*.whl
+
+  # The wheel next to the packages PetaKit5D's Python port uses, in the Python versions its CI tests:
+  # test_python.py's import-order test then runs (this package used after numpy, scipy, cppzarr and
+  # cpptiff were used, and before), and its convert test reads cpp-zarr's and cpp-tiff's files.
+  import-order:
+    name: Import order (${{ matrix.platform.name }}, Python ${{ matrix.python }})
+    needs: wheels
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: Linux,   os: ubuntu-24.04 }
+          - { name: macOS,   os: macos-15 }
+          - { name: Windows, os: windows-2025 }
+        python: ['3.12', '3.14']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: wheels-${{ matrix.platform.name }}
+          path: wheelhouse
+
+      - name: Install
+        run: |
+          python -m pip install numpy scipy cpp-tiff cpp-zarr
+          python -m pip install --no-index --find-links wheelhouse parallel-imaris-writer
+          python -m pip list
+
+      # From another folder than the checkout, so that the installed package is the one imported.
+      # cpp-tiff 1.7.3's and cpp-zarr 1.7.3's macOS wheels crash each other in one process, without
+      # this package too (the second module's write runs the first's copy of pybind11's code: both
+      # export it; fixed in their sources, not released yet). Where the two crash, the tests run with
+      # each of them alone, which skips the import-order test, and a warning says so.
+      - name: Python tests
+        working-directory: ${{ runner.temp }}
+        run: |
+          TEST="$GITHUB_WORKSPACE/python/tests/test_python.py"
+          cat > siblings.py <<'EOF'
+          import os, tempfile, numpy as np, cppzarr, cpptiff
+          d = tempfile.mkdtemp()
+          a = np.arange(20 * 30 * 40, dtype=np.uint16).reshape(20, 30, 40)
+          cppzarr.write_zarr(os.path.join(d, 'a.zarr'), a)
+          cpptiff.write_tiff(os.path.join(d, 'a.tif'), a)
+          print('cpp-zarr and cpp-tiff work in one process')
+          EOF
+          if python siblings.py; then
+            python "$TEST"
+          else
+            echo "::warning::cpp-tiff and cpp-zarr crash each other in one process here (without this package): the tests run with each of them alone, the import-order test skipped"
+            python -m pip uninstall -y cpp-tiff
+            python "$TEST"
+            python -m pip install cpp-tiff
+            python -m pip uninstall -y cpp-zarr
+            python "$TEST"
+          fi

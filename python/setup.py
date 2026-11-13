@@ -56,6 +56,9 @@ class BuildExt(build_ext):
     def run(self):
         # The library (libparallelImarisWriter, with libcppTiff and libcppZarr) is built with
         # CMake into build/ and installed into build/install, then the extension is linked to it.
+        # Windows: with MinGW-w64 (MSYS2's UCRT64 gcc, g++, cmake and ninja first on PATH), and the
+        # extension too (see the end of this file); the repair step (delvewheel) then puts the DLLs
+        # into the wheel.
         cmake_build_dir = os.path.join(here, 'build')
         install_dir = os.path.join(cmake_build_dir, 'install')
         cmake = configured_cmake(cmake_build_dir)
@@ -68,10 +71,11 @@ class BuildExt(build_ext):
             os.makedirs(cmake_build_dir, exist_ok=True)
             subprocess.check_call([
                 'cmake', '-S', cmake_source_dir, '-B', cmake_build_dir,
-                # (cpp-zarr's libuuid step needs make: not Ninja)
-                '-G', 'Unix Makefiles',
+                # (cpp-zarr's libuuid step needs make: not Ninja; Windows has no libuuid step)
+                '-G', 'Ninja' if system == 'Windows' else 'Unix Makefiles',
                 '-DCMAKE_BUILD_TYPE=Release',
-                f'-DCMAKE_INSTALL_PREFIX={install_dir}',
+                # (no CMAKE_INSTALL_PREFIX: the install below gives the folder, so HDF5's configure
+                # summary, compiled into the library, names the default prefix and not this folder)
                 '-DCMAKE_INSTALL_LIBDIR=lib',
                 # (its C++ runtime, and the reader libraries', kept private, as the module's is: see
                 # CMakeLists.txt)
@@ -81,7 +85,8 @@ class BuildExt(build_ext):
         if cmake and os.path.isfile(cmake):
             subprocess.check_call([cmake, '--build', cmake_build_dir, '--parallel', build_jobs(),
                                    '--target', 'parallelImarisWriter_shared'])
-            subprocess.check_call([cmake, '--install', cmake_build_dir, '--component', 'python'])
+            subprocess.check_call([cmake, '--install', cmake_build_dir, '--component', 'python',
+                                   '--prefix', install_dir])
         elif installed:
             print(f'Reusing the library built in {cmake_build_dir} (its cmake, {cmake}, is gone)')
         else:
@@ -97,6 +102,35 @@ class BuildExt(build_ext):
         super().run()
 
 
+# No debug information, and the folders of this build recorded as relative names in the code's
+# file names (pybind11's messages): the wheel's binaries name no folder of the machine that built
+# them (as the library's, see CMakeLists.txt).
+compile_args = ['-g0', f'-ffile-prefix-map={here}=.',
+                f'-ffile-prefix-map={os.path.dirname(pybind11.get_include())}=pybind11']
+define_macros = []
+# Its own static C++ runtime, as the library's (see CMakeLists.txt), and only the module's init
+# function exported
+if system == 'Linux':
+    # (the runtime kept private, __cxa_pure_virtual included; the unwinder is the shared libgcc_s)
+    compile_args += ['-fvisibility=hidden', '-fvisibility-inlines-hidden']
+    link_args = ['-static-libstdc++', f'-Wl,--exclude-libs,ALL,--version-script={module_version_script}',
+                 '-Wl,--undefined=__cxa_pure_virtual']
+elif system == 'Darwin':
+    # (exported, the runtime's weak definitions would be merged by the loader with those of every
+    # other image of the process that exports the same, as another GCC-built module's; the unwinder
+    # is libSystem's, and -static-libgcc keeps Homebrew's libgcc_s out)
+    compile_args += ['-fvisibility=hidden', '-fvisibility-inlines-hidden']
+    link_args = ['-static-libstdc++', '-static-libgcc', '-Wl,-exported_symbol,_PyInit_parallel_imaris_writer']
+else:
+    # MinGW-w64 for python.org's Python (MSVC-built; the library's API is C++, so the module is built
+    # with the library's compiler): the headers of Python 3.9 to 3.11 define MS_WIN64 for MSVC only
+    # (defined empty, as 3.12's own definition for MinGW); NDEBUG as Python's own flags have it on
+    # Linux and macOS (the assertions of Python's headers left out). The module exports PyInit_* alone
+    # (its dllexport) and is stripped (-s, setuptools' MinGW linking).
+    compile_args += ['-O2']
+    define_macros += [('MS_WIN64', ''), ('NDEBUG', None)]
+    link_args = ['-static-libstdc++', '-static-libgcc']
+
 ext_modules = [
     Extension(
         'parallel_imaris_writer.parallel_imaris_writer',
@@ -104,13 +138,9 @@ ext_modules = [
         library_dirs=['build/install/lib64', 'build/install/lib'],
         libraries=['parallelImarisWriter'],
         sources=['parallel_imaris_writer.cpp'],
-        # Only the module's init function exported
-        extra_compile_args=['-fvisibility=hidden', '-fvisibility-inlines-hidden'] if system != 'Windows' else [],
-        # (the static C++ runtime kept private, as in the library, __cxa_pure_virtual included: see
-        # CMakeLists.txt)
-        extra_link_args=['-static-libstdc++'] + ([f'-Wl,--exclude-libs,ALL,--version-script={module_version_script}',
-                                                  '-Wl,--undefined=__cxa_pure_virtual']
-                                                 if system == 'Linux' else []),
+        define_macros=define_macros,
+        extra_compile_args=compile_args,
+        extra_link_args=link_args,
     ),
 ]
 
@@ -123,10 +153,13 @@ setup(
     license='Apache-2.0',
     packages=find_packages(exclude=['tests']),
     ext_modules=ext_modules,
-    # Windows: the library is built beforehand (not by setup.py) and its DLLs are package data
-    cmdclass={'build_ext': BuildExt} if system != 'Windows' else {'build_ext': build_ext},
+    cmdclass={'build_ext': BuildExt},
+    # Windows: MinGW-w64, as the library (above). The wheel holds no DLL of its own: the repair step
+    # (delvewheel) adds the library, the readers and MinGW's runtime DLLs under new names, so that none
+    # is taken for the DLL of the same name another package loaded (cpp-tiff's and cpp-zarr's wheels
+    # ship libcppTiff.dll, libcppZarr.dll, libgomp-1.dll and libwinpthread-1.dll).
+    options={'build_ext': {'compiler': 'mingw32'}} if system == 'Windows' else {},
     install_requires=['numpy>=1.20'],
-    package_data={'': ['*.dll']} if system == 'Windows' else {},
     include_package_data=True,
     entry_points={'console_scripts': ['parallelimariswriter = parallel_imaris_writer.__main__:main']},
     zip_safe=False,
