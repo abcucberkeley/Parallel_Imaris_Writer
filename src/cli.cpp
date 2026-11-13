@@ -14,7 +14,7 @@
  *   limitations under the License.                                        *
  ***************************************************************************/
 
-// The command line (piw::runCli): the cluster subcommands, else the single-node conversion. The
+// The command line (piw::runCli): the cluster subcommands, verify, else the single-node conversion. The
 // conversion itself is piw::convert; every error of the conversion's command line ends with one
 // "ERROR: <text>" line on stderr and exit code 1 (cliExitCode turns a Status into both).
 #include "parallelimariswriter.h"
@@ -72,9 +72,10 @@ void MessageCallback(const char* aText, void*)
 }
 
 // PIW_TIMING=1: one line on stderr when the file is written.
-void TimingCallback(double aReadSeconds, double aFeedSeconds, double aFinishSeconds, void*)
+void TimingCallback(double aReadSeconds, double aFeedSeconds, double aFinishSeconds, double aVerifySeconds, void*)
 {
-    fprintf(stderr, "Timing: read %.2f s, feed %.2f s, finish and close %.2f s\n", aReadSeconds, aFeedSeconds, aFinishSeconds);
+    fprintf(stderr, "Timing: read %.2f s, feed %.2f s, finish and close %.2f s, verify %.2f s\n", aReadSeconds, aFeedSeconds,
+            aFinishSeconds, aVerifySeconds);
 }
 
 int cliError(const std::string& aText)
@@ -96,8 +97,11 @@ void printUsage(FILE* aOut)
         "usage: parallelimariswriter -F FOLDER[,FOLDER...] -P PATTERN[,PATTERN...] [options]\n"
         "       parallelimariswriter setup|worker|monitor|combineone|link|linkparts|layout|monoinit|monoplace|monofinish|monostatus ...\n"
         "       parallelimariswriter plan|task|status|finish ...   (plan -h: the cluster steps as tasks)\n"
+        "       parallelimariswriter verify FILE.ims [FILE.ims...]   (verify -h: checks that files are complete)\n"
         "Converts TIFF or Zarr stacks to one Imaris .ims file. Each pattern is one channel; the files in the\n"
-        "folders whose names contain it are its time points, in the order of their names (full paths).\n"
+        "folders whose names contain it are its time points, in the order of their names (full paths). The\n"
+        "file is written as NAME.ims.partial, checked, and renamed to NAME.ims when complete, replacing an\n"
+        "existing NAME.ims (which an error leaves as it was).\n"
         "  -F FOLDERS      comma-separated input folders\n"
         "  -P PATTERNS     comma-separated file-name patterns, one per channel\n"
         "  -r READER       tiff (.tif, .tiff) or zarr (.zarr); default tiff\n"
@@ -110,14 +114,17 @@ void printUsage(FILE* aOut)
         "                  input's chunks; does not change the output)\n"
         "  -B X0,Y0,Z0,X1,Y1,Z1  crop to [X0,X1) x [Y0,Y1) x [Z0,Z1), 0-based\n"
         "  -C X,Y,Z        voxels of a time point held in memory at once, each >= 1 (TIFF: Z only;\n"
-        "                  default: a whole time point)\n");
+        "                  default: a whole time point)\n"
+        "  --no-overwrite  if NAME.ims exists, say so and exit 0 without converting\n"
+        "  --no-verify     skip the check of the written file (see verify) before it is renamed\n");
     const std::vector<imsmeta::OptionInfo>& vMetadataOptions = imsmeta::metadataOptions();
     for(size_t i = 0; i < vMetadataOptions.size(); ++i){
         fprintf(aOut, "  --%s %s\n                  %s\n", vMetadataOptions[i].name, vMetadataOptions[i].value, vMetadataOptions[i].help);
     }
     fprintf(aOut,
         "  -h, --help      this text\n"
-        "Exit code 0 when the file was written; 1 on any error, after one \"ERROR: ...\" line on stderr.\n");
+        "Exit code 0 when the file was written (or, with --no-overwrite, exists); 1 on any error, after one\n"
+        "\"ERROR: ...\" line on stderr.\n");
 }
 
 // The items of a comma-separated list, spaces around them removed; one trailing comma is fine
@@ -441,8 +448,14 @@ int convertToImaris(int argc, char **argv)
         return cliError("No arguments were given; the options are listed above.");
     }
     ConversionArgs vArgs;
-    const int vRead = readConversion(argc, argv, vArgs, std::vector<ExtraOption>(), printUsage);
+    const ExtraOption vOwn[2] = {{"no-overwrite", false}, {"no-verify", false}};
+    const int vRead = readConversion(argc, argv, vArgs, std::vector<ExtraOption>(vOwn, vOwn + 2), printUsage);
     if(vRead >= 0) return vRead;
+    bool vOverwrite = true;
+    for(size_t i = 0; i < vArgs.extra.size(); ++i){
+        if(vArgs.extra[i].first == 0) vOverwrite = false;
+        else vArgs.options.verify = false;
+    }
     piw::ConvertOptions& vOptions = vArgs.options;
     const std::vector<std::string>& folders = vArgs.folders;
     const std::vector<std::string>& patternList = vArgs.patterns;
@@ -466,6 +479,12 @@ int convertToImaris(int argc, char **argv)
     const std::string outputFile = outputDirString + "/" + outName + ".ims";
     const std::string timepointsFile = outputDirString + "/timepoints.txt";
     #endif
+    // A file of that name is complete (it gets the name only then): nothing to do.
+    struct stat vExisting;
+    if(!vOverwrite && stat(outputFile.c_str(), &vExisting) == 0 && (vExisting.st_mode & S_IFMT) == S_IFREG){
+        printf("%s exists; not converting (--no-overwrite).\n", outputFile.c_str());
+        return 0;
+    }
 
     FILE* fp = fopen(timepointsFile.c_str(),"a");
     if(fp){
@@ -577,6 +596,36 @@ int planCommand(int argc, char** argv)
     return 0;
 }
 
+void printVerifyUsage(FILE* aOut)
+{
+    fprintf(aOut,
+        "usage: parallelimariswriter verify FILE.ims [FILE.ims...]\n"
+        "Checks that each file is a complete .ims, from its metadata alone (no image data is read): the size, time\n"
+        "points and channels that /DataSetInfo gives, every resolution level of the pyramid for that size, and every\n"
+        "dataset holding all of its chunks. Prints one line per complete file; for any other, an ERROR line that names\n"
+        "the first missing or wrong attribute or dataset. Exit code 0 when every file is complete, else 1. Works on\n"
+        "the files of the converter, of finish/monofinish/monitor (the single file) and of link/linkparts (with\n"
+        "their parts).\n");
+}
+
+// verify FILE.ims [FILE.ims...]: piw::verifyIms on each.
+int verifyCommand(int argc, char** argv)
+{
+    if(argc >= 3 && (!strcmp(argv[2], "-h") || !strcmp(argv[2], "--help"))){ printVerifyUsage(stdout); return 0; }
+    if(argc < 3){ printVerifyUsage(stderr); return cliError("verify needs at least one file; the usage is above."); }
+    const char* vTypes[5] = {"", "uint8", "uint16", "float32", "uint32"};
+    int vExitCode = 0;
+    for(int i = 2; i < argc; ++i){
+        piw::ImsVerifyResult vResult;
+        const piw::Status vStatus = piw::verifyIms(expandHome(argv[i]), &vResult);
+        if(!vStatus.ok()){ vExitCode = cliExitCode(vStatus); continue; }
+        printf("%s: complete: %llux%llux%llu %s, %u time point(s) x %u channel(s) x %u level(s), %llu chunks\n", argv[i],
+               (unsigned long long)vResult.size[0], (unsigned long long)vResult.size[1], (unsigned long long)vResult.size[2],
+               vTypes[(int)vResult.dataType], vResult.timepoints, vResult.channels, vResult.levels, (unsigned long long)vResult.chunks);
+    }
+    return vExitCode;
+}
+
 }  // namespace
 
 namespace piw {
@@ -585,9 +634,10 @@ int runCli(int argc, char** argv) noexcept
 {
     int vExitCode = 1;
     try{
-        // Cluster subcommands (setup/worker/monitor/..., monoinit/monoplace/...); otherwise the single-node conversion.
+        // Cluster subcommands (setup/worker/monitor/..., monoinit/monoplace/...), verify; otherwise the single-node conversion.
         if(argc >= 2 && isParallelCommand(argv[1])) vExitCode = runParallel(argc, argv);
         else if(argc >= 2 && !strcmp(argv[1], "plan")) vExitCode = planCommand(argc, argv);
+        else if(argc >= 2 && !strcmp(argv[1], "verify")) vExitCode = verifyCommand(argc, argv);
         else if(argc >= 2 && isClusterCommand(argv[1])) vExitCode = runCluster(argc, argv);
         else if(argc >= 2 && isMonoCommand(argv[1])) vExitCode = runMono(argc, argv);
         else vExitCode = convertToImaris(argc, argv);

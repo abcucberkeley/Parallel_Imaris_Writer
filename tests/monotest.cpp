@@ -249,6 +249,7 @@ int main(int argc, char** argv){
         CHECK(nativeOrder(refDir / "output.ims", out), "storage order or link types differ from the single-node file");
         ImsCompareReport deep;
         CHECK(imsDeepCheck(out, deep, 2), "deep check of the single file");
+        CHECK(run(E + " verify " + q(out)) == 0, "verify of the single file");
     }
     CHECK(run(place(0, 0, keep / "part_t0_c0.ims"), &o, log) == 1 && o.find("finished") != std::string::npos, "a placement after the finish was accepted");
     CHECK(run(E + " monofinish " + q(wd), &o, log) == 0 && o.find("already finished") != std::string::npos, "finishing again");
@@ -291,6 +292,7 @@ int main(int argc, char** argv){
     if(fs::exists(out2)){
         compareFiles(ref2 / "output.ims", out2, "cropped, 2 timepoints x 1 channel");
         CHECK(nativeOrder(ref2 / "output.ims", out2), "crop run: storage order differs");
+        CHECK(run(E + " verify " + q(out2)) == 0, "verify of the crop run's file (level 0 re-chunked)");
     }
 
     // ---------------- thumbnail run: level 1, the maximum projection ----------------
@@ -320,6 +322,7 @@ int main(int argc, char** argv){
     CHECK(made, "thumbnail run: a conversion or a mono step failed");
     if(made){
         compareFiles(ref3 / "output.ims", out3, "thumbnail from level 1");
+        CHECK(run(E + " verify " + q(out3)) == 0, "verify of the thumbnail run's file");
         uint64_t rows = 0, rowBytes = 0; std::vector<uint8_t> rgba; std::set<uint32_t> colours;
         CHECK(imsReadThumbnail(out3, rows, rowBytes, rgba), "thumbnail run: no /Thumbnail/Data");
         for(size_t i = 0; i + 3 < rgba.size(); i += 4) colours.insert((uint32_t)rgba[i] | (uint32_t)rgba[i + 1] << 8 | (uint32_t)rgba[i + 2] << 16);

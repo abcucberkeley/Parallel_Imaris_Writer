@@ -41,9 +41,10 @@ struct Callbacks {
     void* user = nullptr;
     // Called once when the file is written (not after a failure): the wall-clock seconds spent
     // reading the inputs (0 for writeVolumes), handing the blocks to the Imaris writer (copying them
-    // and waiting for its queue), and in its finish, which writes the histograms and metadata and
-    // closes the file. The command line prints them with PIW_TIMING=1.
-    void (*timing)(double readSeconds, double feedSeconds, double finishSeconds, void* user) = nullptr;
+    // and waiting for its queue), in its finish, which writes the histograms and metadata and
+    // closes the file, and in the check of the closed file (verifyIms; 0 without it). The command
+    // line prints them with PIW_TIMING=1.
+    void (*timing)(double readSeconds, double feedSeconds, double finishSeconds, double verifySeconds, void* user) = nullptr;
 };
 
 // A channel's base color: red, green and blue from 0 to 1.
@@ -64,8 +65,8 @@ enum class InputAxes : int {
 struct ConvertOptions {
     std::string reader = "tiff";                        // "tiff" or "zarr"
     std::vector<std::vector<std::string> > files;       // files[channel][timepoint]; every channel has as many
-    std::string outputFile;                             // the .ims to write; an existing file is replaced
-                                                        // (and left alone when the inputs are refused)
+    std::string outputFile;                             // the .ims to write (see convert); an existing file
+                                                        // is replaced only by a complete one
     float voxelSize[3] = {0.108f, 0.108f, 0.108f};      // along the input's axes 0, 1, 2
     bool hasBlockSize = false;    uint64_t blockSize[3] = {0, 0, 0};          // -b; default: the reader's chunks
     bool hasBoundingBox = false;  uint64_t boundingBox[6] = {0, 0, 0, 0, 0, 0}; // -B: a0,a1,a2,b0,b1,b2; 0-based, end excluded
@@ -75,6 +76,7 @@ struct ConvertOptions {
     // YXZ, 2, 1, 0 with ZYX); the values above stay along the input's axes.
     bool xOnImarisX = false;
     InputAxes inputAxes = InputAxes::YXZ;
+    bool verify = true;                                 // check the written file (verifyIms) before it gets its name
 
     // Metadata (/DataSetInfo). Each list is empty (the default) or has one entry per channel.
     std::vector<std::string> channelNames;              // default "Channel 0", "Channel 1", ...; the command
@@ -105,13 +107,14 @@ struct Volume {
 };
 
 struct WriteOptions {
-    std::string outputFile;                             // the .ims to write; an existing file is replaced
+    std::string outputFile;                             // the .ims to write, as convert writes it
     DataType dataType = DataType::UInt16;
     uint64_t size[3] = {0, 0, 0};                       // Imaris X, Y, Z of every volume (each below 2^32)
     unsigned channels = 1, timepoints = 1;
     float voxelSize[3] = {0.108f, 0.108f, 0.108f};      // along Imaris X, Y, Z
     bool hasBlockSize = false; uint64_t blockSize[3] = {64, 64, 64};  // pieces handed to the Imaris writer
     int numThreads = 0;                                 // 0: the calling thread's OpenMP default
+    bool verify = true;                                 // as ConvertOptions::verify
 
     // Metadata (/DataSetInfo): as ConvertOptions's fields of the same names, except that without
     // startTime the first time point is the current time (there is no input file).
@@ -138,15 +141,21 @@ PIW_API Status findInputFiles(const std::vector<std::string>& folders, const std
 // Writes options.outputFile. The inputs' sample type is the file's: uint8, uint16, uint32 or
 // float32 with one sample per pixel (Unsupported for any other: signed, float16/64, 64-bit, bool,
 // complex, RGB). Every input file is checked (sample type, shape; Zarr: 3-D; with a bounding box,
-// that it contains the box) before the output is created; after any later failure the partial
-// output is removed. One conversion runs at a time in a process (calls from other threads wait).
+// that it contains the box) before the output is created. The file is written as
+// "<outputFile>.partial" in the same folder; once it is complete and closed, and (with
+// options.verify) verifyIms found it complete with the expected size, sample type, time points and
+// channels, it is renamed to outputFile, replacing a file of that name (on Windows that file is
+// removed first). So a file under the name outputFile is always a complete one: after any failure
+// the partial file is removed and an existing outputFile is left as it was, and a process that is
+// killed leaves only the .partial file. A folder named outputFile is refused (WriteFailed) before
+// anything is read. One conversion runs at a time in a process (calls from other threads wait).
 PIW_API Status convert(const ConvertOptions& options, const Callbacks& callbacks = Callbacks()) noexcept;
 
 // Writes options.outputFile from volumes in memory: volumes[channel*timepoints + timepoint] (the
 // converter's file order), all of options.size. The file equals a conversion of files holding the
 // same data with the same voxel size and metadata (the block size does not change the file). Fails
-// with InvalidArgument before creating the output when an option or volume is unusable; after any
-// later failure the partial output is removed. The volumes are only read.
+// with InvalidArgument before creating the output when an option or volume is unusable. The file is
+// written under a temporary name, checked and renamed as convert does. The volumes are only read.
 PIW_API Status writeVolumes(const WriteOptions& options, const std::vector<Volume>& volumes,
                             const Callbacks& callbacks = Callbacks()) noexcept;
 
@@ -189,6 +198,26 @@ PIW_API Status imsInfo(const std::string& file, ImsInfo& info, bool checksums = 
 // counts the chunks of every dataset). InvalidArgument when the file has no such dataset.
 PIW_API Status imsDataset(const std::string& file, unsigned level, unsigned timepoint, unsigned channel,
                           uint64_t size[3], DataType& dataType) noexcept;
+
+// What verifyIms found in a complete file.
+struct ImsVerifyResult {
+    uint64_t size[3] = {0, 0, 0};         // /DataSetInfo/Image X, Y, Z: level 0's ImageSizeX/Y/Z
+    unsigned levels = 0, timepoints = 0, channels = 0;
+    DataType dataType = DataType::UInt16;
+    uint64_t chunks = 0;                  // stored in all the Data datasets together
+};
+
+// Checks that an .ims file is complete, from its metadata alone (no chunk is read, so it is quick
+// for a file of any size; files this library, the cluster steps or ImarisWriter write, including
+// link files whose datasets are external links into their parts): /DataSetInfo/Image X, Y, Z
+// (written when the file is finished) give the image size, /DataSetInfo/TimeInfo FileTimePoints
+// the time points and the /DataSetInfo/Channel groups the channels; the resolution levels must be
+// those of ImarisWriter's pyramid for that size and sample type, each with exactly those time
+// points and channels; and every Data dataset must be chunked, of level 0's sample type, with
+// ImageSizeX/Y/Z of its level and as many chunks stored as that size and its chunk size imply
+// (H5Dget_num_chunks). Errors: NotFound, ReadFailed (not an HDF5 file, or the first missing or
+// wrong attribute or dataset, named), Unsupported (a sample type this library does not write).
+PIW_API Status verifyIms(const std::string& file, ImsVerifyResult* result = nullptr) noexcept;
 
 // Reads the region [start, end) of one dataset into out: element (x, y, z) of the region goes to
 // out[(x - start[0])*stride[0] + (y - start[1])*stride[1] + (z - start[2])*stride[2]] (strides

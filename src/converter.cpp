@@ -67,6 +67,7 @@ std::mutex& libraryMutex(){
     static std::mutex vMutex;
     return vMutex;
 }
+Status verifyImsLocked(const std::string& aFile, ImsVerifyResult& aResult);   // src/imsread.cpp
 }
 using detail::libraryMutex;
 
@@ -296,10 +297,40 @@ std::string sizeText(const uint64_t aSize[3]){
     return std::to_string(aSize[0]) + "x" + std::to_string(aSize[1]) + "x" + std::to_string(aSize[2]);
 }
 
-// Removes the output after a failure (only a regular file: never a folder of that name).
+// Removes the partial output after a failure (only a regular file: never a folder of that name).
 void removeOutput(const std::string& aFile){
     struct stat vInfo;
     if(stat(aFile.c_str(), &vInfo) == 0 && (vInfo.st_mode & S_IFMT) == S_IFREG) remove(aFile.c_str());
+}
+
+// The name a file is written under until it is complete: "<name>.partial", in the same folder.
+std::string partialName(const std::string& aFile){
+    return aFile + ".partial";
+}
+
+// The output's name cannot be taken by a folder: the file is renamed to it only at the end.
+Status checkOutputName(const std::string& aFile){
+    struct stat vInfo;
+    if(stat(aFile.c_str(), &vInfo) == 0 && (vInfo.st_mode & S_IFMT) == S_IFDIR){
+        return Status(Code::WriteFailed, "Cannot write " + aFile + ": a folder has that name.");
+    }
+    return Status();
+}
+
+// Renames the complete file to its name, replacing a file of that name (POSIX rename does so in
+// one step; on Windows, where rename does not replace, that file is removed first).
+Status renameOutput(const std::string& aFrom, const std::string& aTo){
+    #ifdef _WIN32
+    struct stat vInfo;
+    if(stat(aTo.c_str(), &vInfo) == 0 && remove(aTo.c_str()) != 0){
+        return Status(Code::WriteFailed, "Could not replace " + aTo + " with the written file: " + strerror(errno) +
+                      " (is it open in another program?).");
+    }
+    #endif
+    if(rename(aFrom.c_str(), aTo.c_str()) != 0){
+        return Status(Code::WriteFailed, "Could not rename the written file " + aFrom + " to " + aTo + ": " + strerror(errno) + ".");
+    }
+    return Status();
 }
 
 typedef std::chrono::steady_clock Clock;
@@ -549,7 +580,7 @@ Status validate(const ConvertOptions& aOptions){
         }
     }
     if(aOptions.numThreads < 0) return Status(Code::InvalidArgument, "The number of threads cannot be negative.");
-    return Status();
+    return checkOutputName(aOptions.outputFile);
 }
 
 size_t dataTypeBytes(DataType aType){
@@ -561,12 +592,13 @@ bool validDataType(DataType aType){
 }
 
 // One output file through the ImarisWriter C interface. open, writeRegion and finish make the
-// file; without a successful finish the destructor stops the writer and removes the partial file.
+// file, under partialName(aOutputFile) until finish has checked it (aVerify) and renamed it; without
+// a successful finish the destructor stops the writer and removes the partial file.
 class ImsWriter {
 public:
-    explicit ImsWriter(const Callbacks& aCallbacks)
-        : mCallbacks(aCallbacks), mConverter(NULL), mDataType(DataType::UInt16), mBuffer(NULL), mFinished(false),
-          mFeedSeconds(0), mFinishSeconds(0) {}
+    ImsWriter(const Callbacks& aCallbacks, bool aVerify)
+        : mCallbacks(aCallbacks), mVerify(aVerify), mConverter(NULL), mDataType(DataType::UInt16), mBuffer(NULL),
+          mFinished(false), mKeepPartial(false), mFeedSeconds(0), mFinishSeconds(0), mVerifySeconds(0) {}
     ~ImsWriter();
 
     Status open(DataType aDataType, const bpConverterTypesC_Size5D& aImageSize, const bpConverterTypesC_Size5D& aBlockSize,
@@ -576,10 +608,12 @@ public:
     // (NULL: all zero padding).
     Status writeRegion(uint64_t aC, uint64_t aT, const uint64_t aBlockBase[3], const uint64_t aBlockLimit[3],
                        const void* aSrc, uint64_t aX0, uint64_t aY0, uint64_t aZ0, const int64_t aStride[3]);
-    // Finish, then (when that succeeded) destroys the Imaris writer: the file is complete and closed.
+    // Finish, then (when that succeeded) destroys the Imaris writer, so the file is complete and
+    // closed; checks it (verifyIms and the expected size, type and counts) and renames it.
     Status finish();
     double feedSeconds() const { return mFeedSeconds; }       // in writeRegion
-    double finishSeconds() const { return mFinishSeconds; }   // in finish
+    double finishSeconds() const { return mFinishSeconds; }   // in finish, up to the close
+    double verifySeconds() const { return mVerifySeconds; }   // in finish, the check
 
 private:
     ImsWriter(const ImsWriter&);
@@ -587,30 +621,33 @@ private:
 
     Status checkErrors();
     void writeMetadata();
+    Status verifyWritten();
     static void onProgress(bpConverterTypesC_Float aProgress, bpConverterTypesC_UInt64 aTotalBytesWritten, void* aUserData);
 
     const Callbacks& mCallbacks;
+    const bool mVerify;
     bpImageConverterCPtr mConverter;
     DataType mDataType;
     bpConverterTypesC_Size5D mImageSize;
     bpConverterTypesC_Size5D mBlockSize;
     float mVoxelSize[3];
     imsmeta::Metadata mMetadata;
-    std::string mOutputFile;
+    std::string mOutputFile, mPartialFile;
     void* mBuffer;
     bool mFinished;
-    double mFeedSeconds, mFinishSeconds;
+    bool mKeepPartial;   // complete but not renamed (the output's name is taken, e.g. open elsewhere): kept
+    double mFeedSeconds, mFinishSeconds, mVerifySeconds;
     Writeback mWriteback;
 };
 
 ImsWriter::~ImsWriter(){
     mWriteback.stop();   // joined (and its descriptor closed) before the file is closed or removed
-    if(!mConverter) return;
     // Without a successful finish, destroying the writer stops it (third_party/imariswriter/README.md):
-    // no histograms, metadata or thumbnail are written, and the incomplete file is removed below.
-    bpImageConverterC_Destroy(mConverter);
+    // no histograms, metadata or thumbnail are written, and the incomplete file is removed below
+    // (also a complete one that failed its check; one that could not be renamed is kept).
+    if(mConverter) bpImageConverterC_Destroy(mConverter);
     free(mBuffer);
-    if(!mFinished) removeOutput(mOutputFile);
+    if(!mPartialFile.empty() && !mFinished && !mKeepPartial) removeOutput(mPartialFile);
 }
 
 void ImsWriter::onProgress(bpConverterTypesC_Float aProgress, bpConverterTypesC_UInt64 aTotalBytesWritten, void* aUserData){
@@ -634,6 +671,7 @@ Status ImsWriter::open(DataType aDataType, const bpConverterTypesC_Size5D& aImag
     mVoxelSize[2] = aVoxelSize[2];
     mMetadata = aMetadata;
     mOutputFile = aOutputFile;
+    mPartialFile = partialName(aOutputFile);
 
     bpConverterTypesC_DataType vType = aDataType == DataType::UInt8 ? bpConverterTypesC_UInt8Type :
                                        aDataType == DataType::UInt16 ? bpConverterTypesC_UInt16Type :
@@ -665,13 +703,13 @@ Status ImsWriter::open(DataType aDataType, const bpConverterTypesC_Size5D& aImag
     mConverter = bpImageConverterC_Create(
                 vType, &mImageSize, &aSample,
                 &aDimensionSequence, &mBlockSize,
-                mOutputFile.c_str(), &aOptions,
+                mPartialFile.c_str(), &aOptions,
                 aApplicationName, aApplicationVersion,
                 aProgressCallback, (void*)&mCallbacks
                 );
     Status vStatus = checkErrors();
     if(!vStatus.ok()) return vStatus;
-    mWriteback.start(mOutputFile);   // the Imaris writer has created the file
+    mWriteback.start(mPartialFile);   // the Imaris writer has created the file
 
     unsigned long long vBlockSize =
             (unsigned long long)mBlockSize.mValueX *
@@ -818,20 +856,57 @@ Status ImsWriter::finish(){
     const Clock::time_point vStart = Clock::now();
     writeMetadata();   // bpImageConverterC_Finish closes the file
     Status vStatus = checkErrors();
-    mWriteback.stop();
+    mWriteback.stop();   // joined before the file is checked, renamed or removed
     if(vStatus.ok()){
         bpImageConverterC_Destroy(mConverter);   // joins the writer's threads; nothing is left to write
         mConverter = NULL;
         free(mBuffer);
         mBuffer = NULL;
-        mFinished = true;
     }
     mFinishSeconds = secondsSince(vStart);
-    return vStatus;
+    if(!vStatus.ok()) return vStatus;
+    if(mVerify){
+        const Clock::time_point vCheck = Clock::now();
+        vStatus = verifyWritten();
+        mVerifySeconds = secondsSince(vCheck);
+        if(!vStatus.ok()) return vStatus;
+    }
+    vStatus = renameOutput(mPartialFile, mOutputFile);
+    if(vStatus.ok()){
+        mFinished = true;
+        return vStatus;
+    }
+    // The file is complete (and checked, unless verify is off): keep it rather than lose the whole
+    // conversion, e.g. when the old output is open in another program on Windows.
+    mKeepPartial = true;
+    return Status(Code::WriteFailed, vStatus.message + " The complete file was kept as " + mPartialFile +
+                  "; rename it to " + mOutputFile + " once that name is free.");
+}
+
+// The closed file is complete (verifyIms) and holds what was written: the image size, sample type,
+// time points and channels.
+Status ImsWriter::verifyWritten(){
+    ImsVerifyResult vFound;
+    Status vStatus = detail::verifyImsLocked(mPartialFile, vFound);
+    if(!vStatus.ok()) return Status(Code::WriteFailed, "The written file is not complete: " + vStatus.message);
+    const uint64_t vSize[3] = {mImageSize.mValueX, mImageSize.mValueY, mImageSize.mValueZ};
+    if(vFound.size[0] != vSize[0] || vFound.size[1] != vSize[1] || vFound.size[2] != vSize[2] || vFound.dataType != mDataType ||
+       vFound.timepoints != mImageSize.mValueT || vFound.channels != mImageSize.mValueC){
+        auto text = [](const uint64_t aXyz[3], uint64_t aT, uint64_t aC, DataType aType){
+            static const char* const kTypes[5] = {"", "uint8", "uint16", "float32", "uint32"};
+            return sizeText(aXyz) + " " + kTypes[(int)aType] + ", " + std::to_string(aT) + " time point(s), " + std::to_string(aC) + " channel(s)";
+        };
+        return Status(Code::WriteFailed, "The written file " + mPartialFile + " holds " +
+                      text(vFound.size, vFound.timepoints, vFound.channels, vFound.dataType) + ", not the " +
+                      text(vSize, mImageSize.mValueT, mImageSize.mValueC, mDataType) + " written.");
+    }
+    return Status();
 }
 
 void reportTiming(const Callbacks& aCallbacks, double aRead, const ImsWriter& aWriter){
-    if(aCallbacks.timing) aCallbacks.timing(aRead, aWriter.feedSeconds(), aWriter.finishSeconds(), aCallbacks.user);
+    if(aCallbacks.timing){
+        aCallbacks.timing(aRead, aWriter.feedSeconds(), aWriter.finishSeconds(), aWriter.verifySeconds(), aCallbacks.user);
+    }
 }
 
 uint64_t numBlocks(uint64_t aSize, uint64_t aBlockSize){
@@ -924,7 +999,7 @@ Status convertValidated(const ConvertOptions& aOptions, const Callbacks& aCallba
         (unsigned int)vChunks[vAxis[0]], (unsigned int)vChunks[vAxis[1]], (unsigned int)vChunks[vAxis[2]], 1, 1
     };
 
-    ImsWriter vWriter(aCallbacks);
+    ImsWriter vWriter(aCallbacks, aOptions.verify);
     vStatus = vWriter.open(vType, aImageSize, aBlockSize, vVoxelSize, vMetadata, aOptions.outputFile);
     if(!vStatus.ok()) return vStatus;
 
@@ -1149,7 +1224,7 @@ Status validateWrite(const WriteOptions& aOptions, const std::vector<Volume>& aV
             vLast += vSpan*vStep;
         }
     }
-    return Status();
+    return checkOutputName(aOptions.outputFile);
 }
 
 // The write itself (options validated, library mutex held).
@@ -1170,7 +1245,7 @@ Status writeValidated(const WriteOptions& aOptions, const std::vector<Volume>& a
     };
     const bpConverterTypesC_Size5D aBlockSize = {(unsigned int)vBlock[0], (unsigned int)vBlock[1], (unsigned int)vBlock[2], 1, 1};
 
-    ImsWriter vWriter(aCallbacks);
+    ImsWriter vWriter(aCallbacks, aOptions.verify);
     Status vStatus = vWriter.open(aOptions.dataType, aImageSize, aBlockSize, aOptions.voxelSize, vMetadata, aOptions.outputFile);
     if(!vStatus.ok()) return vStatus;
     const uint64_t vBase[3] = {0, 0, 0};

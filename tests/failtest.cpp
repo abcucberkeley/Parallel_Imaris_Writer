@@ -7,10 +7,15 @@
 // counted as a hang; PIW_FAILTEST_TIMEOUT=<seconds> changes the limit, e.g. for a sanitizer build):
 //   1. a file-size limit (RLIMIT_FSIZE, SIGXFSZ ignored, so write() fails with EFBIG) of 8 MB, far
 //      below the output of an incompressible 40 MB volume (random uint16 in an uncompressed Zarr);
-//      also with -C 64,64,64 (block processing) and with two timepoints.
+//      also with -C 64,64,64 (block processing) and with two timepoints, and once with SIGXFSZ at its
+//      default (as under a shell's ulimit -f): the executable ignores it itself.
 //   2. a limit one byte below the size of the complete file, single-threaded (then every run writes
 //      the same layout): the last write fails, which may be the flush when the file is closed.
-//   3. the output file name is taken by a directory, so ImarisWriter cannot create the file.
+//   3. the output file name is taken by a directory, so the file cannot get its name.
+// After each of these, the output folder holds neither output.ims nor output.ims.partial (the file
+// is written under the second name and renamed only when complete).
+//   4. a conversion killed with SIGKILL while it writes leaves no output.ims (only output.ims.partial),
+//      and leaves an existing complete output.ims as it was; the next run replaces both.
 // Then the same inputs convert without a limit: exit code 0, and level 0 equals the input.
 // POSIX only (fork/exec and setrlimit); not built on Windows.
 //   usage: failTest <path-to-parallelimariswriter> [workdir]
@@ -46,6 +51,7 @@ namespace fs = std::filesystem;
 static const uint64_t X = 512, Y = 512, Z = 80;           // 40 MiB of uint16
 static const rlim_t kLimit = 8ull << 20;                  // file-size limit of case 1
 static double gTimeout = 30;                              // seconds a run may take
+static bool gIgnoreXfsz = true;                           // the child starts with SIGXFSZ ignored (else default)
 
 static int gFailures = 0;
 static void check(bool ok, const std::string& what){
@@ -133,7 +139,7 @@ static RunResult run(const std::string& exe, const std::vector<std::string>& arg
         int fd = open(logName.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if(fd >= 0){ dup2(fd, 1); dup2(fd, 2); close(fd); }
         if(fsizeLimit){
-            signal(SIGXFSZ, SIG_IGN);
+            signal(SIGXFSZ, gIgnoreXfsz ? SIG_IGN : SIG_DFL);
             struct rlimit rl;
             if(getrlimit(RLIMIT_FSIZE, &rl) == 0){
                 rl.rlim_cur = fsizeLimit;
@@ -189,6 +195,58 @@ static std::vector<std::string> convertArgs(const fs::path& in, const fs::path& 
     return a;
 }
 
+// Runs <exe> <args> (output in <log>) and kills it with SIGKILL as soon as <watch> exists. Returns false
+// when the run ended before <watch> appeared.
+static bool runAndKill(const std::string& exe, const std::vector<std::string>& args, const fs::path& log, const fs::path& watch,
+                       int threads){
+    std::vector<std::string> argStore = {exe};
+    argStore.insert(argStore.end(), args.begin(), args.end());
+    std::vector<char*> argv;
+    for(auto& a : argStore) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    std::vector<std::string> envStore;
+    for(char** e = environ; *e; ++e) if(std::strncmp(*e, "OMP_NUM_THREADS=", 16) != 0) envStore.push_back(*e);
+    envStore.push_back("OMP_NUM_THREADS=" + std::to_string(threads));
+    std::vector<char*> envp;
+    for(auto& e : envStore) envp.push_back(const_cast<char*>(e.c_str()));
+    envp.push_back(nullptr);
+    const std::string logName = log.string();
+    std::printf("  $ (killed once %s exists) %s ...\n", watch.filename().string().c_str(), exe.c_str());
+    std::fflush(stdout);
+    pid_t pid = fork();
+    if(pid < 0){ check(false, std::string("fork failed: ") + std::strerror(errno)); return false; }
+    if(pid == 0){
+#ifdef __linux__
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
+        int fd = open(logName.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if(fd >= 0){ dup2(fd, 1); dup2(fd, 2); close(fd); }
+        execve(argv[0], argv.data(), envp.data());
+        _exit(127);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    int status = 0;
+    bool killed = false;
+    for(;;){
+        if(waitpid(pid, &status, WNOHANG) == pid) break;
+        std::error_code ec;
+        if(fs::exists(watch, ec) || std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() > gTimeout){
+            kill(pid, SIGKILL);
+            waitpid(pid, &status, 0);
+            killed = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return killed && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+}
+
+// Neither <out>/output.ims nor <out>/output.ims.partial.
+static void expectNoOutput(const fs::path& out){
+    check(!fs::exists(out/"output.ims"), "output.ims was left in " + out.string());
+    check(!fs::exists(out/"output.ims.partial"), "output.ims.partial was left in " + out.string());
+}
+
 // A run that cannot write its output: it must exit 1 with an error that says so, within gTimeout.
 static void expectWriteFailure(const std::string& what, const std::string& exe, const fs::path& in,
                                const fs::path& out, const std::vector<std::string>& extra,
@@ -202,6 +260,8 @@ static void expectWriteFailure(const std::string& what, const std::string& exe, 
     const std::string o = lower(r.output);
     check(o.find("error:") != std::string::npos && o.find("write") != std::string::npos,
           "no \"ERROR: ... write ...\" message in the output");
+    if(fs::is_directory(out/"output.ims")) check(!fs::exists(out/"output.ims.partial"), "output.ims.partial was left");
+    else expectNoOutput(out);
     std::printf("  exit %d after %.1f s\n%s", r.exitCode, r.seconds, tail(r.output).c_str());
     if(gFailures == before) std::printf("  OK\n");
 }
@@ -250,6 +310,9 @@ int main(int argc, char** argv){
     expectWriteFailure("8 MB file-size limit", exe, one, work/"out_limit", {}, kLimit, 0);
     expectWriteFailure("8 MB file-size limit, -C 64,64,64", exe, one, work/"out_limit_C", {"-C", "64,64,64"}, kLimit, 0);
     expectWriteFailure("8 MB file-size limit, two timepoints", exe, two, work/"out_limit_2t", {}, kLimit, 0);
+    gIgnoreXfsz = false;
+    expectWriteFailure("8 MB file-size limit, SIGXFSZ at its default", exe, one, work/"out_limit_sig", {}, kLimit, 0);
+    gIgnoreXfsz = true;
 
     // 2. limit one byte below the complete file; one thread, so that both runs write the same layout
     const uintmax_t full = expectSuccess("no limit, one thread", exe, one, work/"out_full1", {}, 1, {&v0});
@@ -262,6 +325,26 @@ int main(int argc, char** argv){
         const fs::path out = work/"out_isdir";
         fs::create_directories(out/"output.ims");
         expectWriteFailure("output.ims is a directory", exe, one, out, {}, 0, 0);
+    }
+
+    // 4. killed with SIGKILL while it writes: no output.ims; an earlier complete one is left as it was
+    {
+        std::printf("[SIGKILL while writing]\n");
+        const int before = gFailures;
+        const fs::path out = work/"out_killed";
+        fs::remove_all(out); fs::create_directories(out);
+        const fs::path ims = out/"output.ims", partial = out/"output.ims.partial";
+        check(runAndKill(exe, convertArgs(two, out, {}), out.string() + ".log", partial, 1), "the run ended before it could be killed");
+        check(!fs::exists(ims), "a killed run left output.ims");
+        check(fs::exists(partial), "a killed run left no output.ims.partial (expected: it is not removed)");
+        const RunResult next = run(exe, convertArgs(one, out, {}), out.string() + ".next.log", 0, 0);
+        check(next.exitCode == 0 && fs::exists(ims) && !fs::exists(partial), "the next run did not replace output.ims.partial by output.ims");
+        if(next.exitCode == 0 && fs::exists(ims)){
+            const std::string earlier = readText(ims);
+            check(runAndKill(exe, convertArgs(two, out, {}), out.string() + ".log2", partial, 1), "the second run ended before it could be killed");
+            check(readText(ims) == earlier, "a killed run changed the earlier output.ims");
+        }
+        if(gFailures == before) std::printf("  OK\n");
     }
 
     // The same inputs without a limit.

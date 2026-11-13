@@ -215,6 +215,7 @@ int main(int argc, char** argv){
     if(fs::exists(out)){
         compareFiles(ref, out, "series plan vs the single-node conversion");
         compareFiles(b4, out, "series plan vs the B-4 flow");
+        CHECK(run(E + " verify " + q(ref) + " " + q(b4) + " " + q(out)) == 0, "verify of the single-node file, the B-4 flow's and the series plan's");
     }
     CHECK(run(task(2, ""), &o, log) == 1 && has(o, "finished"), "a task after the finish");
     CHECK(run(E + " finish " + q(wd), &o, log) == 0 && has(o, "already finished"), "finishing again");
@@ -250,6 +251,7 @@ int main(int argc, char** argv){
     CHECK(run(E + " task " + q(wdt) + " level0 0", &o, log) == 0 && has(o, "already done"), "a done tile task was not skipped");
     CHECK(run(E + " finish " + q(wdt) + " --verify") == 0 && fs::exists(outT), "finish of the tile plan");
     if(fs::exists(outT)) compareFiles(ref, outT, "tile plan (mono store) vs the single-node conversion");
+    CHECK(run(E + " verify " + q(outT)) == 0, "verify of the tile plan's file (mono store)");
 
     std::printf("[tile plan] packs store\n");
     const fs::path wdp = work / "wd_packs", outP = work / "packs.ims";
@@ -260,6 +262,7 @@ int main(int argc, char** argv){
     CHECK(run(E + " status " + q(wdp), &o, log) == 0, "status of the done packs workdir");
     CHECK(run(E + " finish " + q(wdp) + " " + q(outP), &o, log) == 0 && has(o, "merged") && fs::exists(outP), "finish of the packs plan");
     if(fs::exists(outP)) compareFiles(ref, outP, "tile plan (packs store) vs the single-node conversion");
+    CHECK(run(E + " verify " + q(outP)) == 0, "verify of the tile plan's file (packs store)");
 
     // ---------------- setup workdirs: what is placed first decides ----------------
     std::printf("[setup workdir] parts until a tile worker marks it\n");

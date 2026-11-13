@@ -323,6 +323,7 @@ static bool monoStore(const std::string& exe, const fs::path& work, const fs::pa
     std::printf("[mono store] monitor (index the placed chunks)\n");
     if(!check(runCmd(E+" monitor "+q(wd)+" "+q(out)+" --verify") == 0 && fs::exists(out) && !fs::exists(partial), "monitor produced no .ims")) return false;
     ok &= compareTo(monoIms, out, "monolithic vs mono store");
+    check(runCmd(E+" verify "+q(out)) == 0, "verify of the single file");
     check(allHardLinks(out), "a link of the single file is not a hard link");
     ImsCompareReport deep; check(imsDeepCheck(out, deep, 2), "deep check of the single file");
 
@@ -471,6 +472,9 @@ static bool metadataCase(const std::string& exe, const fs::path& work){
     }
     if(runCmd(q(exe)+" linkparts "+q(wd)+" "+q(lp/"link.ims")+" parts") != 0){ std::printf("  FAIL: linkparts\n"); return false; }
     ok &= metaOk(lp/"link.ims", e, "linkparts: every DataSetInfo attribute");
+    // verify: monitor's file (packs store) and the two link files (through their parts) are complete
+    if(runCmd(q(exe)+" verify "+q(par)+" "+q(lk/"link.ims")+" "+q(lp/"link.ims")) != 0){
+        std::printf("  FAIL: verify of monitor's file (packs store), link's and linkparts' link files\n"); ok = false; }
 
 #ifndef _WIN32
     // the mono store with the same options, its tiles smaller than the volume: monitor's single file equals the
@@ -482,6 +486,7 @@ static bool metadataCase(const std::string& exe, const fs::path& work){
     ok &= noPacks(wdm/"chunks");
     ok &= metaOk(parm, e, "mono store: every DataSetInfo attribute");
     ok &= sameFile(md/"output.ims", parm, "the mono store's single file equals the converter's output (data, every attribute, /Thumbnail)");
+    if(runCmd(q(exe)+" verify "+q(parm)) != 0){ std::printf("  FAIL: verify of monitor's single file (mono store, 2 timepoints)\n"); ok = false; }
 #endif
     return ok;
 }

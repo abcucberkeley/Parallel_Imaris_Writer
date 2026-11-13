@@ -19,6 +19,8 @@
 //   imsReadAttribute(s) / imsReadHistogram / imsReadThumbnail / imsExists  -> small accessors for checks
 //   imsCheckDataSetInfo(file, expected, problems) -> every /DataSetInfo attribute against
 //                                              the expected metadata
+//   imsCopyDamaged(src, dst, ...)           -> a copy of a file with one chunk or one object
+//                                              left out (the tests of `verify`)
 //
 // Portable (Linux, macOS, Windows): std::thread and std::ifstream only, no pread or
 // OpenMP. Chunks are listed with one H5Dchunk_iter pass per dataset, never with
@@ -510,6 +512,53 @@ inline bool imsReadThumbnail(const std::filesystem::path& file, uint64_t& rows, 
     rows = dims[0]; rowBytes = dims[1];
     rgba.assign((size_t)(rows * rowBytes), 0);
     return rgba.empty() || H5Dread(d, H5T_NATIVE_UCHAR, H5S_ALL, H5S_ALL, H5P_DEFAULT, rgba.data()) >= 0;
+}
+
+namespace imsutil {
+// The LZ4 filter (32004) as a filter class that only lets a dataset with it be created: chunks are
+// copied raw (H5Dwrite_chunk), so it never runs (and fails if it does).
+inline size_t lz4CopyOnly(unsigned, size_t, const unsigned*, size_t, size_t*, void**){ return 0; }
+inline bool registerLz4CopyOnly(){
+    if(H5Zfilter_avail(32004) > 0) return true;
+    static const H5Z_class2_t cls = {H5Z_CLASS_T_VERS, (H5Z_filter_t)32004, 1, 1, "lz4 (raw copies only)", nullptr, nullptr, lz4CopyOnly};
+    return H5Zregister(&cls) >= 0;
+}
+} // namespace imsutil
+
+// A copy of src as a writer that stopped early could leave it: without the last stored chunk (in (z, y, x)
+// order) of the Data dataset of dropChunkGroup (e.g. imsutil::datasetGroup(0, 0, 0); empty: none), and
+// without the object dropObject (e.g. "/DataSetInfo/TimeInfo"; empty: none). The groups below the root are
+// copied with H5Ocopy, the one Data dataset chunk by chunk (raw); the root's attributes are not copied.
+inline bool imsCopyDamaged(const std::filesystem::path& src, const std::filesystem::path& dst, const std::string& dropChunkGroup,
+                           const std::string& dropObject, std::string& error){
+    using namespace imsutil;
+    if(!registerLz4CopyOnly()){ error = "cannot register the LZ4 filter class"; return false; }
+    Hid in = openFile(src);
+    if(!in.valid()){ error = "cannot open " + src.string(); return false; }
+    Hid out(H5Fcreate(dst.string().c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT), H5Fclose);
+    if(!out.valid()){ error = "cannot create " + dst.string(); return false; }
+    for(const std::string& name : childNames(in, "/")){
+        if(H5Ocopy(in, name.c_str(), out, name.c_str(), H5P_DEFAULT, H5P_DEFAULT) < 0){ error = "cannot copy /" + name; return false; }
+    }
+    if(!dropObject.empty() && H5Ldelete(out, dropObject.c_str(), H5P_DEFAULT) < 0){ error = "cannot remove " + dropObject; return false; }
+    if(dropChunkGroup.empty()) return true;
+    const std::string path = dropChunkGroup + "/Data";
+    Hid d(H5Dopen2(in, path.c_str(), H5P_DEFAULT), H5Dclose);
+    Hid type(H5Dget_type(d), H5Tclose), space(H5Dget_space(d), H5Sclose), dcpl(H5Dget_create_plist(d), H5Pclose);
+    std::vector<Chunk> chunks;
+    if(!d.valid() || !type.valid() || !space.valid() || !dcpl.valid() || !listChunks(d, chunks) || chunks.empty()){
+        error = "cannot read " + path; return false;
+    }
+    if(H5Ldelete(out, path.c_str(), H5P_DEFAULT) < 0){ error = "cannot remove the copy of " + path; return false; }
+    Hid nd(H5Dcreate2(out, path.c_str(), type, space, H5P_DEFAULT, dcpl, H5P_DEFAULT), H5Dclose);
+    if(!nd.valid()){ error = "cannot create " + path; return false; }
+    std::vector<uint8_t> raw;
+    for(size_t i = 0; i + 1 < chunks.size(); ++i){
+        if(!readRawChunk(d, chunks[i], raw) || H5Dwrite_chunk(nd, H5P_DEFAULT, chunks[i].mask, chunks[i].off, raw.size(), raw.data()) < 0){
+            error = "cannot copy a chunk of " + path; return false;
+        }
+    }
+    return true;
 }
 
 // ------------------------------------------------------------------------------------

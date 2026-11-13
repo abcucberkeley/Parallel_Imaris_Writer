@@ -22,6 +22,13 @@
 //     any output
 //   - bounding boxes: max == min, outside along Z only, outside a TIFF, inside the first time point
 //     but not the second (the message names that file)
+//   - fail-safe output (A-9): a failed conversion leaves an existing output.ims as it was and no
+//     output.ims.partial; --no-overwrite with an existing file exits 0 without converting (and
+//     converts when there is none); a conversion replaces an existing file; --no-verify
+//   - verify: a complete file (exit 0, one line), several files, -h, no file, a missing file, a text
+//     file, copies of a complete file without one chunk of a Data dataset, without
+//     /DataSetInfo/TimeInfo and without one (timepoint, channel) group (exit 1, one ERROR line each
+//     that names what is missing)
 //   - POSIX only: "~/" with HOME set for the child, an unreadable input folder and an unwritable
 //     output folder (skipped when running as root)
 // C stdio for file I/O (no iostreams, no std::filesystem copies: see failtest.cpp). The executable
@@ -578,6 +585,69 @@ int main(int argc, char** argv){
         writeZarr(bs/"CamA_t0001.zarr", {40, 30, 10}, 1);
         expectError("-B inside the first time point only", {"-r", "zarr", "-F", native(bs), "-P", "CamA", "-o", native(out),
                     "-B", "0,0,0,20,20,15"}, "does not fit in " + native(bs/"CamA_t0001.zarr") + " (40x30x10)", outIms);
+    }
+
+    std::printf("[fail-safe output]\n");
+    {
+        const fs::path fo = work/"out_failsafe", fIms = fo/"output.ims", fPartial = fo/"output.ims.partial";
+        auto args = [&](const fs::path& in, const fs::path& o, std::vector<std::string> extra){
+            std::vector<std::string> a = {"-r", "zarr", "-F", native(in), "-P", "CamA", "-o", native(o)};
+            a.insert(a.end(), extra.begin(), extra.end());
+            return a;
+        };
+        writeText(fIms, "old");
+        const RunResult bad = run(args(work/"corrupt", fo, {}));
+        check(bad.exitCode == 1 && countErrorLines(bad.err) == 1 && readText(fIms) == "old" && !fs::exists(fPartial),
+              "a failed conversion leaves an existing output.ims as it was and no output.ims.partial (exit " +
+              std::to_string(bad.exitCode) + ")");
+        const RunResult skip = run(args(plain, fo, {"--no-overwrite"}));
+        check(skip.exitCode == 0 && skip.out.find("not converting (--no-overwrite)") != std::string::npos && skip.err.empty() &&
+              readText(fIms) == "old" && !fs::exists(fPartial), "--no-overwrite with an existing output.ims: exit 0, nothing written (exit " +
+              std::to_string(skip.exitCode) + ", \"" + firstLines(skip.out) + "\")");
+        expectOk("a conversion replaces an existing output.ims", args(plain, fo, {}), fIms, d, {0});
+        check(!fs::exists(fPartial), "no output.ims.partial after a conversion");
+        expectOk("--no-overwrite without an existing output.ims converts", args(plain, work/"out_nooverwrite", {"--no-overwrite"}),
+                 work/"out_nooverwrite"/"output.ims", d, {0});
+        expectOk("--no-verify", args(plain, work/"out_noverify", {"--no-verify"}), work/"out_noverify"/"output.ims", d, {0});
+    }
+
+    std::printf("[verify]\n");
+    {
+        // a complete file with two time points and two channels
+        const fs::path vin = work/"verify_in", vo = work/"out_verify", good = vo/"output.ims";
+        for(int t = 0; t < 2; ++t){
+            writeZarr(vin/("CamA_t000" + std::to_string(t) + ".zarr"), d, t);
+            writeZarr(vin/("CamB_t000" + std::to_string(t) + ".zarr"), d, t + 2);
+        }
+        const RunResult made = run({"-r", "zarr", "-F", native(vin), "-P", "CamA,CamB", "-o", native(vo)});
+        check(made.exitCode == 0 && fs::exists(good), "the file to verify (exit " + std::to_string(made.exitCode) + ")");
+        RunResult r = run({"verify", native(good)});
+        check(r.exitCode == 0 && r.out.find(": complete: 40x30x20 uint16, 2 time point(s) x 2 channel(s) x 1 level(s), ") != std::string::npos &&
+              r.err.empty(), "verify of a complete file: exit 0, one line (\"" + firstLines(r.out) + firstLines(r.err) + "\")");
+        r = run({"verify", "-h"});
+        check(r.exitCode == 0 && r.out.find("usage: parallelimariswriter verify") != std::string::npos, "verify -h: usage, exit 0");
+        expectError("verify without a file", {"verify"}, "verify needs at least one file");
+        expectError("verify of a missing file", {"verify", native(vo/"missing.ims")}, "does not exist");
+        writeText(vo/"text.ims", "not an HDF5 file");
+        expectError("verify of a text file", {"verify", native(vo/"text.ims")}, "as an HDF5 file");
+        struct Damage { std::string what, chunkGroup, object, want; };
+        const std::vector<Damage> damages = {
+            {"one chunk left out", "/DataSet/ResolutionLevel 0/TimePoint 1/Channel 1", "",
+             "/DataSet/ResolutionLevel 0/TimePoint 1/Channel 1/Data holds "},
+            {"no /DataSetInfo/TimeInfo", "", "/DataSetInfo/TimeInfo", "FileTimePoints"},
+            {"no (timepoint 1, channel 0) group", "", "/DataSet/ResolutionLevel 0/TimePoint 1/Channel 0",
+             "no /DataSet/ResolutionLevel 0/TimePoint 1/Channel 0/Data"},
+        };
+        int k = 0;
+        for(const Damage& dm : damages){
+            const fs::path bad = vo/("damaged" + std::to_string(k++) + ".ims");
+            std::string err;
+            check(imsCopyDamaged(good, bad, dm.chunkGroup, dm.object, err), "a copy " + dm.what + " (" + err + ")");
+            expectError("verify of a copy with " + dm.what, {"verify", native(bad)}, dm.want);
+        }
+        r = run({"verify", native(good), native(vo/"damaged0.ims")});
+        check(r.exitCode == 1 && countErrorLines(r.err) == 1 && r.out.find(": complete: ") != std::string::npos,
+              "verify of a complete and a damaged file: one line, one ERROR line, exit 1 (exit " + std::to_string(r.exitCode) + ")");
     }
 
 #ifndef _WIN32

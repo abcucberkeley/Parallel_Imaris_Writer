@@ -18,6 +18,11 @@
 //   - the early writeback (Linux): its helper thread runs while a file is written and is gone, with its
 //     descriptor of the output, when the call returns -- after the file is written, a cancel, a failed
 //     read and a failed write; the timing callback (once, only for a written file) and PIW_TIMING=1
+//   - fail-safe output (A-9): the file is written as <name>.partial and gets its name only when complete and
+//     checked; after a cancel or a failed read an existing file of that name is left as it was, a complete
+//     write replaces it, verify = false skips the check, a folder of that name is refused before any work;
+//     piw::verifyIms on a complete file (its size, counts and chunks), a missing file and a file that is
+//     not HDF5
 //   - two conversions one after the other, two at once from two threads, numThreads (and the
 //     caller's OpenMP setting restored), piw::runCli twice in one process
 //   - metadata (A-10): every /DataSetInfo attribute with the defaults (names "Channel c", R/G/B,
@@ -1318,7 +1323,7 @@ struct Timed {
     int sleepMs = 0;           // per poll, so that the conversion lasts long enough for the helper to run
     bool sawHelper = false;
     int timingCalls = 0;
-    double read = -1, feed = -1, finish = -1;
+    double read = -1, feed = -1, finish = -1, verify = -1;
 };
 
 #if defined(__linux__)
@@ -1357,9 +1362,9 @@ static int onTimedCancel(void* user){
     if(helperThreads() > 0) t->sawHelper = true;
     return t->cancelAt > 0 && n >= t->cancelAt;
 }
-static void onTiming(double read, double feed, double finish, void* user){
+static void onTiming(double read, double feed, double finish, double verify, void* user){
     Timed* t = (Timed*)user;
-    ++t->timingCalls; t->read = read; t->feed = feed; t->finish = finish;
+    ++t->timingCalls; t->read = read; t->feed = feed; t->finish = finish; t->verify = verify;
 }
 static piw::Callbacks timedCallbacks(Timed& t){
     piw::Callbacks cb;
@@ -1382,15 +1387,18 @@ static void writebackTests(const std::string& exe, const fs::path& work, const f
     // the call returned: no descriptor of the output, and no helper thread. join() returns when the kernel
     // clears the thread's id, a moment before the thread leaves /proc/self/task: a joined thread is gone
     // within that wait, a helper that was not stopped would still be listed (it runs until stopped).
+    // The file is written as <out>.partial: no descriptor of either name, and no partial file left.
     auto released = [&](const fs::path& out){
-        const int fds = openDescriptors(out);
+        const fs::path partial = out.string() + ".partial";
+        const int fds = openDescriptors(out) + openDescriptors(partial);
         int threads = helperThreads();
         for(int i = 0; i < 100 && threads; ++i){
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             threads = helperThreads();
         }
         return std::string(threads ? std::to_string(threads) + " helper thread(s) left; " : "") +
-               (fds ? std::to_string(fds) + " descriptor(s) of the output left" : "");
+               (fds ? std::to_string(fds) + " descriptor(s) of the output left; " : "") +
+               (fs::exists(partial) ? "the partial file is left" : "");
     };
     {
         const fs::path out = work/"wb_written.ims";
@@ -1400,8 +1408,9 @@ static void writebackTests(const std::string& exe, const fs::path& work, const f
         check(s.ok() && fs::exists(out) && infoOf(out).datasets.size() > 1, "written: ok, a complete file (" + s.message + ")");
         check(!onLinux || t.sawHelper, "written: the helper thread ran while the file was written");
         check(left.empty(), "written: the helper is joined and its descriptor closed when the call returns " + left);
-        check(t.timingCalls == 1 && t.read == 0 && t.feed >= 1.2 && t.finish >= 0 && t.finish < 60,
+        check(t.timingCalls == 1 && t.read == 0 && t.feed >= 1.2 && t.finish >= 0 && t.finish < 60 && t.verify >= 0 && t.verify < 60,
               "written: the timing callback once (read " + std::to_string(t.read) + " s, feed " + std::to_string(t.feed) +
+              " s, verify " + std::to_string(t.verify) +
               " s, finish " + std::to_string(t.finish) + " s)");
         fs::remove(out);
     }
@@ -1468,10 +1477,73 @@ static void writebackTests(const std::string& exe, const fs::path& work, const f
         const std::string withTiming = readText(work/"wb_cli_timing.log");
         const int rc2 = runExe(exe, args, work/"wb_cli_plain.log");
         const std::string plain = readText(work/"wb_cli_plain.log");
-        check(rc == 0 && countLines(withTiming, "Timing: read ") == 1 && withTiming.find(" s, finish and close ") != std::string::npos,
-              "PIW_TIMING=1: one timing line");
+        check(rc == 0 && countLines(withTiming, "Timing: read ") == 1 && withTiming.find(" s, finish and close ") != std::string::npos &&
+              withTiming.find(" s, verify ") != std::string::npos, "PIW_TIMING=1: one timing line");
         check(rc2 == 0 && plain.find("Timing:") == std::string::npos, "without PIW_TIMING: no timing line");
         fs::remove_all(od);
+    }
+}
+
+// --- Fail-safe output (A-9): <name>.partial until the file is complete and checked ---
+static void failSafeTests(const fs::path& work, const fs::path& zdir, const fs::path& trunc){
+    std::printf("[fail-safe output]\n");
+    const Dims d = {150, 90, 40};
+    const std::vector<uint16_t> v = makeTyped<uint16_t>(d, 5);
+    piw::Volume vol; vol.data = v.data(); vol.stride[0] = 1; vol.stride[1] = (int64_t)d.x; vol.stride[2] = (int64_t)(d.x*d.y);
+    const fs::path out = work/"fs_out.ims", partial = work/"fs_out.ims.partial";
+    { std::ofstream(out) << "keep"; }
+    {
+        Recorder rec; rec.cancelOnPoll = 1;
+        const piw::Status s = piw::writeVolumes(writeOptions(out, piw::DataType::UInt16, d), {vol}, callbacksFor(rec));
+        check(s.code == piw::Code::Cancelled && readText(out) == "keep" && !fs::exists(partial),
+              "cancel: the existing file is left as it was, no partial file (" + s.message + ")");
+        Recorder readRec;
+        const piw::Status r = piw::convert(optionsFor("zarr", findFiles(trunc, {"CamA"}), out, ""), callbacksFor(readRec));
+        check(r.code == piw::Code::ReadFailed && readText(out) == "keep" && !fs::exists(partial),
+              "failed read: the existing file is left as it was, no partial file (" + r.message + ")");
+    }
+    {
+        Recorder rec;
+        const piw::Status s = piw::writeVolumes(writeOptions(out, piw::DataType::UInt16, d), {vol}, callbacksFor(rec));
+        piw::ImsVerifyResult r;
+        const piw::Status vs = piw::verifyIms(native(out), &r);
+        check(s.ok() && !fs::exists(partial) && vs.ok() && r.size[0] == d.x && r.size[1] == d.y && r.size[2] == d.z &&
+              r.dataType == piw::DataType::UInt16 && r.timepoints == 1 && r.channels == 1 && r.levels == infoOf(out, false).levels &&
+              r.chunks > 0, "written: the file replaces the existing one, verifyIms finds it complete (" + s.message + vs.message + ")");
+        std::uint64_t chunks = 0;
+        for(const piw::ImsDataset& ds : infoOf(out, false).datasets) chunks += ds.chunks;
+        check(r.chunks == chunks, "verifyIms counts every chunk (" + std::to_string(r.chunks) + " of " + std::to_string(chunks) + ")");
+    }
+    {
+        Recorder rec;
+        piw::WriteOptions o = writeOptions(work/"fs_noverify.ims", piw::DataType::UInt8, d);
+        o.verify = false;
+        const std::vector<uint8_t> v8 = makeTyped<uint8_t>(d, 6);
+        piw::Volume v8v = vol; v8v.data = v8.data();
+        const piw::Status s = piw::writeVolumes(o, {v8v}, callbacksFor(rec));
+        check(s.ok() && piw::verifyIms(native(work/"fs_noverify.ims")).ok() && !fs::exists(work/"fs_noverify.ims.partial"),
+              "verify = false: written and renamed (" + s.message + ")");
+        piw::ConvertOptions c = optionsFor("zarr", findFiles(zdir, {"CamA"}), work/"fs_noverify2.ims", "");
+        c.verify = false;
+        const piw::Status cs = piw::convert(c, callbacksFor(rec));
+        check(cs.ok() && piw::verifyIms(native(work/"fs_noverify2.ims")).ok(), "convert with verify = false (" + cs.message + ")");
+    }
+    {
+        const fs::path dir = work/"fs_dir.ims";
+        fs::create_directories(dir);
+        Recorder rec;
+        const piw::Status s = piw::writeVolumes(writeOptions(dir, piw::DataType::UInt16, d), {vol}, callbacksFor(rec));
+        const piw::Status c = piw::convert(optionsFor("zarr", findFiles(zdir, {"CamA"}), dir, ""), callbacksFor(rec));
+        check(s.code == piw::Code::WriteFailed && c.code == piw::Code::WriteFailed && rec.polls == 0 && fs::is_directory(dir) &&
+              !fs::exists(dir.string() + ".partial"), "a folder of the output's name: WriteFailed before any work (" + s.message + ")");
+    }
+    {
+        piw::ImsVerifyResult r;
+        const piw::Status missing = piw::verifyIms(native(work/"fs_missing.ims"), &r);
+        { std::ofstream(work/"fs_text.ims") << "not an hdf5 file"; }
+        const piw::Status text = piw::verifyIms(native(work/"fs_text.ims"), &r);
+        check(missing.code == piw::Code::NotFound && text.code == piw::Code::ReadFailed && r.levels == 0,
+              "verifyIms: a missing file NotFound, a text file ReadFailed (" + missing.message + "; " + text.message + ")");
     }
 }
 
@@ -1628,6 +1700,7 @@ int main(int argc, char** argv){
     }
     destroyTests(work, 5);
     writebackTests(exe, work, zdir, trunc);
+    failSafeTests(work, zdir, trunc);
 
     // --- 4. calls in sequence, at once, with numThreads; runCli twice ---
     std::printf("[calls]\n");

@@ -1,4 +1,5 @@
-// Reading back .ims files: piw::imsInfo, piw::imsDataset and piw::readIms (src/parallelimariswriter.h).
+// Reading back .ims files: piw::imsInfo, piw::imsDataset, piw::readIms and piw::verifyIms
+// (src/parallelimariswriter.h).
 //
 // An Imaris 5.5 .ims file is HDF5: /DataSet/ResolutionLevel l/TimePoint t/Channel c holds a
 // chunked 3-D Data dataset (dims z, y, x) next to its Histogram datasets, and /DataSetInfo holds
@@ -8,9 +9,12 @@
 // filter needs to be registered. Raw reads are serial; decoding runs in an OpenMP loop.
 // Like the rest of the core: no printing (HDF5's error stack is silenced for each call), no exit,
 // errors come back as a Status, and every call holds the library mutex (HDF5 here is not
-// thread-safe).
+// thread-safe). verifyIms opens the file through a read-only driver that prefetches the nodes of
+// the chunk indexes (Prefetch, below).
 #include "parallelimariswriter.h"
+#include "imscore.h"     // GetOptimalImagePyramid: the levels ImarisWriter makes
 #include "hdf5.h"
+#include "H5FDdevelop.h"
 #include <lz4.h>
 #include <zlib.h>
 #include <omp.h>
@@ -19,15 +23,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 #include <algorithm>
+#include <climits>
+#include <condition_variable>
+#include <deque>
 #include <exception>
+#include <map>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
 namespace piw {
 namespace detail {
 std::mutex& libraryMutex();   // src/converter.cpp
+Status verifyImsLocked(const std::string& aFile, ImsVerifyResult& aResult);
 }
 
 namespace {
@@ -89,10 +106,274 @@ bool pathExists(hid_t aFile, const std::string& aPath){
     return H5Oexists_by_name(aFile, aPath.c_str(), H5P_DEFAULT) > 0;
 }
 
-Status openFile(const std::string& aFile, Hid& aId){
+// Prefetch: a read-only HDF5 file driver (POSIX pread) that reads the nodes of chunk indexes ahead,
+// in parallel. Counting the chunks of a dataset (H5Dget_num_chunks) walks its v1 B-tree one node
+// at a time, and on a network file system every node read waits for a round trip (a 43 GB
+// uint16 file has about 2900 nodes: 1.4 s, of which 0.06 s is CPU time; with this driver 0.2 s,
+// 16 reads at a time). When HDF5 reads a
+// B-tree node of an inner level of a chunk index, this driver queues its children, and helper
+// threads read them (and the children of inner ones) while HDF5 is still working through earlier
+// nodes; HDF5's later reads of those nodes are then served from memory. What is read ahead are
+// plain file bytes at the addresses HDF5 will ask for, so the decoding below only decides what to
+// read ahead: a node it misreads costs one wasted read, never wrong data. At most kPrefetchBytes
+// are held at once (beyond that, nodes are left to HDF5's own reads). Not on Windows (there the
+// default driver is used).
+// On an NFS mount (Linux) the file is read with O_DIRECT. A file this node has just written is
+// still in its page cache, and the NFS client drops all of those pages before the first buffered
+// read after the writer closed the file (3.5 s for 43 GB, whatever is read); direct reads leave
+// them to be dropped later, by the kernel or by the next reader, as without the check.
+#ifndef _WIN32
+const size_t kPrefetchThreads = 16;
+const size_t kPrefetchBytes = (size_t)128 << 20;
+
+// The read-ahead state of one open file.
+struct Prefetcher {
+    enum State { Queued, Reading, Ready };
+    struct Entry { State state; std::vector<char> bytes; };
+    int fd = -1;
+    haddr_t eoa = 0, eof = 0;
+    dev_t dev = 0;
+    ino_t ino = 0;
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::map<haddr_t, Entry> entries;                    // by address; the queue holds the Queued ones
+    std::deque<std::pair<haddr_t, size_t> > queue;
+    size_t held = 0;                                     // bytes of Reading and Ready entries
+    bool stop = false;
+    std::vector<std::thread> threads;
+};
+struct PrefetchFile {
+    H5FD_t pub;                                          // first: HDF5 casts between the two
+    Prefetcher* p;
+};
+Prefetcher& stateOf(const H5FD_t* aFile){ return *((const PrefetchFile*)aFile)->p; }
+
+bool preadAll(int aFd, char* aBuffer, size_t aSize, haddr_t aAddress){
+    size_t vGot = 0;
+    while(vGot < aSize){
+        const ssize_t k = pread(aFd, aBuffer + vGot, aSize - vGot, (off_t)(aAddress + vGot));
+        if(k < 0 && errno == EINTR) continue;
+        if(k < 0) return false;
+        if(k == 0) break;
+        vGot += (size_t)k;
+    }
+    if(vGot < aSize) memset(aBuffer + vGot, 0, aSize - vGot);   // past the end reads as zeros, like sec2
+    return true;
+}
+
+void prefetchWorker(Prefetcher* aState);
+
+// A node of a chunk index ("TREE", node type 1) of an inner level: queues its children, which are
+// nodes of the same size. The node: signature, type, level, entries used (2 bytes), two sibling
+// addresses, then key, child, key, ..., key; with 8-byte addresses a key of a 3-D dataset's index
+// is 40 bytes (chunk size, filter mask, 4 offsets), so a node of 2K entries is 96 K + 64 bytes (no
+// other rank gives such a size). Called with the mutex held.
+void queueChildren(Prefetcher& aState, const char* aNode, size_t aSize){
+    if(aSize < 64 || (aSize - 64) % 96 || memcmp(aNode, "TREE", 4) || aNode[4] != 1 || aNode[5] == 0) return;
+    const size_t vCapacity = 2*((aSize - 64)/96);
+    const size_t vUsed = (unsigned char)aNode[6] | (size_t)(unsigned char)aNode[7] << 8;
+    if(!vUsed || vUsed > vCapacity) return;
+    bool vQueued = false;
+    for(size_t i = 0; i < vUsed; ++i){
+        const unsigned char* vChild = (const unsigned char*)aNode + 24 + 40*(i + 1) + 8*i;
+        haddr_t vAddress = 0;
+        for(int b = 7; b >= 0; --b) vAddress = vAddress << 8 | vChild[b];
+        if(!vAddress || vAddress >= aState.eof || aSize > aState.eof - vAddress) return;   // not what it seemed
+        if(aState.entries.count(vAddress)) continue;
+        aState.entries[vAddress].state = Prefetcher::Queued;
+        aState.queue.push_back(std::make_pair(vAddress, aSize));
+        vQueued = true;
+    }
+    if(!vQueued) return;
+    try{
+        while(aState.threads.size() < kPrefetchThreads) aState.threads.push_back(std::thread(prefetchWorker, &aState));
+    }
+    catch(...){}   // fewer helpers (with none, HDF5 reads every node itself)
+    aState.changed.notify_all();
+}
+
+void prefetchWorker(Prefetcher* aState){
+    Prefetcher& s = *aState;
+    std::unique_lock<std::mutex> vLock(s.mutex);
+    for(;;){
+        s.changed.wait(vLock, [&s]{ return s.stop || !s.queue.empty(); });
+        if(s.stop) return;
+        const haddr_t vAddress = s.queue.front().first;
+        const size_t vSize = s.queue.front().second;
+        s.queue.pop_front();
+        std::map<haddr_t, Prefetcher::Entry>::iterator it = s.entries.find(vAddress);
+        if(it == s.entries.end() || it->second.state != Prefetcher::Queued) continue;   // HDF5 read it itself
+        if(s.held + vSize > kPrefetchBytes){ s.entries.erase(it); continue; }
+        try{
+            std::vector<char> vBytes(vSize);
+            it->second.state = Prefetcher::Reading;
+            s.held += vSize;
+            vLock.unlock();
+            const bool vRead = preadAll(s.fd, vBytes.data(), vSize, vAddress);
+            vLock.lock();
+            it = s.entries.find(vAddress);               // still there: only this thread removes a Reading entry
+            if(vRead){
+                it->second.bytes.swap(vBytes);
+                it->second.state = Prefetcher::Ready;
+                queueChildren(s, it->second.bytes.data(), vSize);
+            }
+            else{
+                s.held -= vSize;
+                s.entries.erase(it);
+            }
+        }
+        catch(...){                                      // out of memory: HDF5 reads that node itself
+            if(!vLock.owns_lock()) vLock.lock();
+            it = s.entries.find(vAddress);
+            if(it != s.entries.end() && it->second.state != Prefetcher::Queued){
+                s.held -= it->second.state == Prefetcher::Ready ? it->second.bytes.size() : vSize;
+                s.entries.erase(it);
+            }
+        }
+        s.changed.notify_all();
+    }
+}
+
+H5FD_t* prefetchOpen(const char* aName, unsigned aFlags, hid_t, haddr_t){
+    if(aFlags & (H5F_ACC_RDWR | H5F_ACC_TRUNC | H5F_ACC_CREAT | H5F_ACC_EXCL)) return NULL;   // read-only
+    const int vFd = open(aName, O_RDONLY);
+    if(vFd < 0) return NULL;
+    #if defined(__linux__)
+    struct statfs vFs;
+    const long kNfs = 0x6969;   // NFS_SUPER_MAGIC
+    if(fstatfs(vFd, &vFs) == 0 && (long)vFs.f_type == kNfs){
+        const int vFlags = fcntl(vFd, F_GETFL);
+        if(vFlags != -1) fcntl(vFd, F_SETFL, vFlags | O_DIRECT);   // if refused: buffered reads
+    }
+    #endif
+    struct stat vInfo;
+    PrefetchFile* vFile = NULL;
+    try{
+        if(fstat(vFd, &vInfo) < 0) throw 0;
+        vFile = (PrefetchFile*)calloc(1, sizeof(PrefetchFile));
+        if(!vFile) throw 0;
+        vFile->p = new Prefetcher();
+    }
+    catch(...){ free(vFile); close(vFd); return NULL; }
+    Prefetcher& s = *vFile->p;
+    s.fd = vFd;
+    s.eof = (haddr_t)vInfo.st_size;
+    s.dev = vInfo.st_dev;
+    s.ino = vInfo.st_ino;
+    return &vFile->pub;
+}
+
+herr_t prefetchClose(H5FD_t* aFile){
+    PrefetchFile* vFile = (PrefetchFile*)aFile;
+    Prefetcher* vState = vFile->p;
+    {
+        std::lock_guard<std::mutex> vLock(vState->mutex);
+        vState->stop = true;
+    }
+    vState->changed.notify_all();
+    for(size_t i = 0; i < vState->threads.size(); ++i) vState->threads[i].join();
+    const int vClosed = close(vState->fd);
+    delete vState;
+    free(vFile);
+    return vClosed == 0 ? 0 : -1;
+}
+
+int prefetchCmp(const H5FD_t* aA, const H5FD_t* aB){
+    const Prefetcher& a = stateOf(aA);
+    const Prefetcher& b = stateOf(aB);
+    if(a.dev != b.dev) return a.dev < b.dev ? -1 : 1;
+    if(a.ino != b.ino) return a.ino < b.ino ? -1 : 1;
+    return 0;
+}
+
+herr_t prefetchQuery(const H5FD_t*, unsigned long* aFlags){
+    if(aFlags) *aFlags = H5FD_FEAT_AGGREGATE_METADATA | H5FD_FEAT_DATA_SIEVE | H5FD_FEAT_DEFAULT_VFD_COMPATIBLE;
+    return 0;
+}
+
+haddr_t prefetchGetEoa(const H5FD_t* aFile, H5FD_mem_t){ return stateOf(aFile).eoa; }
+herr_t prefetchSetEoa(H5FD_t* aFile, H5FD_mem_t, haddr_t aAddress){ stateOf(aFile).eoa = aAddress; return 0; }
+haddr_t prefetchGetEof(const H5FD_t* aFile, H5FD_mem_t){ return stateOf(aFile).eof; }
+
+herr_t prefetchRead(H5FD_t* aFile, H5FD_mem_t aType, hid_t, haddr_t aAddress, size_t aSize, void* aBuffer){
+    Prefetcher& s = stateOf(aFile);
+    try{
+        std::unique_lock<std::mutex> vLock(s.mutex);
+        std::map<haddr_t, Prefetcher::Entry>::iterator it = s.entries.find(aAddress);
+        if(it != s.entries.end() && it->second.state == Prefetcher::Reading){
+            s.changed.wait(vLock, [&]{
+                it = s.entries.find(aAddress);
+                return it == s.entries.end() || it->second.state != Prefetcher::Reading; });
+        }
+        if(it != s.entries.end() && it->second.state == Prefetcher::Ready && it->second.bytes.size() == aSize){
+            memcpy(aBuffer, it->second.bytes.data(), aSize);
+            s.held -= aSize;
+            s.entries.erase(it);
+            return 0;
+        }
+        if(it != s.entries.end()){                       // queued (or read with another size): read here instead
+            if(it->second.state == Prefetcher::Ready) s.held -= it->second.bytes.size();
+            s.entries.erase(it);
+        }
+        vLock.unlock();
+        if(!preadAll(s.fd, (char*)aBuffer, aSize, aAddress)) return -1;
+        if(aType == H5FD_MEM_BTREE){
+            vLock.lock();
+            queueChildren(s, (const char*)aBuffer, aSize);
+        }
+        return 0;
+    }
+    catch(...){ return -1; }
+}
+
+herr_t prefetchWrite(H5FD_t*, H5FD_mem_t, hid_t, haddr_t, size_t, const void*){ return -1; }   // read-only
+herr_t prefetchLock(H5FD_t*, hbool_t){ return 0; }
+herr_t prefetchUnlock(H5FD_t*){ return 0; }
+
+hid_t prefetchDriver(){
+    static hid_t vId = H5I_INVALID_HID;
+    if(vId >= 0 && H5Iis_valid(vId) > 0) return vId;
+    static H5FD_class_t vClass;
+    memset(&vClass, 0, sizeof vClass);
+    vClass.version = H5FD_CLASS_VERSION;
+    vClass.value = (H5FD_class_value_t)302;   // 256-511: drivers that are not registered with The HDF Group
+    vClass.name = "piw_prefetch";
+    vClass.maxaddr = (haddr_t)INT64_MAX;
+    vClass.fc_degree = H5F_CLOSE_WEAK;
+    vClass.open = prefetchOpen;
+    vClass.close = prefetchClose;
+    vClass.cmp = prefetchCmp;
+    vClass.query = prefetchQuery;
+    vClass.get_eoa = prefetchGetEoa;
+    vClass.set_eoa = prefetchSetEoa;
+    vClass.get_eof = prefetchGetEof;
+    vClass.read = prefetchRead;
+    vClass.write = prefetchWrite;
+    vClass.lock = prefetchLock;
+    vClass.unlock = prefetchUnlock;
+    const H5FD_mem_t vMap[H5FD_MEM_NTYPES] = H5FD_FLMAP_DICHOTOMY;
+    memcpy(vClass.fl_map, vMap, sizeof vMap);
+    vId = H5FDregister(&vClass);
+    return vId;
+}
+#endif
+
+// aPrefetch: through the Prefetch driver (POSIX), else HDF5's default one. External links (a link
+// file's parts) are opened with the same driver.
+Status openFile(const std::string& aFile, Hid& aId, bool aPrefetch = false){
     struct stat vInfo;
     if(stat(aFile.c_str(), &vInfo) != 0) return Status(Code::NotFound, aFile + " does not exist.");
-    hid_t vId = H5Fopen(aFile.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+    Hid vFapl;
+    #ifndef _WIN32
+    if(aPrefetch){
+        const hid_t vDriver = prefetchDriver();
+        vFapl.reset(H5Pcreate(H5P_FILE_ACCESS), H5Pclose);
+        if(vDriver < 0 || !vFapl.valid() || H5Pset_driver(vFapl, vDriver, NULL) < 0) vFapl.reset(-1, NULL);
+    }
+    #else
+    (void)aPrefetch;
+    #endif
+    hid_t vId = H5Fopen(aFile.c_str(), H5F_ACC_RDONLY, vFapl.valid() ? (hid_t)vFapl : H5P_DEFAULT);
     if(vId < 0) return Status(Code::ReadFailed, "could not open " + aFile + " as an HDF5 file");
     aId.reset(vId, H5Fclose);
     return Status();
@@ -586,6 +867,123 @@ Status infoLocked(const std::string& aFile, ImsInfo& aInfo, bool aChecksums){
     return Status();
 }
 
+// A whole number written as digits only (an attribute's text).
+bool wholeNumber(const std::string& aText, uint64_t& aValue){
+    if(aText.empty() || aText.size() > 19 || aText.find_first_not_of("0123456789") != std::string::npos) return false;
+    aValue = strtoull(aText.c_str(), NULL, 10);
+    return true;
+}
+
+std::string sizeText(const uint64_t aSize[3]){
+    return std::to_string(aSize[0]) + "x" + std::to_string(aSize[1]) + "x" + std::to_string(aSize[2]);
+}
+
+// verifyIms with the library mutex held. Every message names the file and the first object that
+// is wrong.
+Status verifyLocked(const std::string& aFile, ImsVerifyResult& aResult){
+    Hid vFile;
+    Status vStatus = openFile(aFile, vFile, true);
+    if(!vStatus.ok()) return vStatus;
+    const std::string vPrefix = aFile + ": ";
+    auto bad = [&](const std::string& aWhy){ return Status(Code::ReadFailed, vPrefix + aWhy); };
+    ImsVerifyResult vResult;
+
+    // What the metadata says (written when the file is finished).
+    static const char* const kAxes[3] = {"X", "Y", "Z"};
+    for(int i = 0; i < 3; ++i){
+        const std::string vText = objectAttribute(vFile, "/DataSetInfo/Image", kAxes[i]);
+        if(!wholeNumber(vText, vResult.size[i]) || !vResult.size[i] || vResult.size[i] > UINT_MAX){
+            return bad(std::string("no usable /DataSetInfo/Image ") + kAxes[i] + " (the file was not finished)");
+        }
+    }
+    std::string vTimes = objectAttribute(vFile, "/DataSetInfo/TimeInfo", "FileTimePoints");
+    if(vTimes.empty()) vTimes = objectAttribute(vFile, "/DataSetInfo/TimeInfo", "DatasetTimePoints");
+    uint64_t vTimepoints = 0;
+    if(!wholeNumber(vTimes, vTimepoints) || !vTimepoints || vTimepoints > UINT_MAX){
+        return bad("no usable /DataSetInfo/TimeInfo FileTimePoints (the file was not finished)");
+    }
+    vResult.timepoints = (unsigned)vTimepoints;
+    vResult.channels = countNumbered(vFile, "/DataSetInfo", "Channel ");
+    if(!vResult.channels) return bad("no /DataSetInfo/Channel 0 (the file was not finished)");
+
+    // Level 0's sample type, and the pyramid ImarisWriter makes of that size and type.
+    const std::string vFirst = datasetGroup(0, 0, 0) + "/Data";
+    if(!pathExists(vFile, vFirst)) return bad("no " + vFirst);
+    {
+        Hid vData(H5Dopen2(vFile, vFirst.c_str(), H5P_DEFAULT), H5Dclose);
+        if(!vData.valid()) return bad("cannot open " + vFirst);
+        vStatus = dataTypeOf(vData, vFirst, vResult.dataType);
+        if(!vStatus.ok()) return Status(vStatus.code, vPrefix + vStatus.message);
+    }
+    const std::vector<imscore::Vec3> vLevels = imscore::GetOptimalImagePyramid(
+        (1024*1024)/dataTypeBytes(vResult.dataType), {vResult.size[0], vResult.size[1], vResult.size[2]}, true);
+    vResult.levels = (unsigned)vLevels.size();
+    const std::string vImage = sizeText(vResult.size) + " " + dataTypeName(vResult.dataType) + " image";
+
+    // Exactly those levels, time points and channels.
+    if(pathExists(vFile, "/DataSet/ResolutionLevel " + std::to_string(vResult.levels))){
+        return bad("more resolution levels than the " + std::to_string(vResult.levels) + " of a " + vImage);
+    }
+    for(unsigned vL = 0; vL < vResult.levels; ++vL){
+        const std::string vLevel = "/DataSet/ResolutionLevel " + std::to_string(vL);
+        if(!pathExists(vFile, vLevel)) return bad("no " + vLevel + " (a " + vImage + " has " + std::to_string(vResult.levels) + " levels)");
+        if(pathExists(vFile, vLevel + "/TimePoint " + std::to_string(vResult.timepoints))){
+            return bad(vLevel + " has more time points than the " + std::to_string(vResult.timepoints) + " of /DataSetInfo/TimeInfo");
+        }
+        for(unsigned vT = 0; vT < vResult.timepoints; ++vT){
+            const std::string vPoint = vLevel + "/TimePoint " + std::to_string(vT);
+            if(pathExists(vFile, vPoint + "/Channel " + std::to_string(vResult.channels))){
+                return bad(vPoint + " has more channels than the " + std::to_string(vResult.channels) + " of /DataSetInfo");
+            }
+        }
+    }
+
+    // Every Data dataset: its size, sample type and every chunk.
+    for(unsigned vL = 0; vL < vResult.levels; ++vL){
+        for(unsigned vT = 0; vT < vResult.timepoints; ++vT){
+            for(unsigned vC = 0; vC < vResult.channels; ++vC){
+                const std::string vGroup = datasetGroup(vL, vT, vC), vPath = vGroup + "/Data";
+                if(!pathExists(vFile, vPath)) return bad("no " + vPath);
+                uint64_t vSize[3] = {0, 0, 0};
+                vStatus = imageSize(vFile, vGroup, vSize);
+                if(!vStatus.ok()) return Status(vStatus.code, vPrefix + vStatus.message);
+                if(vSize[0] != vLevels[vL][0] || vSize[1] != vLevels[vL][1] || vSize[2] != vLevels[vL][2]){
+                    const uint64_t vWant[3] = {vLevels[vL][0], vLevels[vL][1], vLevels[vL][2]};
+                    return bad(vGroup + " is " + sizeText(vSize) + "; level " + std::to_string(vL) + " of a " + vImage + " is " + sizeText(vWant));
+                }
+                Hid vData(H5Dopen2(vFile, vPath.c_str(), H5P_DEFAULT), H5Dclose);
+                if(!vData.valid()) return bad("cannot open " + vPath);
+                Hid vPlist(H5Dget_create_plist(vData), H5Pclose);
+                hsize_t vChunk[3] = {0, 0, 0};
+                if(!vPlist.valid() || H5Pget_layout(vPlist) != H5D_CHUNKED || H5Pget_chunk(vPlist, 3, vChunk) != 3 ||
+                   !vChunk[0] || !vChunk[1] || !vChunk[2]){
+                    return bad(vPath + " is not a chunked 3-D dataset");
+                }
+                DataType vType;
+                vStatus = dataTypeOf(vData, vPath, vType);
+                if(!vStatus.ok()) return Status(vStatus.code, vPrefix + vStatus.message);
+                if(vType != vResult.dataType){
+                    return bad(vPath + " holds " + dataTypeName(vType) + " data, " + vFirst + " " + dataTypeName(vResult.dataType));
+                }
+                // chunk dims are (z, y, x)
+                const uint64_t vWant = ((vSize[0] + vChunk[2] - 1)/vChunk[2])*((vSize[1] + vChunk[1] - 1)/vChunk[1])*
+                                       ((vSize[2] + vChunk[0] - 1)/vChunk[0]);
+                Hid vSpace(H5Dget_space(vData), H5Sclose);
+                hsize_t vCount = 0;
+                if(!vSpace.valid() || H5Dget_num_chunks(vData, vSpace, &vCount) < 0) return bad("cannot count the chunks of " + vPath);
+                if(vCount != vWant){
+                    return bad(vPath + " holds " + std::to_string((unsigned long long)vCount) + " chunks; its size " + sizeText(vSize) +
+                               " in chunks of " + std::to_string((unsigned long long)vChunk[2]) + "x" + std::to_string((unsigned long long)vChunk[1]) +
+                               "x" + std::to_string((unsigned long long)vChunk[0]) + " needs " + std::to_string((unsigned long long)vWant));
+                }
+                vResult.chunks += vCount;
+            }
+        }
+    }
+    aResult = vResult;
+    return Status();
+}
+
 Status datasetLocked(const std::string& aFile, unsigned aLevel, unsigned aTimepoint, unsigned aChannel,
                      uint64_t aSize[3], DataType& aType){
     Hid vFile;
@@ -711,6 +1109,26 @@ Status imsInfo(const std::string& file, ImsInfo& info, bool checksums) noexcept{
         std::lock_guard<std::mutex> vLock(detail::libraryMutex());
         QuietErrors vQuiet;
         return infoLocked(file, info, checksums);
+    }
+    catch(const std::exception& vError){ return internalError(vError.what()); }
+    catch(...){ return internalError("unknown exception"); }
+}
+
+namespace detail {
+// verifyIms for the converter, which holds the library mutex already.
+Status verifyImsLocked(const std::string& aFile, ImsVerifyResult& aResult){
+    QuietErrors vQuiet;
+    return verifyLocked(aFile, aResult);
+}
+}
+
+Status verifyIms(const std::string& file, ImsVerifyResult* result) noexcept{
+    try{
+        std::lock_guard<std::mutex> vLock(detail::libraryMutex());
+        ImsVerifyResult vResult;
+        const Status vStatus = detail::verifyImsLocked(file, vResult);
+        if(vStatus.ok() && result) *result = vResult;
+        return vStatus;
     }
     catch(const std::exception& vError){ return internalError(vError.what()); }
     catch(...){ return internalError("unknown exception"); }
