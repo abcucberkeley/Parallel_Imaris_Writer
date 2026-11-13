@@ -31,13 +31,14 @@ Sections:
               and leaves no file; Ctrl-C (simulated) likewise; verbose prints the messages
   metadata    channel names and colors, wavelengths, start time and interval in ims_info
   errors      unsupported types, empty arrays, wrong arguments, unwritable folders: exceptions, the
-              process alive, nothing left behind
+              process alive, nothing left behind; a final rename that fails (os.replace mocked) keeps
+              the complete temporary file of write_ims and convert_to_ims and names it in the OSError
   h5py        with h5py and hdf5plugin installed: every level read through h5py equals read_ims
   importorder with scipy, cpp-zarr and cpp-tiff installed: this package imported and used after
               numpy, scipy, cppzarr and cpptiff were used, and before (fresh processes)
   fork        (Linux, macOS) after a write, a write in a child made by os.fork() ends within 60 s
-  sigint      (Linux, macOS) SIGINT 1 s into a long write ends it with KeyboardInterrupt within 5 s,
-              leaving no file
+  sigint      (Linux, macOS) SIGINT 1 s into a long write ends it with KeyboardInterrupt within 15 s
+              (that Ctrl-C works, not how fast: a loaded node took 7.5 s), leaving no file
   cluster     (Linux, macOS) the cluster steps on two channels and two time points of (y, x, z) Zarrs:
               cluster_plan, every task in a Python process of its own (one with a truncated chunk
               fails alone and runs once the chunk is whole), cluster_status, cluster_finish: the file
@@ -65,6 +66,7 @@ import tempfile
 import threading
 import time
 import warnings
+from unittest import mock
 
 import numpy as np
 import parallel_imaris_writer as piw
@@ -1152,6 +1154,34 @@ def test_errors(tmp):
     raises(ValueError, lambda: piw.read_ims(f, num_threads=0), 'read_ims num_threads=0')
     check(np.array_equal(piw.read_ims(f), a), 'the process works after every error')
 
+    # Only the final rename fails (on Windows: the old file open in Imaris): the complete temporary
+    # file is kept, and the OSError names it and the target
+    zarr = os.path.join(tmp, 'rename_input.zarr')
+    write_zarr(zarr, zvolume(3))
+
+    def refused(src, dst):
+        raise PermissionError(13, 'Permission denied (simulated)', src, None, dst)
+    for name, call, order, data in (('write_ims', lambda g: piw.write_ims(g, a), 'C', a),
+                                    ('convert_to_ims', lambda g: piw.convert_to_ims(g, files=zarr), 'F', zvolume(3))):
+        folder = os.path.join(tmp, 'rename_' + name)
+        os.makedirs(folder)
+        target = os.path.join(folder, 'r.ims')
+        error = None
+        with mock.patch('os.replace', refused):
+            try:
+                call(target)
+            except OSError as e:
+                error = e
+        kept = leftovers(folder)
+        path = os.path.join(folder, kept[0]) if len(kept) == 1 else None
+        whole = path is not None and complete_ims(path) and np.array_equal(piw.read_ims(path, order=order), data)
+        check(isinstance(error, PermissionError) and path is not None and path in str(error) and
+              target in str(error) and whole and not os.path.exists(target),
+              f'{name}: a failed final rename keeps the complete file ({kept}): {type(error).__name__}: {error}')
+        # and the same call without the mock writes the file
+        call(target)
+        check(leftovers(folder) == sorted(kept + ['r.ims']), f'{name} after it: {leftovers(folder)}')
+
 
 # ---- h5py
 
@@ -1302,7 +1332,7 @@ def test_sigint(tmp):
     if 'FINISHED' in out:
         skip(f'sigint: the write finished before the signal ({out.strip()})')
         return
-    check('STARTED' in started and p.returncode != 0 and 'KeyboardInterrupt' in err and seconds <= 5 and
+    check('STARTED' in started and p.returncode != 0 and 'KeyboardInterrupt' in err and seconds <= 15 and
           not leftovers(tmp), f'SIGINT 1 s into a write: KeyboardInterrupt after {seconds:.2f} s (exit code '
           f'{p.returncode}), files left: {leftovers(tmp)}' + ('' if 'KeyboardInterrupt' in err else '\n' + err[-2000:]))
 

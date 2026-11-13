@@ -314,6 +314,19 @@ def _remove(path):
         pass
 
 
+def _rename(temporary, file_name):
+    # The complete temporary file under its final name. If only this rename fails (on Windows, for
+    # example, while the old file_name is open in another program), the complete file is kept under
+    # its temporary name and the error names it, as the library keeps its <name>.ims.partial (the
+    # caller removes the temporary file on any other exception)
+    try:
+        os.replace(temporary, file_name)
+    except OSError as e:
+        message = (f'the complete file was kept as {temporary}: it could not be renamed to {file_name} '
+                   f'({e.strerror or e})')
+        raise (OSError(e.errno, message) if e.errno is not None else OSError(message)) from e
+
+
 def write_ims(file_name, data, voxel_size=None, block_size=None, order='C', num_threads=None, progress=None,
               verbose=False, channel_names=None, channel_colors=None, emission_wavelengths=None,
               excitation_wavelengths=None, time_interval=None, start_time=None, x_on_imaris_x=False):
@@ -349,7 +362,9 @@ def write_ims(file_name, data, voxel_size=None, block_size=None, order='C', num_
 
     The file is written under a temporary name beside file_name (<stem>_<8 hex digits>.ims) and
     renamed when complete, replacing an existing file_name: a file under its final name is always
-    whole, and a failed or stopped write leaves nothing. Calls in one process write one at a time.
+    whole, and a failed or stopped write leaves nothing. If only that rename fails (on Windows, for
+    example, while the old file is open in Imaris), the complete file is kept under its temporary
+    name and the OSError names it. Calls in one process write one at a time.
     """
     file_name = _ims_name(file_name)
     order = _order(order)
@@ -370,14 +385,15 @@ def write_ims(file_name, data, voxel_size=None, block_size=None, order='C', num_
     if verbose:
         # (what Python printed before comes first)
         sys.stdout.flush()
-    temporary = None
+    temporary, written = None, False
     try:
         temporary = _temporary(file_name)
         pybind11_write_ims(_native(temporary), volumes, channels, timepoints, voxel, block, threads,
                            verbose=bool(verbose), progress=progress, **metadata)
-        os.replace(temporary, file_name)
-    except BaseException:
-        if temporary is not None:
+        written = True
+        _rename(temporary, file_name)
+    except BaseException as e:
+        if temporary is not None and not (written and isinstance(e, OSError)):
             _remove(temporary)
         raise
 
@@ -628,15 +644,16 @@ def convert_to_ims(file_name, folders=None, channel_patterns=None, files=None, r
         raise IsADirectoryError(f'{file_name} is a folder')
     if verbose:
         sys.stdout.flush()
-    temporary = None
+    temporary, written = None, False
     try:
         temporary = _temporary(file_name)
         pybind11_convert(c['reader'], c['files'], _native(temporary), c['voxel'], c['block'], c['box'], c['process'],
                          threads, x_on_imaris_x=bool(x_on_imaris_x), input_axes=c['axes'], verbose=bool(verbose),
                          progress=progress, **c['metadata'])
-        os.replace(temporary, file_name)
-    except BaseException:
-        if temporary is not None:
+        written = True
+        _rename(temporary, file_name)
+    except BaseException as e:
+        if temporary is not None and not (written and isinstance(e, OSError)):
             _remove(temporary)
         raise
 

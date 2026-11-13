@@ -1,4 +1,6 @@
 # Parallel_Imaris_Writer
+[![Tests](https://github.com/abcucberkeley/Parallel_Imaris_Writer/actions/workflows/tests.yml/badge.svg)](https://github.com/abcucberkeley/Parallel_Imaris_Writer/actions/workflows/tests.yml)
+
 An efficient converter that writes TIFF and Zarr image stacks to the Imaris 5 (.ims) file format, utilizing cpp-tiff, cpp-zarr, the ImarisWriter, and OpenMP. The output is a single multi-resolution .ims file ready for visualization and analysis in Imaris.
 
 ## Limitations
@@ -9,6 +11,204 @@ An efficient converter that writes TIFF and Zarr image stacks to the Imaris 5 (.
 ## Releases
 
 Prebuilt release folders for Linux, Mac, and Windows are available from the [releases page](https://github.com/abcucberkeley/Parallel_Imaris_Writer/releases): download, unzip, and run the `parallelimariswriter` executable inside.
+
+## Python
+
+A Python package, `parallel_imaris_writer`, writes NumPy arrays to `.ims` files, converts TIFF and Zarr files as the command line does, reads `.ims` files back, and runs the [cluster steps](#cluster-steps-from-python). It is the same C++ code as the command line, and with the same inputs and options its files equal the command line's.
+
+### Prerequisites
+
+#### Python
+1. Python version 3.9-3.14 (3.14 free-threaded too on Linux and Mac)
+2. NumPy (installed with the package)
+
+#### OS
+Linux (x86_64): distributions with glibc 2.28 or newer (manylinux_2_28)
+
+Mac Apple Silicon (M1, M2, etc.): wheels built by GitHub Actions need macOS 15 or newer, because the OpenMP runtime bundled into the wheel (Homebrew's gcc@13 libgomp on the build machine) sets the wheel's macOS version; wheels built on a macOS 13 machine install on macOS 13 and newer
+
+Windows (x86_64): Windows 10 or newer
+
+### Installation
+
+The package is not on PyPI yet. Until it is, install a wheel built by the Wheels workflow, or build one from source.
+
+#### A wheel from the Wheels workflow
+The [Wheels workflow](https://github.com/abcucberkeley/Parallel_Imaris_Writer/actions/workflows/wheels.yml) (run by hand, or on a `v*` tag) builds and tests wheels for every supported Python. Open a run, download the artifact of your system (`wheels-Linux`, `wheels-macOS` or `wheels-Windows`), unzip it, and install the wheel of your Python, e.g.
+````
+pip install parallel_imaris_writer-<version>-cp312-cp312-<platform>.whl
+````
+
+#### Build from source
+The wheel is built with CMake (fetched by pip on Linux and Mac); the dependencies are downloaded at the first build, as for the [CMake](#cmake) build. Compilers: gcc on Linux; Homebrew's gcc-13 on Mac (`brew install gcc@13`); on Windows MSYS2's UCRT64 environment (`pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-libgomp mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja`) with its `ucrt64\bin` folder first on PATH. The simplest way is cibuildwheel, as the Wheels workflow runs it (on Linux it needs Docker or Podman; set `CIBW_BUILD`, e.g. `cp312-*`, to build fewer wheels):
+````
+git clone https://github.com/abcucberkeley/Parallel_Imaris_Writer
+cd Parallel_Imaris_Writer
+pip install cibuildwheel
+cibuildwheel python --output-dir wheelhouse
+pip install wheelhouse/parallel_imaris_writer-<version>-cp312-cp312-<platform>.whl
+````
+Or with pip in `python/`: `pip wheel . --no-deps -w dist` (on Mac with `CC=gcc-13 CXX=g++-13`), then bundle the library into the wheel with `auditwheel repair` (Linux), `delocate-wheel` (Mac) or `delvewheel repair` (Windows), pointing them at `python/build/install/lib` (`python/build/install/bin` on Windows), and install the repaired wheel. `python/tools/build_manylinux_wheels.sh` does all of this for Linux inside a manylinux container. A plain `pip install .` does not bundle the library into the package.
+
+#### From PyPI (once it is there)
+````
+pip install parallel-imaris-writer
+````
+
+The package also installs the command line as the `parallelimariswriter` command (the same as `python -m parallel_imaris_writer`).
+
+### Conventions
+
+**Types.** uint8, uint16, uint32 (checked with Imaris' own reader) and float32. Arrays of any other type raise `TypeError` (convert them with `astype` first); input files of another type raise `ValueError` before anything is written.
+
+**Axes.** `order` names the axes of arrays and of every per-axis value; it does not ask for a memory layout (any layout is read in place and means the same). By default **Imaris X is the image's y**, Imaris Y its x and Imaris Z its z, as in every file the command line and PetaKit5D's MATLAB wrapper write; `x_on_imaris_x=True` (on `write_ims`, `convert_to_ims`, `convert_dataset` and `cluster_plan`) puts the image's x on Imaris X instead. Read such a file with `x_on_imaris_x=True` too (`read_ims`, `ims_info`).
+
+| | `order='C'` (default) | `order='F'` |
+| --- | --- | --- |
+| 3D array | (z, y, x) | (y, x, z) |
+| 4D array | (c, z, y, x) | (y, x, z, c) |
+| 5D array | (t, c, z, y, x) | (y, x, z, c, t) |
+| `voxel_size`, `block_size`, `process_block_size`, `tile_size`, `start_coords`, `end_coords` | (z, y, x) | (y, x, z) |
+| `input_bbox` (0-based, end excluded) | (z0, y0, x0, z1, y1, x1) | (y0, x0, z0, y1, x1, z1) |
+| Imaris X, Y, Z | y, x, z | y, x, z |
+| Imaris X, Y, Z with `x_on_imaris_x=True` | x, y, z | x, y, z |
+| what it matches | NumPy (z, y, x) stacks, e.g. `cpptiff.read_tiff` | MATLAB arrays |
+
+A 2D array is one (y, x) plane in either order. `voxel_size` and the other per-axis values can also be a mapping with the keys `'x'`, `'y'` and `'z'`.
+
+**The axes of input files** (`input_axes` of `convert_to_ims`, `convert_dataset` and `cluster_plan`): `'yxz'` is MATLAB's layout, which every TIFF has (rows, columns, pages) and PetaKit5D's Zarr files have; `'zyx'` is a Zarr of a (z, y, x) array. By default it is `'yxz'` for TIFF files and is decided from each Zarr's metadata: a Zarr v2 of order `F`, or a Zarr v3 whose transpose codec reverses the axes, is MATLAB's (y, x, z); order `C` is (z, y, x). Pitfall: `cppzarr.write_zarr` writes Zarr v2 files in F order by default, so a (z, y, x) NumPy array saved with its defaults is read as (y, x, z): pass `input_axes='zyx'`, or write it with `order='C'`. The command line has no such option: it takes every input as (y, x, z).
+
+**Behaviour.**
+- Calls in one process run one at a time (a call from a second thread waits for the first); to convert several files at once, use processes (below).
+- The GIL is released while a call runs, and Ctrl-C stops it with `KeyboardInterrupt` (but not `run_cli`, and a tile `cluster_task` finishes its tiles first). `num_threads` sets the threads of that call only (default: `OMP_NUM_THREADS`, or every CPU the process may use).
+- A file appears under its name only when it is complete: it is written as `<stem>_<8 hex digits>.ims` next to it and renamed at the end, replacing an existing file. A failed or stopped call leaves nothing; if only the final rename fails (on Windows, for example, while the old file is open in Imaris), the complete file is kept under its temporary name and the `OSError` names it. (The command line does the same with `<name>.ims.partial`: see its Usage section below.)
+- `progress(fraction, bytes_written)` is called on the calling thread at most about ten times a second and once with 1.0 at the end; an exception it raises stops the call.
+
+### Usage
+
+#### Write an array
+````
+import numpy as np
+import parallel_imaris_writer as piw
+im = np.random.randint(0, 4096, size=(64, 512, 512), dtype=np.uint16)   # (z, y, x)
+piw.write_ims('volume.ims', im, voxel_size=(0.25, 0.108, 0.108))   # (dz, dy, dx) in microns
+````
+
+#### Several channels and time points
+````
+ch0 = np.random.randint(0, 4096, size=(64, 512, 512), dtype=np.uint16)
+ch1 = np.random.randint(0, 4096, size=(64, 512, 512), dtype=np.uint16)
+# A list of channels, or a (c, z, y, x) array
+piw.write_ims('channels.ims', [ch0, ch1], channel_names=['CamA', 'CamB'], channel_colors=[(0, 1, 0), (1, 0, 1)])
+# data[timepoint][channel], or a (t, c, z, y, x) array
+piw.write_ims('series.ims', [[ch0, ch1], [ch1, ch0]], time_interval=2.5, start_time='2026-01-01 12:00:00')
+piw.write_ims('series5d.ims', np.stack([np.stack([ch0, ch1]), np.stack([ch1, ch0])]), time_interval=2.5,
+              start_time='2026-01-01 12:00:00')
+````
+
+#### MATLAB's (y, x, z) layout
+````
+yxz = np.transpose(im, (1, 2, 0))   # (y, x, z), as MATLAB holds it
+piw.write_ims('matlab.ims', yxz, order='F', voxel_size=(0.108, 0.108, 0.25))   # (dy, dx, dz)
+# the same image as volume.ims: the same data (and, given the same start_time, the same file)
+````
+
+#### Put x on Imaris X
+````
+piw.write_ims('x_on_x.ims', im, x_on_imaris_x=True)
+back = piw.read_ims('x_on_x.ims', x_on_imaris_x=True)   # (z, y, x) again
+````
+
+#### Convert TIFF or Zarr files
+The inputs are found as the command line's `-F` and `-P` find them (each pattern one channel, its files the time points in name order), or given as a list. The reader comes from the file names unless `reader='tiff'` or `'zarr'` is given.
+````
+# Every file in data/ whose name contains CamA (channel 0) or CamB (channel 1)
+piw.convert_to_ims('converted.ims', folders='data', channel_patterns=['CamA', 'CamB'],
+                   voxel_size=(0.25, 0.108, 0.108))
+# The same inputs as a list: files[channel][timepoint]
+files = piw.find_input_files('data', ['CamA', 'CamB'])
+piw.convert_to_ims('listed.ims', files=files, voxel_size=(0.25, 0.108, 0.108))
+# Crop every input, 0-based with the end excluded: (z0, y0, x0, z1, y1, x1)
+piw.convert_to_ims('cropped.ims', files=files, input_bbox=(0, 100, 100, 32, 300, 300))
+````
+
+Zarr files of (z, y, x) arrays:
+````
+import cppzarr
+cppzarr.write_zarr('zyx_c.zarr', im, order='C')   # C order: read as (z, y, x)
+piw.convert_to_ims('zyx_c.ims', files='zyx_c.zarr')
+cppzarr.write_zarr('zyx_f.zarr', im)              # F order by default: say what the axes are
+piw.convert_to_ims('zyx_f.ims', files='zyx_f.zarr', input_axes='zyx')
+````
+
+As PetaKit5D's MATLAB dataset wrapper: one `.ims` per dataset folder, in its `imaris` folder, named after the first input file (an existing one is kept unless `overwrite=True`); it returns the paths:
+````
+outputs = piw.convert_dataset('data', channel_patterns=['CamA', 'CamB'], zarr_file=True,
+                              voxel_size=(0.25, 0.108, 0.108))
+````
+
+#### Bounded memory, threads and progress
+````
+def report(fraction, bytes_written):
+    print(f'{fraction:.0%}, {bytes_written / 1e6:.1f} MB written')
+
+# Hold at most 32 x 256 x 256 voxels of a time point at once (TIFF: whole planes), with 8 threads
+piw.convert_to_ims('bounded.ims', folders='data', channel_patterns=['CamA', 'CamB'],
+                   process_block_size=(32, 256, 256), num_threads=8, progress=report)
+````
+
+#### Several conversions at once
+Calls in one process run one at a time, so convert several files at once in processes, each with its share of the CPUs:
+````
+from concurrent.futures import ProcessPoolExecutor
+import parallel_imaris_writer as piw
+
+def convert(pattern):
+    piw.convert_to_ims(f'{pattern}.ims', folders='data', channel_patterns=pattern, num_threads=4)
+
+if __name__ == '__main__':
+    with ProcessPoolExecutor(2) as pool:
+        list(pool.map(convert, ['CamA', 'CamB']))
+````
+
+#### Read back and compare
+````
+whole = piw.read_ims('volume.ims')                                          # (z, y, x)
+region = piw.read_ims('volume.ims', start_coords=(0, 0, 0), end_coords=(16, 128, 128))
+coarse = piw.read_ims('series.ims', resolution_level=1, timepoint=1, channel=0)
+print(np.array_equal(whole, im))                                           # True
+
+info = piw.ims_info('volume.ims')   # shape, dtype, channels, timepoints, resolution_levels, voxel_size, ...
+print(info['shape'], info['dtype'], info['resolution_levels'], info['voxel_size'])
+
+# Two files hold the same data when the CRCs of their datasets are equal
+a = piw.ims_info('volume.ims', checksums=True)
+b = piw.ims_info('matlab.ims', checksums=True)
+print([d['crc'] for d in a['datasets']] == [d['crc'] for d in b['datasets']])   # True
+````
+`ims_info` also returns every attribute of the file (`info['attributes']`); with the same `start_time` two such files have the same attributes too.
+
+#### The command line
+````
+import subprocess, sys
+subprocess.run([sys.executable, '-m', 'parallel_imaris_writer', '-r', 'zarr', '-F', 'data', '-P', 'CamA,CamB',
+                '-o', 'out', '-n', 'cli'], check=True)
+# or in this process: the exit code
+code = piw.run_cli(['verify', 'out/cli.ims'])
+````
+
+#### Cluster steps from Python
+The [cluster steps](#plan-tasks-finish-any-job-system) are one function each: `cluster_plan` plans the conversion as stages of independent tasks, `cluster_task` runs one task (a single-node call: run each in a job of your own job system, in any process on any node, each stage after the one before), `cluster_status` says which tasks are not done, and `cluster_finish` writes the file. The functions never talk to Slurm or any other scheduler. A failed task raises and is simply run again; Ctrl-C stops a time-series task between blocks (a tile task finishes its tiles first). The time-series plan (the default) runs on Linux and Mac.
+````
+plan = piw.cluster_plan('workdir', folders='data', channel_patterns=['CamA', 'CamB'], file_name='cluster.ims',
+                        voxel_size=(0.25, 0.108, 0.108))
+for stage in plan['stages']:            # in order: each stage after the one before
+    for index in range(stage['tasks']):     # in your job system: one job (or array task) each
+        piw.cluster_task('workdir', stage['name'], index, num_threads=8)
+print(piw.cluster_status('workdir')['missing'])   # 0
+piw.cluster_finish('workdir')
+````
+`cluster.ims` equals `convert_to_ims` of the same inputs and options. With `tile_size` the plan cuts each volume into tiles instead (Zarr input in MATLAB's layout, uint8 or uint16), in stages `level0`, `level1`, ...
 
 ## CMake
 
