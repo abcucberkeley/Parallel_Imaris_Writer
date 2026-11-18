@@ -13,8 +13,9 @@ build_manylinux_wheels.sh as well. Checked for each wheel, by its platform tag:
       libcppTiff.dll, libcppZarr.dll, libgomp-1.dll or libwinpthread-1.dll: cpp-tiff's and
       cpp-zarr's wheels ship DLLs of those names, and Windows takes an already loaded DLL of the
       same name for the one a library asks for;
-  * no binary holds a --forbid text, such as the folder the wheel was built in or the home folder
-    (on Windows also checked with / and \\ swapped).
+  * no file of the wheel, binary or text (such as delvewheel's DELVEWHEEL record), holds a --forbid
+    text, such as the folder the wheel was built in or the home folder: searched as given, on
+    Windows also with / and \\ swapped, and with every backslash doubled (as a Python repr writes it).
 Exits with status 1 when a check fails. Only the standard library is needed.
 """
 import argparse
@@ -96,25 +97,25 @@ def check(path, forbid):
             texts.append(t)
             if system == 'windows':
                 texts += [t.replace('\\', '/'), t.replace('/', '\\')]
+        texts += [t.replace('\\', '\\\\') for t in texts]
         texts = sorted(set(t.encode() for t in texts if t))
         binaries = 0
         for i in infos:
             data = z.read(i)
-            if not data.startswith(BINARY_MAGIC):
-                continue
-            binaries += 1
+            binaries += data.startswith(BINARY_MAGIC)
             for t in texts:
                 if t in data:
-                    errors.append(f'{path}: {i.filename} holds {t.decode()!r} ({data.count(t)} times)')
+                    errors.append(f"{path}: {i.filename} holds '{t.decode()}' ({data.count(t)} times)")
         if texts:
-            print(f'       {binaries} binaries searched for ' + ', '.join(repr(t.decode()) for t in texts))
+            print(f'       {len(infos)} files ({binaries} binaries) searched for ' +
+                  ', '.join(f"'{t.decode()}'" for t in texts))
     return errors
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--forbid', action='append', default=[], metavar='TEXT',
-                        help='text no binary of the wheel may hold (e.g. the build folder); repeatable')
+                        help='text no file of the wheel may hold (e.g. the build folder); repeatable')
     parser.add_argument('wheels', nargs='+', metavar='WHEEL')
     args = parser.parse_args()
     errors = []

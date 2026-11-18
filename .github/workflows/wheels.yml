@@ -76,6 +76,16 @@ jobs:
         with:
           python-version: '3.12'
 
+      # cibuildwheel's temporary folder outside the runner's profile, so that delvewheel's record
+      # in the wheels (DELVEWHEEL) names no user folder
+      - name: Temporary folder outside the user profile (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path C:\cibw-tmp | Out-Null
+          "TEMP=C:\cibw-tmp" >> $env:GITHUB_ENV
+          "TMP=C:\cibw-tmp" >> $env:GITHUB_ENV
+
       - name: Build and test the wheels
         run: |
           python -m pip install cibuildwheel==4.3.5

@@ -41,7 +41,9 @@ repair-wheel-command = "DYLD_LIBRARY_PATH=\"{package}/build/install/lib\" deloca
 # MinGW-w64: MSYS2's UCRT64 environment (gcc, g++, cmake, ninja, strip) first on PATH, e.g.
 # C:\msys64\ucrt64\bin. delvewheel vendors the library and the readers from the install folder and
 # MinGW's DLLs (libgomp, libwinpthread) from PATH, all under new names (stripped first where the
-# renaming needs it).
+# renaming needs it). delvewheel records its arguments in the wheel (DELVEWHEEL), so the install
+# folder is named relative to the project root ({project} is "." there: cibuildwheel runs the
+# repair command in it), not by {package}'s absolute path, which would name the build folder.
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
-repair-wheel-command = "delvewheel repair --add-path \"{package}/build/install/bin\" --strip -w {dest_dir} -v {wheel}"
+repair-wheel-command = "delvewheel repair --add-path \"{project}/python/build/install/bin\" --strip -w {dest_dir} -v {wheel}"
