@@ -195,6 +195,131 @@ FetchContent_Declare(cppzarr
 )
 FetchContent_MakeAvailable(cpptiff cppzarr)
 
+# Windows (MinGW): ld exports every global symbol of a DLL but those of the archives --exclude-libs
+# names. Not ALL: under CMake's Makefile generators ("MinGW Makefiles", "MSYS Makefiles"; not Ninja)
+# a DLL's own objects are linked from an archive too (<target>.dir/objects.a, CMake's Windows-GNU
+# rules), and ALL took them as well: the readers exported nothing. Named instead: every static archive
+# the target links, as the linker matches them (the file name, no folder), found from its link
+# libraries and theirs (this build's static libraries by $<TARGET_FILE_NAME:...>, archives named by
+# path or name, -l<name>), so that a dependency a newer cpp-tiff or cpp-zarr adds is excluded too;
+# and the compiler's runtime archives (its implicit libraries; libgcc_eh, the unwinder -static-libgcc
+# links, which ld's default exclusions leave exported, and libsupc++). An archive named but not linked
+# changes nothing.
+# piw_genex_value(<$<condition:value>> <out>): the value, whatever the condition (an archive excluded
+# that a configuration does not link changes nothing).
+function(piw_genex_value item out)
+    set(${out} "" PARENT_SCOPE)
+    string(LENGTH "${item}" n)
+    math(EXPR last "${n} - 2")
+    if(last LESS 2)
+        return()
+    endif()
+    set(depth 0)
+    set(prev "")
+    foreach(i RANGE 2 ${last})
+        string(SUBSTRING "${item}" ${i} 1 c)
+        if(prev STREQUAL "$" AND c STREQUAL "<")
+            math(EXPR depth "${depth} + 1")
+        elseif(c STREQUAL ">" AND depth GREATER 0)
+            math(EXPR depth "${depth} - 1")
+        elseif(c STREQUAL ":" AND depth EQUAL 0)
+            math(EXPR start "${i} + 1")
+            math(EXPR len "${n} - 1 - ${start}")
+            string(SUBSTRING "${item}" ${start} ${len} value)
+            set(${out} "${value}" PARENT_SCOPE)
+            return()
+        endif()
+        set(prev "${c}")
+    endforeach()
+endfunction()
+# piw_static_archives(<target> <out>): the file names of the static archives <target> links.
+function(piw_static_archives target out)
+    set(archives libgcc_eh.a libsupc++.a)
+    set(todo ${CMAKE_C_IMPLICIT_LINK_LIBRARIES} ${CMAKE_CXX_IMPLICIT_LINK_LIBRARIES})
+    get_target_property(libs ${target} LINK_LIBRARIES)
+    if(libs)
+        list(APPEND todo ${libs})
+    endif()
+    set(seen "")
+    while(todo)
+        list(POP_FRONT todo item)
+        set(conditional FALSE)
+        while(item MATCHES "^\\$<.*>$")
+            piw_genex_value("${item}" item)
+            set(conditional TRUE)
+        endwhile()
+        # (::@(<directory>): the directory marks of a target_link_libraries called from another one)
+        if(item STREQUAL "" OR item MATCHES "^::@" OR item IN_LIST seen)
+            continue()
+        endif()
+        list(APPEND seen "${item}")
+        if(TARGET "${item}")
+            get_target_property(real "${item}" ALIASED_TARGET)
+            if(NOT real)
+                set(real "${item}")
+            endif()
+            get_target_property(type "${real}" TYPE)
+            get_target_property(imported "${real}" IMPORTED)
+            if(imported AND NOT type STREQUAL "INTERFACE_LIBRARY")
+                # (its files, every configuration's: the archives among them by the rules below)
+                get_target_property(location "${real}" IMPORTED_LOCATION)
+                if(location)
+                    list(APPEND todo "${location}")
+                endif()
+                get_target_property(configs "${real}" IMPORTED_CONFIGURATIONS)
+                foreach(config IN LISTS configs)
+                    string(TOUPPER "${config}" config)
+                    get_target_property(location "${real}" IMPORTED_LOCATION_${config})
+                    if(location)
+                        list(APPEND todo "${location}")
+                    endif()
+                endforeach()
+            elseif(type STREQUAL "STATIC_LIBRARY")
+                list(APPEND archives "$<TARGET_FILE_NAME:${real}>")
+            endif()
+            get_target_property(deps "${real}" INTERFACE_LINK_LIBRARIES)
+            if(deps)
+                list(APPEND todo ${deps})
+            endif()
+        elseif(item MATCHES "^-l:(.+)$")
+            list(APPEND archives "${CMAKE_MATCH_1}")
+        elseif(item MATCHES "^-l(.+)$")
+            list(APPEND archives "lib${CMAKE_MATCH_1}.a")
+        elseif(item MATCHES "^-")
+            # (a linker flag: -static-libstdc++, -pthread, ...)
+        elseif(item MATCHES "\\.a$")
+            get_filename_component(name "${item}" NAME)
+            list(APPEND archives "${name}")
+        elseif(item MATCHES "::|[$<>]")
+            # An imported target of a find module, made in a dependency's directory and not visible
+            # here: its library as the module caches it (ZLIB::ZLIB: ZLIB_LIBRARY). One of a condition
+            # need not exist (MPI::MPI_C of a HDF5 without MPI).
+            set(found "")
+            if(item MATCHES "^([A-Za-z0-9_]+)::")
+                set(found ${${CMAKE_MATCH_1}_LIBRARY} ${${CMAKE_MATCH_1}_LIBRARY_RELEASE})
+            endif()
+            if(found)
+                list(APPEND todo ${found})
+            elseif(NOT conditional)
+                message(WARNING "${target}: the link library ${item} is not a target here: the symbols "
+                    "of its static libraries may be exported (piw_static_archives)")
+            endif()
+        elseif(NOT item MATCHES "[/\\\\.]")
+            # (a library's name: kernel32, gcc)
+            list(APPEND archives "lib${item}.a")
+        endif()
+    endwhile()
+    list(REMOVE_DUPLICATES archives)
+    set(${out} "${archives}" PARENT_SCOPE)
+endfunction()
+# piw_static_exports_off(<target>): no symbol of the static archives <target> links exported
+# (Windows; ld takes the names separated by ":" -- a "," would end -Wl's argument).
+function(piw_static_exports_off target)
+    piw_static_archives(${target} archives)
+    string(REPLACE ";" ":" archives "${archives}")
+    target_link_options(${target} PRIVATE "-Wl,--exclude-libs,${archives}")
+endfunction()
+
 # The readers' exports: their API alone, the functions of the global namespace (_Z<length><name>...,
 # all of cpp-tiff's and cpp-zarr's, listed by the length's first digit to keep to plain * patterns)
 # and cpp-zarr's zarr class; the template code of namespace std and
@@ -202,11 +327,12 @@ FetchContent_MakeAvailable(cpptiff cppzarr)
 # -fvisibility says). Linux: no symbol of a static library exported (--exclude-libs,ALL) and a
 # version script; macOS: an exported-symbols list (Mach-O names have one more leading underscore).
 # Windows (MinGW, which exports every global symbol of a DLL): no symbol of a static library
-# exported; the DLLs' own template instantiations stay exported, but nothing of ours imports them.
+# exported (piw_static_exports_off); the DLLs' own template instantiations stay exported, but nothing
+# of ours imports them.
 set(PIW_READER_API _Z1* _Z2* _Z3* _Z4* _Z5* _Z6* _Z7* _Z8* _Z9* _ZN4zarr* _ZNK4zarr*)
 function(piw_reader_exports target)
     if(WIN32)
-        target_link_options(${target} PRIVATE -Wl,--exclude-libs,ALL)
+        piw_static_exports_off(${target})
         return()
     endif()
     if(APPLE)
@@ -227,6 +353,24 @@ function(piw_reader_exports target)
 endfunction()
 piw_reader_exports(cppTiff_shared)
 piw_reader_exports(cppZarr_shared)
+# Windows: the build stops at the readers, with one clear error, when a DLL exports none of its API
+# (rather than with undefined references in every program linked to it); every program and the
+# Python package's library wait for this check (piw_link_like_executable). runtimeIsolation checks
+# the same on every system.
+if(WIN32 AND CMAKE_OBJDUMP)
+    set(PIW_READER_API_STAMP "${CMAKE_CURRENT_BINARY_DIR}/reader_api.stamp")
+    set(PIW_READER_API_CHECK ${CMAKE_COMMAND} -DPLATFORM=${CMAKE_SYSTEM_NAME} "-DNM=${CMAKE_NM}"
+        "-DOBJDUMP=${CMAKE_OBJDUMP}" -DBINARIES= -DAPI_ONLY=ON)
+    set(PIW_ISOLATION_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_isolation.cmake)
+    add_custom_command(OUTPUT "${PIW_READER_API_STAMP}"
+        COMMAND ${PIW_READER_API_CHECK} "-DREADERS=$<TARGET_FILE:cppTiff_shared>" -P ${PIW_ISOLATION_SCRIPT}
+        COMMAND ${PIW_READER_API_CHECK} "-DREADERS=$<TARGET_FILE:cppZarr_shared>" -P ${PIW_ISOLATION_SCRIPT}
+        COMMAND ${CMAKE_COMMAND} -E touch "${PIW_READER_API_STAMP}"
+        DEPENDS cppTiff_shared cppZarr_shared ${PIW_ISOLATION_SCRIPT}
+        COMMENT "Checking the exports of libcppTiff and libcppZarr"
+        VERBATIM)
+    add_custom_target(piw_reader_api DEPENDS "${PIW_READER_API_STAMP}")
+endif()
 
 # ---------------------------------------------------------------------------
 # ImarisWriter -- fetched but NOT configured with its own CMakeLists (which does
@@ -346,8 +490,12 @@ piw_warnings(parallelimariswriter)
 # macOS: it is libSystem's whatever -static-libgcc says (which keeps Homebrew's libgcc_s out);
 # Windows: SEH unwinds through the system, each module with its own static libgcc, as the readers'
 # DLLs have. Only valid for GNU; Apple Clang rejects these flags (build on macOS with Homebrew gcc).
-# Used for the executable and every test program.
+# Used for the executable and every test program; on Windows each also waits for the check of the
+# readers' exports (piw_reader_api).
 function(piw_link_like_executable target)
+    if(TARGET piw_reader_api)
+        add_dependencies(${target} piw_reader_api)
+    endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         target_link_options(${target} PRIVATE -static-libstdc++)
         if(APPLE OR WIN32)
@@ -488,6 +636,9 @@ if(PIW_BUILD_PYTHON_LIB)
     add_library(parallelImarisWriter_shared SHARED $<TARGET_OBJECTS:piw_core>)
     set_target_properties(parallelImarisWriter_shared PROPERTIES OUTPUT_NAME parallelImarisWriter)
     target_link_libraries(parallelImarisWriter_shared PRIVATE ${PIW_LINK_LIBRARIES})
+    if(TARGET piw_reader_api)
+        add_dependencies(parallelImarisWriter_shared piw_reader_api)
+    endif()
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
         # Its own static C++ runtime, as the executable's (piw_link_like_executable), kept private
         # like the readers': only the piw:: functions exported (the template instantiations of
@@ -508,7 +659,8 @@ if(PIW_BUILD_PYTHON_LIB)
             # unwinder). And ImarisWriter's dllexport declarations would turn off MinGW's export of
             # everything, leaving the piw:: functions unexported.
             target_link_options(parallelImarisWriter_shared PRIVATE
-                -Wl,--allow-multiple-definition -Wl,--exclude-libs,ALL -Wl,--export-all-symbols)
+                -Wl,--allow-multiple-definition -Wl,--export-all-symbols)
+            piw_static_exports_off(parallelImarisWriter_shared)
         else()
             # Static HDF5, LZ4, zlib, ImarisWriter and C++ runtime hidden (__cxa_pure_virtual included:
             # see piw_link_like_executable). The unwinder is the shared libgcc_s (never -static-libgcc

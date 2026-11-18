@@ -115,3 +115,49 @@ jobs:
             macOS) nm -gU "$MOD" ;;
           esac
           PYTHONPATH=python python python/tests/test_python.py
+
+  # The Windows build with CMake's "MinGW Makefiles" generator (mingw32-make, its commands run by
+  # cmd.exe), as a Windows build outside MSYS2 has it; the job above uses Ninja. Under the Makefile
+  # generators CMake links a DLL's own objects from an archive (objects.a), which Ninja does not:
+  # the readers' exports are checked under both (piw_static_exports_off, runtimeIsolation). Run from
+  # PowerShell with MSYS2's UCRT64 folder first on PATH (as the Windows wheels are built), the
+  # runner's git for FetchContent, and no folder with an sh.exe on PATH (Git's own bin folders): with
+  # one, mingw32-make runs the commands with sh instead of cmd.exe.
+  cpp-mingw-makefiles:
+    name: C++ (Windows, MinGW Makefiles)
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up MinGW
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          pacboy: gcc:p libgomp:p cmake:p make:p
+
+      - name: Put MinGW first on PATH
+        run: '"${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin" >> $env:GITHUB_PATH'
+
+      # (each command's exit code checked: a PowerShell step otherwise fails only on its last one)
+      - name: Build
+        run: |
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and -not (Test-Path -LiteralPath "$_\sh.exe") }) -join ';'
+          Get-Command gcc, g++, cmake, mingw32-make, objdump, git | Format-Table Name, Source -AutoSize
+          cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DPIW_BUILD_TESTS=ON -DPIW_BUILD_PYTHON_LIB=ON
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --parallel 4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --target release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: C++ tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Runtime symbol report
+        run: ctest --test-dir build -R runtimeIsolation -V --no-tests=error

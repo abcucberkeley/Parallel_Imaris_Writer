@@ -21,6 +21,9 @@
 #            libraries export no unwinder, LZ4, zlib or C++ ABI (__cxa_*, __gxx_*) function. (MinGW exports
 #            every global symbol of a DLL's own objects, the template instantiations of namespace std among
 #            them: those are counted, not refused.)
+# Every library checked also exports its own API (one function of it at least: an export list or exclusion
+# that matched everything left the readers exporting nothing on Windows once, so that every program failed
+# to link). -DAPI_ONLY=ON checks that alone, for READERS (the Windows build runs it on the readers' DLLs).
 # Lists use "|" as separators (a ";" would split the ctest argument).
 
 foreach(v PLATFORM NM OBJDUMP READERS BINARIES)
@@ -47,6 +50,15 @@ set(LABEL_UNWIND "unwinder")
 set(LABEL_LZ4 "LZ4")
 set(LABEL_ZLIB "zlib")
 set(LABEL_NLOHMANN "nlohmann/json")
+
+# A function of each library's API (mangled; by the library's name): writeTiffParallelWrapper, a constructor
+# of zarr, a function of namespace piw (the Python package's library).
+set(API_libcppTiff "^_Z24writeTiffParallelWrapper")
+set(API_LABEL_libcppTiff "writeTiffParallelWrapper")
+set(API_libcppZarr "^_ZN4zarrC[12]E")
+set(API_LABEL_libcppZarr "zarr::zarr")
+set(API_libparallelImarisWriter "^_ZN3piw")
+set(API_LABEL_libparallelImarisWriter "piw::")
 
 set(gFailed FALSE)
 
@@ -135,17 +147,35 @@ function(exports_of out file)
     set(${out} "${names}" PARENT_SCOPE)
 endfunction()
 
+# Fails (at the end) when the library <name> exports nothing, or none of its API (when it is one of API_*).
+function(check_api name names)
+    list(LENGTH names n)
+    # (every library checked exports its API: none found means the tool's output was not understood)
+    if(n EQUAL 0)
+        message("  FAIL ${name}: no export found in the output of ${NM} / ${OBJDUMP}")
+        set(gFailed TRUE PARENT_SCOPE)
+        return()
+    endif()
+    string(REGEX MATCH "^lib[A-Za-z0-9_]+" lib "${name}")
+    if(lib STREQUAL "" OR NOT DEFINED API_${lib})
+        return()
+    endif()
+    foreach(sym IN LISTS names)
+        if(sym MATCHES "${API_${lib}}")
+            return()
+        endif()
+    endforeach()
+    message("  FAIL ${name}: exports none of its API (no ${API_LABEL_${lib}}, ${API_${lib}})")
+    set(gFailed TRUE PARENT_SCOPE)
+endfunction()
+
 function(check_exports file)
     get_filename_component(name "${file}" NAME)
     exports_of(names "${file}")
     classify(E "${names}")
     describe(text E ${CATEGORIES})
     message("  ${name}: exports ${text}")
-    # (every library checked exports its API: none found means the tool's output was not understood)
-    if(E_ALL EQUAL 0)
-        message("  FAIL ${name}: no export found in the output of ${NM} / ${OBJDUMP}")
-        set(gFailed TRUE)
-    endif()
+    check_api("${name}" "${names}")
     if(PLATFORM STREQUAL "Windows")
         # (the C++ runtime's own functions, not the template instantiations of the DLL's own objects)
         set(cabi "")
@@ -271,6 +301,20 @@ function(check_binary file)
     endif()
     set(gFailed ${gFailed} PARENT_SCOPE)
 endfunction()
+
+if(API_ONLY)
+    foreach(f IN LISTS READERS)
+        if(NOT f STREQUAL "")
+            get_filename_component(name "${f}" NAME)
+            exports_of(names "${f}")
+            check_api("${name}" "${names}")
+        endif()
+    endforeach()
+    if(gFailed)
+        message(FATAL_ERROR "reader exports: FAILED (CMakeLists.txt: piw_reader_exports)")
+    endif()
+    return()
+endif()
 
 message("Reader libraries:")
 foreach(f IN LISTS READERS)
